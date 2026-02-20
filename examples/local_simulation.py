@@ -26,6 +26,7 @@ async def main() -> None:
                 artifact_uri="mesh://bundles/tinygrad-linear-v1",
                 artifact_checksum="sha256:dev",
                 runtime="tinygrad",
+                model_adapter="gabion.user_models.linear:LinearAdapter",
                 local_epochs=1,
                 min_quorum=2,
                 max_rounds=3,

@@ -64,6 +64,7 @@ async def test_mesh_pebble_round_trip() -> None:
                 artifact_uri="mesh://bundles/job-1",
                 artifact_checksum="sha256:test",
                 runtime="tinygrad",
+                model_adapter="gabion.user_models.linear:LinearAdapter",
                 local_epochs=1,
                 min_quorum=2,
                 max_rounds=2,

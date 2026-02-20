@@ -234,6 +234,7 @@ class MeshServer:
                         "job_id": runtime.job.job_id,
                         "round_id": round_id,
                         "weights": runtime.weights,
+                        "model_adapter": runtime.job.model_adapter,
                         "local_epochs": runtime.job.local_epochs,
                     },
                 )

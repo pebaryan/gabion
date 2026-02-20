@@ -12,6 +12,7 @@ class TrainingJob:
     artifact_uri: str
     artifact_checksum: str
     runtime: str
+    model_adapter: str
     local_epochs: int
     min_quorum: int
     max_rounds: int
@@ -25,6 +26,7 @@ class TrainingJob:
             "artifact_uri": self.artifact_uri,
             "artifact_checksum": self.artifact_checksum,
             "runtime": self.runtime,
+            "model_adapter": self.model_adapter,
             "local_epochs": self.local_epochs,
             "min_quorum": self.min_quorum,
             "max_rounds": self.max_rounds,

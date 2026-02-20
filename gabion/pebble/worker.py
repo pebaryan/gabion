@@ -9,6 +9,7 @@ from aiohttp import ClientSession, WSMsgType
 
 from gabion.common.config import PebbleConfig
 from gabion.common.protocol import make_message
+from gabion.pebble.adapters import load_adapter
 from gabion.pebble.trainer import Trainer
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ class PebbleWorker:
             selected_job = jobs[0]
 
         runtime = str(selected_job.get("runtime", ""))
+        adapter_ref = str(selected_job.get("model_adapter", ""))
         if runtime == "tinygrad" and self.trainer.backend != "tinygrad":
             logger.warning(
                 "worker %s cannot join tinygrad job %s without tinygrad runtime",
@@ -109,6 +111,17 @@ class PebbleWorker:
                 selected_job.get("job_id"),
             )
             return
+        if adapter_ref:
+            try:
+                load_adapter(adapter_ref)
+            except Exception:
+                logger.warning(
+                    "worker %s cannot load adapter %s for job %s",
+                    self.config.worker_id,
+                    adapter_ref,
+                    selected_job.get("job_id"),
+                )
+                return
 
         await ws.send_json(make_message("join_job", {"job_id": selected_job["job_id"]}))
 
@@ -121,7 +134,11 @@ class PebbleWorker:
         weights = [float(v) for v in data["weights"]]
         local_epochs = int(data.get("local_epochs", 1))
 
-        new_weights, sample_count, loss = self.trainer.train(weights=weights, local_epochs=local_epochs)
+        new_weights, sample_count, loss = self.trainer.train(
+            weights=weights,
+            local_epochs=local_epochs,
+            job=data,
+        )
         await ws.send_json(
             make_message(
                 "round_result",
