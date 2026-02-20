@@ -1,0 +1,22 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class MeshConfig:
+    host: str = "127.0.0.1"
+    port: int = 8765
+    round_timeout_s: float = 8.0
+    local_epochs: int = 1
+    max_rounds: int = 3
+    min_quorum: int = 1
+    heartbeat_timeout_s: float = 30.0
+
+
+@dataclass(frozen=True)
+class PebbleConfig:
+    worker_id: str
+    mesh_ws_url: str = "ws://127.0.0.1:8765/ws"
+    heartbeat_interval_s: float = 5.0
+    preferred_job_id: str | None = None
