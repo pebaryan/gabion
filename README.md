@@ -27,6 +27,7 @@ Reference it as `module.path:ClassName`.
 Built-ins:
 - `gabion.user_models.linear:LinearAdapter`
 - `gabion.user_models.mnist_softmax:MnistSoftmaxAdapter`
+- `gabion.user_models.bbt_transformer:BBTTransformerAdapter`
 
 ## Install
 
@@ -53,6 +54,12 @@ gabion mesh \
   --model-adapter my_models.my_adapter:MyAdapter
 ```
 
+Optional mesh runtime flags:
+
+- `--checkpoint-path <path>`: save/load job weights and last completed round
+- `--checkpoint-every-rounds <n>`: checkpoint cadence (default `1`)
+- Restarting mesh with the same `--checkpoint-path` resumes from the last completed round.
+
 Start workers and select the job:
 
 ```bash
@@ -73,6 +80,13 @@ gabion pebble --id w-gpu0 --job-id my-job-v1 --device cuda --visible-devices 0
 gabion pebble --id w-webgpu --job-id my-job-v1 --device webgpu --webgpu-backend WGPUBackendType_Vulkan
 ```
 
+Mixed GPU setup example (NVIDIA CUDA + AMD WebGPU):
+
+```bash
+gabion pebble --id w-nv --job-id my-job-v1 --device cuda --visible-devices 0
+gabion pebble --id w-amd --job-id my-job-v1 --device webgpu --webgpu-backend WGPUBackendType_Vulkan
+```
+
 List jobs:
 
 ```bash
@@ -83,6 +97,18 @@ Status:
 
 ```bash
 curl http://127.0.0.1:8765/status
+```
+
+Training dashboard:
+
+```bash
+http://127.0.0.1:8765/dashboard
+```
+
+Raw metrics JSON:
+
+```bash
+curl http://127.0.0.1:8765/metrics
 ```
 
 ## MNIST example job

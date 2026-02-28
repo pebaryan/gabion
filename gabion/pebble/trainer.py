@@ -54,7 +54,6 @@ class TinygradTrainer(SyntheticTrainer):
     def train(
         self, weights: List[float], local_epochs: int, job: Dict[str, object] | None = None
     ) -> Tuple[List[float], int, float]:
-        from tinygrad.nn.optim import SGD  # type: ignore
         from tinygrad import Tensor  # type: ignore
 
         adapter_ref = "gabion.user_models.linear:LinearAdapter"
@@ -67,18 +66,21 @@ class TinygradTrainer(SyntheticTrainer):
         for param in trainable_params:
             param.requires_grad = True
 
-        opt = SGD(trainable_params, lr=self.learning_rate)
         epochs = max(1, local_epochs)
         batch_size = max(8, self.sample_count)
         loss_value = 0.0
-        for epoch in range(epochs):
-            x, y = adapter.sample_batch(batch_size=batch_size, seed=self.seed + epoch)
-            opt.zero_grad()
-            logits = adapter.forward(trainable_params, x)
-            loss = adapter.loss(logits, y)
-            loss.backward()
-            opt.step()
-            loss_value = float(loss.item())
+        with Tensor.train():
+            for epoch in range(epochs):
+                x, y = adapter.sample_batch(batch_size=batch_size, seed=self.seed + epoch)
+                for param in trainable_params:
+                    param.grad = None
+                logits = adapter.forward(trainable_params, x)
+                loss = adapter.loss(logits, y)
+                loss.backward()
+                for param in trainable_params:
+                    if param.grad is not None:
+                        param.assign((param - param.grad * self.learning_rate).realize())
+                loss_value = float(loss.item())
 
         flat = flatten_tensors(trainable_params)
         return flat, batch_size, loss_value

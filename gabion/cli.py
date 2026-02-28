@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     mesh.add_argument("--job-name", default="Tinygrad Custom V1")
     mesh.add_argument("--model-adapter", default="gabion.user_models.linear:LinearAdapter")
     mesh.add_argument("--enable-mnist-job", action="store_true")
+    mesh.add_argument("--checkpoint-path", default=None)
+    mesh.add_argument("--checkpoint-every-rounds", type=int, default=1)
 
     pebble = sub.add_parser("pebble")
     pebble.add_argument("--id", required=True)
@@ -74,6 +76,8 @@ def main() -> None:
             port=args.port,
             max_rounds=args.max_rounds,
             min_quorum=args.min_quorum,
+            checkpoint_path=args.checkpoint_path,
+            checkpoint_every_rounds=max(1, int(args.checkpoint_every_rounds)),
         )
         jobs = [
             build_tinygrad_job(
@@ -110,7 +114,8 @@ def main() -> None:
             mesh_ws_url=args.mesh_ws_url,
             preferred_job_id=args.job_id,
         )
-        trainer = TinygradTrainer(seed=hash(args.id) % 999)
+        # Use a conservative LR to keep transformer-style adapters numerically stable.
+        trainer = TinygradTrainer(seed=hash(args.id) % 999, learning_rate=0.001)
         try:
             backend = trainer.backend
         except Exception as exc:

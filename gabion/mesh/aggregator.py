@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Iterable, List
 
 from gabion.common.protocol import RoundResultPayload
@@ -13,6 +14,8 @@ def fedavg(results: Iterable[RoundResultPayload], fallback_weights: List[float])
         count = max(0, int(result["sample_count"]))
         weights = result["weights"]
         if len(weights) != len(weighted_sum) or count == 0:
+            continue
+        if any(not math.isfinite(float(w)) for w in weights):
             continue
         total_samples += count
         for i, weight in enumerate(weights):

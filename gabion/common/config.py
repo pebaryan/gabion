@@ -12,6 +12,8 @@ class MeshConfig:
     max_rounds: int = 3
     min_quorum: int = 1
     heartbeat_timeout_s: float = 30.0
+    checkpoint_path: str | None = None
+    checkpoint_every_rounds: int = 1
 
 
 @dataclass(frozen=True)

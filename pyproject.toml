@@ -25,5 +25,6 @@ dev = [
 gabion = "gabion.cli:main"
 
 [tool.pytest.ini_options]
+addopts = "-p no:faulthandler"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
