@@ -29,6 +29,8 @@ class RoundResultPayload(TypedDict):
     worker_id: str
     job_id: str
     round_id: int
+    round_token: str
+    model_version: int
     sample_count: int
     weights: List[float]
     metrics: Dict[str, float]

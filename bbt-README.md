@@ -26,7 +26,8 @@ Input (batch, seq_len)
     ├─> Transformer Layer 2
     │   └─> ...
     │
-    └─> Output Projection → (batch, seq_len, input_dim)
+    └─> Output Projection → logits (batch, seq_len, vocab)
+        training uses next-token targets over seq_len-1 positions
 ```
 
 ## Hyperparameters
@@ -38,7 +39,7 @@ Input (batch, seq_len)
 | `n_heads` | 4 | Number of attention heads |
 | `n_layers` | 2 | Number of transformer layers |
 | `seq_len` | 32 | Maximum sequence length |
-| `learning_rate` | 0.001 | SGD learning rate |
+| `learning_rate` | 0.001 | Worker trainer learning rate (CLI/runtime), not adapter constructor |
 | `vocab_size` | 256 | Vocabulary size for token embeddings |
 
 ## Usage with gabion
@@ -76,15 +77,17 @@ Start the mesh server with BBT:
 
 ```cmd
 python -m gabion.cli mesh ^
-  --host 127.0.0.1 \
-  --port 8766 \
-  --max-rounds 200 \
-  --min-quorum 2 \
-  --job-id bbt-job-v1 \
-  --job-name "BitByte Transformer" \
+  --host 127.0.0.1 ^
+  --port 8766 ^
+  --max-rounds 200 ^
+  --min-quorum 2 ^
+  --job-id bbt-job-v1 ^
+  --job-name "BitByte Transformer" ^
   --model-adapter gabion.user_models.bbt_transformer:BBTTransformerAdapter ^
   --checkpoint-path D:\code\gabion\artifacts\checkpoints\bbt-job-v1.json ^
-  --checkpoint-every-rounds 1
+  --checkpoint-every-rounds 1 ^
+  --eval-every-rounds 10 ^
+  --eval-batch-size 64
 ```
 
 ### Mixed GPU setup (CUDA + WebGPU/Vulkan)
@@ -108,7 +111,9 @@ python -m gabion.cli mesh ^
   --job-name "BitByte Transformer" ^
   --model-adapter gabion.user_models.bbt_transformer:BBTTransformerAdapter ^
   --checkpoint-path D:\code\gabion\artifacts\checkpoints\bbt-job-v1.json ^
-  --checkpoint-every-rounds 1
+  --checkpoint-every-rounds 1 ^
+  --eval-every-rounds 10 ^
+  --eval-batch-size 64
 ```
 
 Terminal 2 (`CUDA pebble`, NVIDIA):

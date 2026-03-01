@@ -17,6 +17,13 @@ class TrainingJob:
     min_quorum: int
     max_rounds: int
     initial_weights: List[float]
+    # Optimizer config
+    learning_rate: float = 5e-4
+    optimizer: str = "adam"            # "adam" or "sgd"
+    grad_clip_norm: float = 1.0       # 0 = disabled
+    warmup_steps: int = 10
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
 
     def to_dict(self) -> Dict[str, Any]:
         return {

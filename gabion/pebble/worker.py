@@ -31,7 +31,10 @@ class PebbleWorker:
                                 "register",
                                 {
                                     "worker_id": self.config.worker_id,
-                                    "capabilities": {"trainer": self.trainer.backend},
+                                    "capabilities": {
+                                        "trainer": self.trainer.backend,
+                                        "work_scale": f"{self.config.work_scale:.4f}",
+                                    },
                                 },
                             )
                         )
@@ -131,6 +134,8 @@ class PebbleWorker:
             return
 
         round_id = int(data["round_id"])
+        round_token = str(data.get("round_token", ""))
+        model_version = int(data.get("model_version", -1))
         weights = [float(v) for v in data["weights"]]
         local_epochs = int(data.get("local_epochs", 1))
 
@@ -145,6 +150,8 @@ class PebbleWorker:
                 {
                     "job_id": job_id,
                     "round_id": round_id,
+                    "round_token": round_token,
+                    "model_version": model_version,
                     "sample_count": sample_count,
                     "weights": new_weights,
                     "metrics": {"loss": loss},

@@ -59,11 +59,10 @@ class BBTTransformerAdapter:
         self.head_dim = d_model // n_heads
         assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
 
-        # Precompute RoPE inverse frequencies.
-        from tinygrad import Tensor
-
-        freq_idx = Tensor.arange(0, self.head_dim, 2).float()
-        self._inv_freq = Tensor.exp(-(math.log(self.rope_base) / self.head_dim) * freq_idx).realize()
+        # Keep adapter initialization backend-agnostic. tinygrad tensors are created lazily in forward.
+        self._inv_freq_values = [
+            math.exp(-(math.log(self.rope_base) / self.head_dim) * i) for i in range(0, self.head_dim, 2)
+        ]
 
     def init_params(self, seed: int) -> list:
         from tinygrad import Tensor
@@ -357,8 +356,9 @@ class BBTTransformerAdapter:
         from tinygrad import Tensor
 
         seq_len = x.shape[2]
+        inv_freq = Tensor(self._inv_freq_values)
         pos = Tensor.arange(seq_len).float().reshape(seq_len, 1)
-        freqs = pos * self._inv_freq.reshape(1, -1)  # [T, D/2]
+        freqs = pos * inv_freq.reshape(1, -1)  # [T, D/2]
         emb = freqs.cat(freqs, dim=-1)  # [T, D]
         cos = emb.cos().reshape(1, 1, seq_len, self.head_dim)
         sin = emb.sin().reshape(1, 1, seq_len, self.head_dim)
