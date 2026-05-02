@@ -10,6 +10,7 @@ from gabion.pebble.trainer import TinygradTrainer
 def _has_tinygrad() -> bool:
     try:
         import tinygrad  # type: ignore  # noqa: F401
+        import numpy  # type: ignore  # noqa: F401
 
         return True
     except Exception:

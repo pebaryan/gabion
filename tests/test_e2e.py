@@ -43,6 +43,8 @@ async def _fake_worker(worker_id: str, ws_url: str, seen_rounds: list[int]) -> N
                             {
                                 "job_id": payload["job_id"],
                                 "round_id": round_id,
+                                "round_token": payload.get("round_token", ""),
+                                "model_version": payload.get("model_version", 0),
                                 "sample_count": 8,
                                 "weights": updated,
                                 "metrics": {"loss": 0.2},
