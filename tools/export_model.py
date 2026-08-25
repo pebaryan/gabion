@@ -919,6 +919,141 @@ def export_tinygrad(path: Path, config: dict) -> dict:
     return {"config": config, "weights_b64": f16_base64(flat)}
 
 
+def _export_gguf_lfm2(meta: dict, by_name: dict, buf: bytes, data_base: int,
+                      config: dict | None = None) -> dict:
+    """LFM2/LFM2.5 (liquid-ai) — hybrid: attention layers (q/k per-head RMSNorm
+    + RoPE + softmax GQA) alternate with shortconv layers (gated depthwise
+    causal conv1d). Wire config carries `layer_types`; the JS engine branches
+    per layer. All matmuls bias-free; lm_head is tied to the embedding.
+
+    Flat layout (MUST match model_loader.js `_lfm2LayerSize`):
+      token_embd [V, D]
+      per layer i (layer_types[i]):
+        "attn": attn_norm [D], q [D,D], k [D,kvD], v [D,kvD],
+                q_norm [hd], k_norm [hd], o [D,D],
+                ffn_norm [D], gate_up [D,2*dff], down [dff,D]
+        "conv": attn_norm [D], in_proj [D,3D], conv [D,3], out_proj [D,D],
+                ffn_norm [D], gate_up [D,2*dff], down [dff,D]
+      token_embd_norm [D]
+    """
+    arch = "lfm2"
+
+    def kv(key: str):
+        return meta.get(f"{arch}.{key}")
+
+    def get(name: str) -> np.ndarray | None:
+        if name not in by_name:
+            return None
+        dims, gtype, off = by_name[name]
+        return _tensor_data(buf, name, dims, gtype, off, data_base)
+
+    def as_linear(name: str, want: tuple) -> np.ndarray:
+        """GGUF linear ne = (in, out); _dequant reverses to (out, in). Wire
+        wants (in, out) for JS `x.matmul(weight)` — always transpose."""
+        t = get(name)
+        if t is None:
+            raise ValueError(f"GGUF is missing required tensor '{name}'")
+        t = t.T
+        if t.shape != want:
+            raise ValueError(f"GGUF tensor '{name}': shape {t.shape} vs expected {want}")
+        return t
+
+    L = int(kv("block_count"))
+    D = int(kv("embedding_length"))
+    heads = int(kv("attention.head_count"))
+    d_ff = int(kv("feed_forward_length") or 4 * D)
+    rope_base = float(kv("rope.freq_base") or 10000.0)
+    ctx = int(kv("context_length") or 2048)
+    eps = float(kv("attention.layer_norm_rms_epsilon") or 1e-5)
+    conv_l_cache = int(kv("shortconv.l_cache") or 3)
+
+    tok_dims = by_name["token_embd.weight"][0] if "token_embd.weight" in by_name else ()
+    if len(tok_dims) == 2:
+        n_vocab = int(tok_dims[1])
+    else:
+        raise ValueError("cannot determine vocab size: token_embd.weight missing")
+
+    # head_dim + kv heads come from the actual tensors (the GGUF writes
+    # head_count_kv: 0 for lfm2 — trust the k_proj shape instead).
+    q0 = get("blk.2.attn_q.weight")
+    k0 = get("blk.2.attn_k.weight")
+    if q0 is None or k0 is None:
+        raise ValueError("lfm2 GGUF must have at least one attention layer")
+    head_dim = q0.shape[0] // heads
+    kvD = k0.shape[0]
+    if kvD % head_dim:
+        raise ValueError(f"kv projection {kvD} not divisible by head_dim {head_dim}")
+    kv_heads = kvD // head_dim
+
+    # layer_types: attention layers carry attn_q; the rest are shortconv-only.
+    layer_types = []
+    for i in range(L):
+        layer_types.append("attn" if f"blk.{i}.attn_q.weight" in by_name else "conv")
+
+    tensors = [get("token_embd.weight")]
+    for i in range(L):
+        norm = get(f"blk.{i}.attn_norm.weight").reshape(-1)
+        n2 = get(f"blk.{i}.ffn_norm.weight").reshape(-1)
+        gate = as_linear(f"blk.{i}.ffn_gate.weight", (D, d_ff))
+        up = as_linear(f"blk.{i}.ffn_up.weight", (D, d_ff))
+        gate_up = np.concatenate([gate, up], axis=1)  # JS splitLast -> gate first
+        down = as_linear(f"blk.{i}.ffn_down.weight", (d_ff, D))
+        if layer_types[i] == "attn":
+            q = as_linear(f"blk.{i}.attn_q.weight", (D, D))
+            k = as_linear(f"blk.{i}.attn_k.weight", (D, kvD))
+            v = as_linear(f"blk.{i}.attn_v.weight", (D, kvD))
+            qn = get(f"blk.{i}.attn_q_norm.weight").reshape(-1)
+            kn = get(f"blk.{i}.attn_k_norm.weight").reshape(-1)
+            o = as_linear(f"blk.{i}.attn_output.weight", (D, D))
+            tensors += [norm, q, k, v, qn, kn, o, n2, gate_up, down]
+        else:
+            inp = as_linear(f"blk.{i}.shortconv.in_proj.weight", (D, 3 * D))
+            conv = get(f"blk.{i}.shortconv.conv.weight")  # ne (3, D) -> (D, 3)
+            if conv.shape != (D, 3):
+                raise ValueError(f"blk.{i}.shortconv.conv.weight: shape {conv.shape} vs (D,3)")
+            outp = as_linear(f"blk.{i}.shortconv.out_proj.weight", (D, D))
+            tensors += [norm, inp, conv, outp, n2, gate_up, down]
+
+    tensors.append(get("token_embd_norm.weight").reshape(-1))
+    if "output.weight" in by_name:
+        raise ValueError("lfm2 wire assumes tied embeddings; unexpected output.weight")
+    tie = True
+
+    if config is None:
+        cfg = {
+            "arch": "lfm2", "vocab_size": n_vocab, "d_model": D,
+            "n_heads": heads, "n_kv_heads": kv_heads, "head_dim": head_dim,
+            "n_layers": L, "layer_types": layer_types,
+            "conv_l_cache": conv_l_cache, "norm_eps": eps,
+            "seq_len": min(ctx, 4096), "d_ff": d_ff, "tie_weights": tie,
+            "act_quant": True, "rope_base": rope_base,
+        }
+    else:
+        cfg = dict(config)
+        cfg["arch"] = "lfm2"
+        cfg["layer_types"] = list(layer_types)
+        cfg["conv_l_cache"] = conv_l_cache
+        cfg["norm_eps"] = eps
+        cfg["head_dim"] = head_dim
+        cfg["n_kv_heads"] = kv_heads
+        cfg["tie_weights"] = tie
+    flat = np.concatenate([np.asarray(t, dtype=np.float32).reshape(-1) for t in tensors])
+    wire = {"config": cfg, "weights_b64": f16_base64(flat)}
+
+    tokens = meta.get("tokenizer.ggml.tokens")
+    if tokens and meta.get("tokenizer.ggml.merges"):
+        wire["vocab"] = {t: i for i, t in enumerate(tokens)}
+        wire["merges"] = [ln for ln in meta["tokenizer.ggml.merges"] if ln]
+        ttypes = meta.get("tokenizer.ggml.token_type")
+        if ttypes:
+            wire["special"] = [t for i, t in enumerate(tokens)
+                               if i < len(ttypes) and ttypes[i] in (3, 4)]
+        if meta.get("tokenizer.chat_template"):
+            wire["chat_template"] = meta["tokenizer.chat_template"]
+        cfg["tokenizer"] = f"lfm2:{meta.get('tokenizer.ggml.pre', 'bpe')}"
+    return wire
+
+
 def export_gguf(path: Path, config: dict | None = None) -> dict:
     buf = Path(path).read_bytes()
     meta, infos, data_base = parse_gguf(path)
@@ -926,6 +1061,8 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
 
     # Arch-prefixed metadata (llama, qwen2, gemma, ... all share the key layout).
     arch = str(meta.get("general.architecture", "llama"))
+    if arch == "lfm2":
+        return _export_gguf_lfm2(meta, by_name, buf, data_base, config)
 
     def kv(key: str):
         return meta.get(f"{arch}.{key}") if f"{arch}.{key}" in meta else meta.get(f"llama.{key}")
@@ -1127,12 +1264,29 @@ def main(argv=None) -> int:
         V, D, L = cfg["vocab_size"], cfg["d_model"], cfg["n_layers"]
         kvD = D // cfg["n_heads"] * cfg["n_kv_heads"]
         dFF = cfg.get("d_ff") or (D * 4)
-        per = 2 * D * D + 2 * D * kvD + 2 * D + 2 * D * dFF + dFF * D
+        # Per-layer flat sizes (f16 elements). lfm2 layers are heterogeneous
+        # (attn vs conv); llama-family layers are uniform.
+        if cfg.get("arch") == "lfm2":
+            lt = cfg["layer_types"]
+            hd = cfg["head_dim"]
+            kvD = hd * cfg["n_kv_heads"]
+            def layer_n(i):
+                if lt[i] == "attn":
+                    return 2 * D * D + 2 * D * kvD + 2 * D * dFF + dFF * D + 2 * D + 2 * hd
+                return 4 * D * D + 2 * D * dFF + dFF * D + 2 * D + 3 * D
+            sizes = [layer_n(i) for i in range(L)]
+        else:
+            per = 2 * D * D + 2 * D * kvD + 2 * D + 2 * D * dFF + dFF * D
+            sizes = [per] * L
+        offs = [0]
+        for s in sizes:
+            offs.append(offs[-1] + s)
         f16 = np.frombuffer(base64.b64decode(out["weights_b64"]), dtype="<u2").view(np.float16)
         tok_n = V * D
-        assert len(f16) == tok_n + L * per + D + (0 if cfg["tie_weights"] else D * V)
+        assert len(f16) == tok_n + offs[-1] + D + (0 if cfg["tie_weights"] else D * V), \
+            f"flat size {len(f16)} vs expected {tok_n + offs[-1] + D}"
         # coordinator: embedding + tail (final norm [+ lm_head when untied])
-        coord = np.concatenate([f16[:tok_n], f16[tok_n + L * per:]]).view("<u2").tobytes()
+        coord = np.concatenate([f16[:tok_n], f16[tok_n + offs[-1]:]]).view("<u2").tobytes()
         (d / "coord.f16").write_bytes(coord)
         # shards: contiguous per-layer slices of the flat
         shards = []
@@ -1142,7 +1296,7 @@ def main(argv=None) -> int:
             if a == b:
                 shards.append(None)
                 continue
-            sl = f16[tok_n + a * per: tok_n + b * per].view("<u2").tobytes()
+            sl = f16[tok_n + offs[a]: tok_n + offs[b]].view("<u2").tobytes()
             (d / f"shard_{i}.f16").write_bytes(sl)
             shards.append({"layers": [a, b], "file": f"shard_{i}.f16", "n_layers": b - a})
         out["shards"] = shards

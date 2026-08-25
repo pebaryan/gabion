@@ -47,8 +47,14 @@
       this.ropeBase = config.ropeBase || 10000.0;
       this.headDim = this.D / this.H;
       this.kvD = this.kvH * this.headDim;
-      this.eps = 1e-6;
+      this.eps = config.normEps != null ? config.normEps : 1e-6;
       this.actQuant = config.actQuant !== false; // default true
+      // LFM2 hybrid arch: layerTypes[i] is "attn" (q/k-norm + softmax GQA) or
+      // "conv" (gated depthwise causal shortconv). headDim is explicit (64).
+      this.arch = config.arch || "llama";
+      this.layerTypes = config.layerTypes || null;
+      this.convLCache = config.convLCache || 3;
+      this.headDim = config.headDim || (this.D / this.H);
       // Optional attention biases (q/k/v per-layer; Qwen2.5-Instruct has them)
       this._qBiases = config.qBiases || null;
       this._kBiases = config.kBiases || null;
@@ -63,8 +69,21 @@
         if (this._qBiases) bl.qBias = this._qBiases[l];
         if (this._kBiases) bl.kBias = this._kBiases[l];
         if (this._vBiases) bl.vBias = this._vBiases[l];
+        if (this.arch === "lfm2") {
+          if (!this.layerTypes || this.layerTypes[l] === "conv") {
+            bl.isConv = true;
+            bl.inProj = new nn.Linear(this.D, 3 * this.D);
+            bl.convW = new Tensor(new Float32Array(this.D * this.convLCache), [this.D, this.convLCache], false);
+            bl.outProj = new nn.Linear(this.D, this.D);
+          } else {
+            bl.qn = new Tensor(new Float32Array(this.headDim), [this.headDim], false);
+            bl.kn = new Tensor(new Float32Array(this.headDim), [this.headDim], false);
+          }
+        }
         this.layers.push(bl);
       }
+      // Shortconv rolling state per layer: [L, D, convLCache] most-recent-first
+      this._convStates = new Float32Array(this.L * this.D * this.convLCache);
       this.normF = this.lean ? new nn.RMSNorm(1) : new nn.RMSNorm(this.D);
       if (!this.tieWeights && !this.lean) {
         this.lmHead = new nn.Linear(this.D, this.V);
@@ -95,6 +114,20 @@
       // GPU buffers for RoPE tables (lazy-initialized, non-parameter)
       this._ropeCosBuf = null;
       this._ropeSinBuf = null;
+    }
+
+    /**
+     * LFM2 per-head RMSNorm: normalize each (head, headDim) slice of x
+     * in place with the per-head weight w ([headDim]) and eps.
+     */
+    _rmsNormHeads(x, w, nHeads, hd, eps) {
+      for (let h = 0; h < nHeads; h++) {
+        const off = h * hd;
+        let ss = 0;
+        for (let i = 0; i < hd; i++) ss += x[off + i] * x[off + i];
+        const inv = 1 / Math.sqrt(ss / hd + eps);
+        for (let i = 0; i < hd; i++) x[off + i] *= inv * w[i];
+      }
     }
 
     /** Upload RoPE cos/sin tables to GPU (once). */
@@ -133,11 +166,29 @@
       take(this.tokEmb.weight, uploadToGPU);
       for (let l = 0; l < this.L; l++) {
         const bl = this.layers[l];
-        take(bl.q.weight, uploadToGPU);
-        take(bl.k.weight, uploadToGPU);
-        take(bl.v.weight, uploadToGPU);
-        take(bl.o.weight, uploadToGPU);
-        take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
+        if (this.arch === "lfm2") {
+          // layout: attn [norm1,q,k,v,qn,kn,o, gate_up,norm2,down]
+          //         conv [norm1,in_proj,convW,out_proj, gate_up,norm2,down]
+          take(bl.norm1.weight);
+          if (bl.isConv) {
+            take(bl.inProj.weight, uploadToGPU);
+            take(bl.convW, uploadToGPU);
+            take(bl.outProj.weight, uploadToGPU);
+          } else {
+            take(bl.q.weight, uploadToGPU);
+            take(bl.k.weight, uploadToGPU);
+            take(bl.v.weight, uploadToGPU);
+            take(bl.qn);
+            take(bl.kn);
+            take(bl.o.weight, uploadToGPU);
+          }
+        } else {
+          take(bl.q.weight, uploadToGPU);
+          take(bl.k.weight, uploadToGPU);
+          take(bl.v.weight, uploadToGPU);
+          take(bl.o.weight, uploadToGPU);
+          take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
+        }
         take(bl.gateUp.weight, uploadToGPU);
         take(bl.norm2.weight);          // CPU (1D)
         take(bl.down.weight, uploadToGPU);
@@ -162,11 +213,27 @@
       };
       for (let l = 0; l < this.L; l++) {
         const bl = this.layers[l];
-        take(bl.q.weight, uploadToGPU);
-        take(bl.k.weight, uploadToGPU);
-        take(bl.v.weight, uploadToGPU);
-        take(bl.o.weight, uploadToGPU);
-        take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
+        if (this.arch === "lfm2") {
+          take(bl.norm1.weight);
+          if (bl.isConv) {
+            take(bl.inProj.weight, uploadToGPU);
+            take(bl.convW, uploadToGPU);
+            take(bl.outProj.weight, uploadToGPU);
+          } else {
+            take(bl.q.weight, uploadToGPU);
+            take(bl.k.weight, uploadToGPU);
+            take(bl.v.weight, uploadToGPU);
+            take(bl.qn);
+            take(bl.kn);
+            take(bl.o.weight, uploadToGPU);
+          }
+        } else {
+          take(bl.q.weight, uploadToGPU);
+          take(bl.k.weight, uploadToGPU);
+          take(bl.v.weight, uploadToGPU);
+          take(bl.o.weight, uploadToGPU);
+          take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
+        }
         take(bl.gateUp.weight, uploadToGPU);
         take(bl.norm2.weight);          // CPU (1D)
         take(bl.down.weight, uploadToGPU);
@@ -853,9 +920,30 @@
         let x = Tensor.fromArray(h.data.subarray(r * D, (r + 1) * D), [B, 1, D], false);
         for (let l = 0; l < this.L; l++) {
           const bl = this.layers[l];
+          if (this.arch === "lfm2" && bl.isConv) {
+            // ---- LFM2 shortconv block (gated depthwise causal conv1d) ----
+            const hh = bl.norm1.forward(x);
+            const h2d = hh.reshape([1, D]);
+            const bcx = (await h2d.matmul(bl.inProj.weight).toCPU()).data;  // [1, 3D]
+            const b = bcx.subarray(0, D), c = bcx.subarray(D, 2 * D), xx = bcx.subarray(2 * D, 3 * D);
+            const st = this._convStates.subarray(l * D * this.convLCache, (l + 1) * D * this.convLCache);
+            const cv = bl.convW.data;  // [D, 3]
+            const y = new Float32Array(D);
+            for (let i = 0; i < D; i++) {
+              const bx = b[i] * xx[i];
+              // y = w0*bx[t] + w1*bx[t-1] + w2*bx[t-2]; state = [t-1, t-2, t-3]
+              y[i] = cv[i * 3] * bx + cv[i * 3 + 1] * st[i * 3] + cv[i * 3 + 2] * st[i * 3 + 1];
+              // roll state: [bx, t-1, t-2]
+              st[i * 3 + 2] = st[i * 3 + 1]; st[i * 3 + 1] = st[i * 3]; st[i * 3] = bx;
+            }
+            for (let i = 0; i < D; i++) y[i] *= c[i];
+            const o = (await Tensor.fromArray(y, [1, D], false).matmul(bl.outProj.weight).toCPU()).data;
+            chk("layer" + l + ".conv", o);
+            x = x.add(Tensor.fromArray(o, [1, 1, D], false));
+          } else {
           // Pre-norm + q/k/v projections
-          let hh = bl.norm1.forward(x);
-          const h2d = hh.reshape([1, D]);
+          let hh2 = bl.norm1.forward(x);
+          const h2d = hh2.reshape([1, D]);
           let q, k, v;
           if (ternarize) {
             q = this._bitlinear(h2d, bl.q.weight);
@@ -870,6 +958,11 @@
           if (k.onGPU) await k.toCPU();
           if (v.onGPU) await v.toCPU();
           chk("layer" + l + ".q", q.data); chk("layer" + l + ".k", k.data); chk("layer" + l + ".v", v.data);
+          // LFM2: per-head RMSNorm on q/k (before any bias — lfm2 has none)
+          if (this.arch === "lfm2") {
+            this._rmsNormHeads(q.data, bl.qn.data, H, headDim, this.eps);
+            this._rmsNormHeads(k.data, bl.kn.data, kvH, headDim, this.eps);
+          }
           // Attention biases (Qwen2.5-Instruct): affine projections
           if (bl.qBias) for (let i = 0; i < q.data.length; i++) q.data[i] += bl.qBias[i % bl.qBias.length];
           if (bl.kBias) for (let i = 0; i < k.data.length; i++) k.data[i] += bl.kBias[i % bl.kBias.length];
@@ -910,6 +1003,7 @@
           chk("layer" + l + ".o", o.data);
           x = x.add(o);
           chk("layer" + l + ".x", x.data);
+          } // end else (attention path)
 
           // FFN + residual — GPU-resident when the FFN weights are on GPU
           // (gate_up/down are the dominant per-layer CPU cost: ~30ms each)

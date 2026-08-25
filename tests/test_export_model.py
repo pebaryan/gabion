@@ -582,3 +582,77 @@ def test_export_cli(tmp_path, monkeypatch):
     assert out.exists()
     data = json.loads(out.read_text())
     assert "weights_b64" in data and data["config"]["d_model"] == 8
+
+
+def test_export_gguf_lfm2(tmp_path):
+    """Synthetic lfm2 GGUF (hybrid attn/conv layers) -> wire: config, layout,
+    flat sizes, tied head, tokenizer. Mirrors the real LFM2.5-2.6B pattern."""
+    import numpy as np
+    from tools.export_model import f16_decode
+    D, H, KVH, HD, DFF, L, V = 32, 4, 2, 8, 64, 6, 16
+    rng = np.random.default_rng(7)
+    lt = ["conv", "conv", "attn", "conv", "conv", "attn"]
+    tensors = {
+        "token_embd.weight": rng.standard_normal((V, D)).astype(np.float32),
+        "token_embd_norm.weight": rng.standard_normal(D).astype(np.float32),
+    }
+    for i in range(L):
+        tensors[f"blk.{i}.attn_norm.weight"] = rng.standard_normal(D).astype(np.float32)
+        tensors[f"blk.{i}.ffn_norm.weight"] = rng.standard_normal(D).astype(np.float32)
+        tensors[f"blk.{i}.ffn_gate.weight"] = rng.standard_normal((DFF, D)).astype(np.float32)
+        tensors[f"blk.{i}.ffn_up.weight"] = rng.standard_normal((DFF, D)).astype(np.float32)
+        tensors[f"blk.{i}.ffn_down.weight"] = rng.standard_normal((D, DFF)).astype(np.float32)
+        if lt[i] == "attn":
+            tensors[f"blk.{i}.attn_q.weight"] = rng.standard_normal((D, D)).astype(np.float32)
+            tensors[f"blk.{i}.attn_k.weight"] = rng.standard_normal((KVH * HD, D)).astype(np.float32)
+            tensors[f"blk.{i}.attn_v.weight"] = rng.standard_normal((KVH * HD, D)).astype(np.float32)
+            tensors[f"blk.{i}.attn_q_norm.weight"] = rng.standard_normal(HD).astype(np.float32)
+            tensors[f"blk.{i}.attn_k_norm.weight"] = rng.standard_normal(HD).astype(np.float32)
+            tensors[f"blk.{i}.attn_output.weight"] = rng.standard_normal((D, D)).astype(np.float32)
+        else:
+            tensors[f"blk.{i}.shortconv.in_proj.weight"] = rng.standard_normal((3 * D, D)).astype(np.float32)
+            tensors[f"blk.{i}.shortconv.conv.weight"] = rng.standard_normal((D, 3)).astype(np.float32)
+            tensors[f"blk.{i}.shortconv.out_proj.weight"] = rng.standard_normal((D, D)).astype(np.float32)
+    meta = {
+        "general.architecture": "lfm2",
+        "lfm2.block_count": L,
+        "lfm2.embedding_length": D,
+        "lfm2.attention.head_count": H,
+        "lfm2.feed_forward_length": DFF,
+        "lfm2.rope.freq_base": 1e7,
+        "lfm2.context_length": 128,
+        "lfm2.attention.layer_norm_rms_epsilon": 1e-5,
+        "lfm2.shortconv.l_cache": 3,
+        "tokenizer.ggml.tokens": ["a", "b"],
+        "tokenizer.ggml.merges": ["a b"],
+    }
+    path = tmp_path / "lfm2.gguf"
+    _write_gguf(path, meta, tensors)
+    out = export_gguf(path)
+    cfg = out["config"]
+    assert cfg["arch"] == "lfm2"
+    assert cfg["layer_types"] == lt
+    assert cfg["n_kv_heads"] == KVH and cfg["head_dim"] == HD
+    assert cfg["conv_l_cache"] == 3 and cfg["norm_eps"] == pytest.approx(1e-5, rel=1e-6)
+    assert cfg["tie_weights"] is True
+    assert cfg["n_heads"] == H and cfg["d_model"] == D and cfg["n_layers"] == L
+    # flat size: emb + 2 attn layers + 4 conv layers + final norm (tied head)
+    attn_n = 2 * D * D + 2 * D * (KVH * HD) + 2 * D * DFF + DFF * D + 2 * D + 2 * HD
+    conv_n = 4 * D * D + 2 * D * DFF + DFF * D + 2 * D + 3 * D
+    f16 = f16_decode(out["weights_b64"])
+    assert len(f16) == V * D + 2 * attn_n + 4 * conv_n + D
+    # spot-check: blk.2 (attn) layout starts after emb + layers 0,1 (conv)
+    off2 = V * D + 2 * conv_n
+    f32 = np.array(f16, dtype=np.float16).astype(np.float32)
+    # layer 2: attn_norm [D], then attn_q [D, D]
+    q_flat = f32[off2 + D: off2 + D + D * D]
+    assert np.allclose(q_flat.reshape(D, D), tensors["blk.2.attn_q.weight"].T, atol=1e-3)
+    # conv layer 0: attn_norm [D], then in_proj [D, 3D]
+    inp_flat = f32[V * D + D: V * D + D + D * 3 * D]
+    assert np.allclose(inp_flat.reshape(D, 3 * D), tensors["blk.0.shortconv.in_proj.weight"].T, atol=1e-3)
+    # conv weight ne (3, D) -> wire (D, 3), no transpose
+    cv_flat = f32[V * D + D + D * 3 * D: V * D + D + D * 3 * D + D * 3]
+    assert np.allclose(cv_flat.reshape(D, 3), tensors["blk.0.shortconv.conv.weight"], atol=1e-3)
+    # tokenizer embedded
+    assert out["vocab"] == {"a": 0, "b": 1} and out["merges"] == ["a b"]
+    assert cfg["tokenizer"] == "lfm2:bpe"
