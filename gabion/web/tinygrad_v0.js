@@ -2881,6 +2881,26 @@
     }
   }
 
+  /**
+   * KV-cache attention over a single query position (decode step / prefix attend).
+   * q: [BH, headDim], kCache/vCache: [BH, L, headDim] — all must be on GPU.
+   * opts: { causal: bool, pos: number } — with causal, cache positions j > pos are masked.
+   * Returns output Tensor [BH, headDim] on GPU. Forward-only (no autograd path);
+   * decode inference does not backprop through attention.
+   */
+  function kvAttention(q, kCache, vCache, opts = {}) {
+    const backend = gpu();
+    if (!backend || !q.onGPU || !kCache.onGPU || !vCache.onGPU) {
+      throw new Error("kvAttention requires GPU tensors (WebGPU backend)");
+    }
+    const BH = q.shape[0];
+    const headDim = q.shape[1];
+    const L = kCache.shape[1];
+    const P = { BH, L, headDim, scale: 1.0 / Math.sqrt(headDim), causal: opts.causal ? 1 : 0, pos: opts.pos || 0 };
+    const outBuf = backend.kvAttention(q.gpuBuffer, kCache.gpuBuffer, vCache.gpuBuffer, P);
+    return new Tensor(new Float32Array(BH * headDim), [BH, headDim], q.requiresGrad, [], () => {}, outBuf, "gpu");
+  }
+
   const nn = {
     Module, Linear, Embedding, RMSNorm, LayerNorm, Dropout,
     Conv2d, Conv1d, ConvTranspose2d, ConvTranspose1d, GroupNorm, BatchNorm, BatchNorm2d: BatchNorm, LSTMCell,
@@ -2903,6 +2923,7 @@
     training: false,
     crossEntropy,
     crossEntropyGPU,
+    kvAttention,
     embeddingLookup,
     rmsNorm,
     f32ToF16,

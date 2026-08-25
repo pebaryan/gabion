@@ -653,10 +653,123 @@ const report = {};
   report.lstm_dbhh = maxAbs(dbK, cell.biasHh.grad);
 }
 
+// ---- KV-cache attention (decode step): scores + apply, incl. causal mask ----
+{
+  const rng = (() => { let s = 314159; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
+  const BH = 2, L = 5, headDim = 4, scale = 1 / Math.sqrt(headDim);
+  const q = new Float32Array(BH * headDim), kc = new Float32Array(BH * L * headDim), vc = new Float32Array(BH * L * headDim);
+  for (let i = 0; i < q.length; i++) q[i] = rng() * 2 - 1;
+  for (let i = 0; i < kc.length; i++) kc[i] = rng() * 2 - 1;
+  for (let i = 0; i < vc.length; i++) vc[i] = rng() * 2 - 1;
+
+  // Reference: explicit softmax-weighted sum over the cache (no masking)
+  const scoresRef = new Float32Array(BH * L), outRef = new Float32Array(BH * headDim);
+  for (let bh = 0; bh < BH; bh++) {
+    for (let j = 0; j < L; j++) {
+      let dot = 0;
+      for (let d = 0; d < headDim; d++) dot += q[bh * headDim + d] * kc[(bh * L + j) * headDim + d];
+      scoresRef[bh * L + j] = dot * scale;
+    }
+    let m = -Infinity;
+    for (let j = 0; j < L; j++) m = Math.max(m, scoresRef[bh * L + j]);
+    let sumE = 0;
+    const p = new Float32Array(L);
+    for (let j = 0; j < L; j++) { p[j] = Math.exp(scoresRef[bh * L + j] - m); sumE += p[j]; }
+    for (let d = 0; d < headDim; d++) {
+      let acc = 0;
+      for (let j = 0; j < L; j++) acc += p[j] / sumE * vc[(bh * L + j) * headDim + d];
+      outRef[bh * headDim + d] = acc;
+    }
+  }
+
+  // WGSL kv_attention_scores + kv_attention_apply transpiled (no causal)
+  const scoresK = new Float32Array(BH * L), outK = new Float32Array(BH * headDim);
+  for (let idx = 0; idx < BH * L; idx++) {
+    const bh = (idx / L) | 0, j = idx % L;
+    let dot = 0;
+    for (let d = 0; d < headDim; d++) dot += q[bh * headDim + d] * kc[(bh * L + j) * headDim + d];
+    scoresK[idx] = dot * scale;
+  }
+  for (let idx = 0; idx < BH * headDim; idx++) {
+    const bh = (idx / headDim) | 0, d = idx % headDim;
+    let m = -Infinity;
+    for (let j = 0; j < L; j++) m = Math.max(m, scoresK[bh * L + j]);
+    let sumE = 0, acc = 0;
+    for (let j = 0; j < L; j++) {
+      const e = Math.exp(scoresK[bh * L + j] - m);
+      sumE += e;
+      acc += e * vc[(bh * L + j) * headDim + d];
+    }
+    outK[idx] = acc / Math.max(sumE, 1e-12);
+  }
+  report.kv_scores = maxAbs(scoresK, scoresRef);
+  report.kv_out = maxAbs(outK, outRef);
+
+  // Causal mask: attend over prefix pos=2 with L=5 (positions 3,4 must contribute 0)
+  const pos = 2;
+  const outCausal = new Float32Array(BH * headDim);
+  for (let idx = 0; idx < BH * headDim; idx++) {
+    const bh = (idx / headDim) | 0, d = idx % headDim;
+    let m = -Infinity;
+    for (let j = 0; j <= pos; j++) m = Math.max(m, scoresK[bh * L + j]);
+    let sumE = 0, acc = 0;
+    for (let j = 0; j <= pos; j++) {
+      const e = Math.exp(scoresK[bh * L + j] - m);
+      sumE += e;
+      acc += e * vc[(bh * L + j) * headDim + d];
+    }
+    outCausal[idx] = acc / Math.max(sumE, 1e-12);
+  }
+  // Cross-check against full-sequence causal attention (last row equivalence): the
+  // kv-attention over the full cache at pos = L-1 must equal the last row of a
+  // full-sequence causal attention over the same K/V.
+  const outFullRow = new Float32Array(BH * headDim);
+  for (let bh = 0; bh < BH; bh++) {
+    let m = -Infinity;
+    for (let j = 0; j < L; j++) m = Math.max(m, scoresRef[bh * L + j]);
+    let sumE = 0;
+    const p = new Float32Array(L);
+    for (let j = 0; j < L; j++) { p[j] = Math.exp(scoresRef[bh * L + j] - m); sumE += p[j]; }
+    for (let d = 0; d < headDim; d++) {
+      let acc = 0;
+      for (let j = 0; j < L; j++) acc += p[j] / sumE * vc[(bh * L + j) * headDim + d];
+      outFullRow[bh * headDim + d] = acc;
+    }
+  }
+  const causalFull = new Float32Array(BH * headDim);
+  for (let idx = 0; idx < BH * headDim; idx++) {
+    const bh = (idx / headDim) | 0, d = idx % headDim;
+    let m = -Infinity;
+    for (let j = 0; j < L; j++) m = Math.max(m, scoresK[bh * L + j]);
+    let sumE = 0, acc = 0;
+    for (let j = 0; j < L; j++) {
+      const e = Math.exp(scoresK[bh * L + j] - m);
+      sumE += e;
+      acc += e * vc[(bh * L + j) * headDim + d];
+    }
+    causalFull[idx] = acc / Math.max(sumE, 1e-12);
+  }
+  report.kv_causal = maxAbs(outCausal, outRef.slice(0, BH * headDim).map((_, i) => {
+    // masked reference: recompute per bh over 0..pos
+    const bh = (i / headDim) | 0, d = i % headDim;
+    let m = -Infinity;
+    for (let j = 0; j <= pos; j++) m = Math.max(m, scoresRef[bh * L + j]);
+    let sumE = 0, acc = 0;
+    for (let j = 0; j <= pos; j++) {
+      const e = Math.exp(scoresRef[bh * L + j] - m);
+      sumE += e;
+      acc += e * vc[(bh * L + j) * headDim + d];
+    }
+    return acc / Math.max(sumE, 1e-12);
+  }));
+  report.kv_fullrow = maxAbs(causalFull, outFullRow);
+}
+
 const convChecks = [report.conv2d_fwd, report.conv2d_dx, report.conv2d_dw, report.conv2d_db, report.ct_fwd, report.ct_dx, report.ct_dw, report.ct_db];
 const normChecks = [report.bn_fwd, report.bn_dx, report.bn_dgamma, report.bn_dbeta, report.aff_fwd, report.aff_dx, report.aff_dw, report.aff_db];
 const lastChecks = [report.ln_bwd, report.afflast_fwd, report.afflast_dx, report.afflast_dw, report.afflast_db, report.lstm_h, report.lstm_c];
 const lstmBwdChecks = [report.lstm_dx, report.lstm_dh, report.lstm_dc, report.lstm_dwih, report.lstm_dwhh, report.lstm_dbih, report.lstm_dbhh];
-if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4)) || lastChecks.some((v) => !(v < 1e-4)) || lstmBwdChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
+const kvChecks = [report.kv_scores, report.kv_out, report.kv_causal, report.kv_fullrow];
+if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4)) || lastChecks.some((v) => !(v < 1e-4)) || lstmBwdChecks.some((v) => !(v < 1e-4)) || kvChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
 
 console.log(JSON.stringify(report, null, 2));

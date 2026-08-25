@@ -932,6 +932,68 @@
       return dwhhBuf;
     }
 
+    /** Pack the KV-attention Params struct (BH, L, headDim u32 + scale f32 + causal/pos), 24 bytes. */
+    _kvUniform(P) {
+      const ab = new ArrayBuffer(24);
+      new Uint32Array(ab, 0, 3).set([P.BH, P.L, P.headDim]);
+      new Float32Array(ab, 12, 1).set([P.scale]);
+      new Uint32Array(ab, 16, 2).set([P.causal, P.pos]);
+      return new Uint8Array(ab);
+    }
+
+    /**
+     * Attention scores over a KV cache. Q: [BH*headDim], KCache: [BH*L*headDim].
+     * causal: mask positions j > pos to -inf. Returns scoresBuf [BH*L].
+     */
+    kvAttentionScores(qBuf, kCacheBuf, P) {
+      const pipeline = this.getPipeline("kv_attention_scores");
+      const uniformBuf = this.createUniformBuffer(this._kvUniform(P));
+      const scoresBuf = this.createEmptyBuffer(P.BH * P.L * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: qBuf } },
+          { binding: 2, resource: { buffer: kCacheBuf } },
+          { binding: 3, resource: { buffer: scoresBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.BH * P.L / 256), 1, 1, uniformBuf);
+      return scoresBuf;
+    }
+
+    /**
+     * Softmax-weighted sum over a KV cache. scores: [BH*L], VCache: [BH*L*headDim].
+     * Returns outBuf [BH*headDim]. No L limit (per-thread scan, no shared score buffer).
+     */
+    kvAttentionApply(scoresBuf, vCacheBuf, P) {
+      const pipeline = this.getPipeline("kv_attention_apply");
+      const uniformBuf = this.createUniformBuffer(this._kvUniform(P));
+      const outBuf = this.createEmptyBuffer(P.BH * P.headDim * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: scoresBuf } },
+          { binding: 2, resource: { buffer: vCacheBuf } },
+          { binding: 3, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.BH * P.headDim / 256), 1, 1, uniformBuf);
+      return outBuf;
+    }
+
+    /**
+     * KV-cache attention over a single query position (decode step / prefix attend).
+     * Q: [BH*headDim], KCache/VCache: [BH*L*headDim]. Returns outBuf [BH*headDim].
+     */
+    kvAttention(qBuf, kCacheBuf, vCacheBuf, P) {
+      const scoresBuf = this.kvAttentionScores(qBuf, kCacheBuf, P);
+      const outBuf = this.kvAttentionApply(scoresBuf, vCacheBuf, P);
+      this.releaseBuffer(scoresBuf);
+      return outBuf;
+    }
+
     /**
      * Dispatch row-wise reduction.
      * op: 0=sum, 1=max, 2=sumSquares
