@@ -1661,6 +1661,18 @@
     /**
      * Transpose last two dims of a 3D tensor: [B, M, N] -> [B, N, M].
      */
+    exp() {
+      const n = this.numel;
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = Math.exp(this.data[i]);
+      const outData = out;
+      return new Tensor(out, [...this.shape], this.requiresGrad, [this], (gout) => {
+        if (!this.requiresGrad) return;
+        if (!this.grad) this.grad = new Float32Array(this.data.length);
+        for (let i = 0; i < n; i++) this.grad[i] += gout[i] * outData[i];
+      });
+    }
+
     transpose3d() {
       if (this.shape.length !== 3) throw new Error(`transpose3d requires 3D, got ${this.shape}`);
       const [B, m, n] = this.shape;
@@ -3153,6 +3165,66 @@
     }
   }
 
+  class VAEEncoder extends Module {
+    constructor(inChannels = 2, baseChannels = 4, latentDim = 4, { numGroups = 2, eps = 1e-5 } = {}) {
+      super();
+      this.stem = new Conv2d(inChannels, baseChannels, 3, { padding: 1, bias: false });
+      this.rb0 = new ResBlock(baseChannels, baseChannels, 16, { numGroups, eps });
+      this.down = new Conv2d(baseChannels, baseChannels, 3, { stride: 2, padding: 1, bias: false });
+      this.rb1 = new ResBlock(baseChannels, baseChannels, 16, { numGroups, eps });
+      this.muConv = new Conv2d(baseChannels, latentDim, 1, { bias: true });
+      this.logvarConv = new Conv2d(baseChannels, latentDim, 1, { bias: true });
+    }
+    forward(x) {
+      let h = this.stem.forward(x);
+      h = this.rb0.forward(h, null);
+      h = this.down.forward(h);
+      h = this.rb1.forward(h, null);
+      const mu = this.muConv.forward(h);
+      const logvar = this.logvarConv.forward(h);
+      return { mu, logvar };
+    }
+  }
+
+  class VAEDecoder extends Module {
+    constructor(latentDim = 4, baseChannels = 4, outChannels = 2, { numGroups = 2, eps = 1e-5 } = {}) {
+      super();
+      this.rb0 = new ResBlock(latentDim, baseChannels, 16, { numGroups, eps });
+      this.up = new ConvTranspose2d(baseChannels, baseChannels, 3, { stride: 2, padding: 1, outputPadding: 1, bias: false });
+      this.rb1 = new ResBlock(baseChannels, baseChannels, 16, { numGroups, eps });
+      this.outNorm = new GroupNorm(Math.min(numGroups, baseChannels), baseChannels, { eps });
+      this.outConv = new Conv2d(baseChannels, outChannels, 3, { padding: 1, bias: true });
+    }
+    forward(z) {
+      let h = this.rb0.forward(z, null);
+      h = this.up.forward(h);
+      h = this.rb1.forward(h, null);
+      h = this.outNorm.forward(h).silu();
+      h = this.outConv.forward(h);
+      return h;
+    }
+  }
+
+  class VAE extends Module {
+    constructor(inChannels = 2, baseChannels = 4, latentDim = 4, opts = {}) {
+      super();
+      this.encoder = new VAEEncoder(inChannels, baseChannels, latentDim, opts);
+      this.decoder = new VAEDecoder(latentDim, baseChannels, inChannels, opts);
+    }
+    reparameterize(mu, logvar, eps) {
+      const halfLogvar = logvar.scale(0.5);
+      const std = halfLogvar.exp();
+      const scaled = std.mul(eps);
+      return mu.add(scaled);
+    }
+    forward(x, eps) {
+      const { mu, logvar } = this.encoder.forward(x);
+      const z = this.reparameterize(mu, logvar, eps);
+      const recon = this.decoder.forward(z);
+      return { recon, mu, logvar, z };
+    }
+  }
+
   class BatchNorm extends Module {
     constructor(sz, { eps = 1e-5, affine = true, momentum = 0.1 } = {}) {
       super();
@@ -3410,6 +3482,9 @@
     ResBlock,
     SpatialAttention,
     UNet,
+    VAEEncoder,
+    VAEDecoder,
+    VAE,
   };
   const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD, LAMB, LARS, Muon };
 
@@ -3427,6 +3502,9 @@
     LARS,
     Muon,
     DDPMSampler,
+    VAEEncoder,
+    VAEDecoder,
+    VAE,
     training: false,
     crossEntropy,
     crossEntropyGPU,

@@ -361,6 +361,73 @@ def build_fixture() -> dict:
     samp_scaled = (samp_eps.astype(np.float64) * float(samp_coef2)).astype(np.float32)
     samp_sub = (samp_x.astype(np.float64) - samp_scaled.astype(np.float64)).astype(np.float32)
     samp_out = (samp_sub.astype(np.float64) * float(samp_coef1)).astype(np.float32)
+
+    # VAE tiny (8x8 -> 4x4 latent) forward reference
+    vae_x = rng.normal(0, 1, size=(2, 2, 8, 8)).astype(np.float32)
+    vae_eps = rng.normal(0, 1, size=(2, 4, 4, 4)).astype(np.float32)
+    vae_stem = TGConv2d(2, 4, 3, padding=1, bias=False)
+    vae_enc_gn1 = TGGroupNorm(2, 4, eps=1e-5)
+    vae_enc_c1 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    vae_enc_gn2 = TGGroupNorm(2, 4, eps=1e-5)
+    vae_enc_c2 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    vae_down = TGConv2d(4, 4, 3, stride=2, padding=1, bias=False)
+    vae_enc2_gn1 = TGGroupNorm(2, 4, eps=1e-5)
+    vae_enc2_c1 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    vae_enc2_gn2 = TGGroupNorm(2, 4, eps=1e-5)
+    vae_enc2_c2 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    vae_mu_conv = TGConv2d(4, 4, 1, bias=True)
+    vae_logvar_conv = TGConv2d(4, 4, 1, bias=True)
+    vae_dec_gn1 = TGGroupNorm(2, 4, eps=1e-5)
+    vae_dec_c1 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    vae_dec_gn2 = TGGroupNorm(2, 4, eps=1e-5)
+    vae_dec_c2 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    vae_up = TGConvTranspose2d(4, 4, 3, stride=2, padding=1, output_padding=1, bias=False)
+    vae_dec2_gn1 = TGGroupNorm(2, 4, eps=1e-5)
+    vae_dec2_c1 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    vae_dec2_gn2 = TGGroupNorm(2, 4, eps=1e-5)
+    vae_dec2_c2 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    vae_out_gn = TGGroupNorm(2, 4, eps=1e-5)
+    vae_out_c = TGConv2d(4, 2, 3, padding=1, bias=True)
+
+    def vae_rb(xt, gn1, c1, gn2, c2):
+        h = gn1(xt).silu()
+        h = c1(h)
+        h = gn2(h).silu()
+        h = c2(h)
+        return h + xt
+
+    def vae_encode(xt):
+        h = vae_stem(xt)
+        h = vae_rb(h, vae_enc_gn1, vae_enc_c1, vae_enc_gn2, vae_enc_c2)
+        h = vae_down(h)
+        h = vae_rb(h, vae_enc2_gn1, vae_enc2_c1, vae_enc2_gn2, vae_enc2_c2)
+        mu = vae_mu_conv(h)
+        logvar = vae_logvar_conv(h)
+        return mu, logvar
+
+    def vae_decode(zt):
+        h = vae_rb(zt, vae_dec_gn1, vae_dec_c1, vae_dec_gn2, vae_dec_c2)
+        h = vae_up(h)
+        h = vae_rb(h, vae_dec2_gn1, vae_dec2_c1, vae_dec2_gn2, vae_dec2_c2)
+        h = vae_out_gn(h).silu()
+        h = vae_out_c(h)
+        return h
+
+    vae_xt = Tensor(vae_x.tolist())
+    vae_eps_t = Tensor(vae_eps.tolist())
+    vae_mu_t, vae_logvar_t = vae_encode(vae_xt)
+    vae_std_t = (vae_logvar_t * 0.5).exp()
+    vae_z_t = vae_mu_t + vae_std_t * vae_eps_t
+    vae_recon_t = vae_decode(vae_z_t)
+    vae_recon = vae_recon_t.numpy().astype(np.float64).reshape(-1)
+    vae_mu = vae_mu_t.numpy().astype(np.float64).reshape(-1)
+    vae_logvar = vae_logvar_t.numpy().astype(np.float64).reshape(-1)
+    vae_z = vae_z_t.numpy().astype(np.float64).reshape(-1)
+    # grad check for encoder stem
+    vae_loss = ((vae_recon_t - vae_xt) * (vae_recon_t - vae_xt)).mean()
+    vae_loss_val = float(vae_loss.numpy())
+    vae_grads = vae_loss.gradient(vae_stem.weight, vae_out_c.weight)
+    vae_g_stem, vae_g_out = [g.numpy().astype(np.float64).reshape(-1) for g in vae_grads]
     # alternative direct float32 via numpy: ensure same as JS scale/add
     # recompute via same float32 path as JS does (scale then sub then scale)
     # The above already mimics JS float32
@@ -595,6 +662,50 @@ def build_fixture() -> dict:
         "samp_eps": samp_eps.astype(float).reshape(-1).tolist(),
         "samp_t": int(samp_t),
         "samp_out": samp_out.astype(float).reshape(-1).tolist(),
+        "vae_x": vae_x.astype(float).reshape(-1).tolist(),
+        "vae_eps": vae_eps.astype(float).reshape(-1).tolist(),
+        "vae_stem_w": vae_stem.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc_gn1w": vae_enc_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc_gn1b": vae_enc_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc_c1w": vae_enc_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc_gn2w": vae_enc_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc_gn2b": vae_enc_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc_c2w": vae_enc_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_down_w": vae_down.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc2_gn1w": vae_enc2_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc2_gn1b": vae_enc2_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc2_c1w": vae_enc2_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc2_gn2w": vae_enc2_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc2_gn2b": vae_enc2_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_enc2_c2w": vae_enc2_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_mu_w": vae_mu_conv.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_mu_b": vae_mu_conv.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_logvar_w": vae_logvar_conv.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_logvar_b": vae_logvar_conv.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec_gn1w": vae_dec_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec_gn1b": vae_dec_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec_c1w": vae_dec_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec_gn2w": vae_dec_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec_gn2b": vae_dec_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec_c2w": vae_dec_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_up_w": vae_up.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec2_gn1w": vae_dec2_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec2_gn1b": vae_dec2_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec2_c1w": vae_dec2_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec2_gn2w": vae_dec2_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec2_gn2b": vae_dec2_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_dec2_c2w": vae_dec2_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_out_gnw": vae_out_gn.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_out_gnb": vae_out_gn.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_out_cw": vae_out_c.weight.numpy().astype(float).reshape(-1).tolist(),
+        "vae_out_cb": vae_out_c.bias.numpy().astype(float).reshape(-1).tolist(),
+        "vae_recon": vae_recon.tolist(),
+        "vae_mu": vae_mu.tolist(),
+        "vae_logvar": vae_logvar.tolist(),
+        "vae_z": vae_z.tolist(),
+        "vae_loss": float(vae_loss_val),
+        "vae_g_stem": vae_g_stem.tolist(),
+        "vae_g_out": vae_g_out.tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -646,6 +757,7 @@ def main() -> int:
         "unet": report["unet_fwd"] < 1e-4,
         "unet_loss": report["unet_loss_err"] < 1e-4 and report["unet_loss_g_stem"] < 1e-4 and report["unet_loss_g_out"] < 1e-4,
         "sampler": report["samp_fwd"] < 1e-5,
+        "vae": report["vae_recon"] < 1e-4 and report["vae_mu"] < 1e-4 and report["vae_logvar"] < 1e-4 and report["vae_z"] < 1e-4 and report["vae_loss_err"] < 1e-4 and report["vae_g_stem"] < 1e-4 and report["vae_g_out"] < 1e-4,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])

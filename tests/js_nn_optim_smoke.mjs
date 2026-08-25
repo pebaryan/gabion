@@ -277,6 +277,55 @@ const sampX = Tensor.fromArray(fixture.samp_x, [2,2,2,2], false);
 const sampEps = Tensor.fromArray(fixture.samp_eps, [2,2,2,2], false);
 const sampOut = sampSampler.step(sampX, fixture.samp_t, sampEps);
 
+// VAE tiny forward
+const vae = new tg.nn.VAE(2, 4, 4, { numGroups: 2 });
+vae.encoder.stem.weight.data.set(Float32Array.from(fixture.vae_stem_w));
+vae.encoder.rb0.norm1.weight.data.set(Float32Array.from(fixture.vae_enc_gn1w));
+vae.encoder.rb0.norm1.bias.data.set(Float32Array.from(fixture.vae_enc_gn1b));
+vae.encoder.rb0.conv1.weight.data.set(Float32Array.from(fixture.vae_enc_c1w));
+vae.encoder.rb0.norm2.weight.data.set(Float32Array.from(fixture.vae_enc_gn2w));
+vae.encoder.rb0.norm2.bias.data.set(Float32Array.from(fixture.vae_enc_gn2b));
+vae.encoder.rb0.conv2.weight.data.set(Float32Array.from(fixture.vae_enc_c2w));
+vae.encoder.down.weight.data.set(Float32Array.from(fixture.vae_down_w));
+vae.encoder.rb1.norm1.weight.data.set(Float32Array.from(fixture.vae_enc2_gn1w));
+vae.encoder.rb1.norm1.bias.data.set(Float32Array.from(fixture.vae_enc2_gn1b));
+vae.encoder.rb1.conv1.weight.data.set(Float32Array.from(fixture.vae_enc2_c1w));
+vae.encoder.rb1.norm2.weight.data.set(Float32Array.from(fixture.vae_enc2_gn2w));
+vae.encoder.rb1.norm2.bias.data.set(Float32Array.from(fixture.vae_enc2_gn2b));
+vae.encoder.rb1.conv2.weight.data.set(Float32Array.from(fixture.vae_enc2_c2w));
+vae.encoder.muConv.weight.data.set(Float32Array.from(fixture.vae_mu_w));
+vae.encoder.muConv.bias.data.set(Float32Array.from(fixture.vae_mu_b));
+vae.encoder.logvarConv.weight.data.set(Float32Array.from(fixture.vae_logvar_w));
+vae.encoder.logvarConv.bias.data.set(Float32Array.from(fixture.vae_logvar_b));
+vae.decoder.rb0.norm1.weight.data.set(Float32Array.from(fixture.vae_dec_gn1w));
+vae.decoder.rb0.norm1.bias.data.set(Float32Array.from(fixture.vae_dec_gn1b));
+vae.decoder.rb0.conv1.weight.data.set(Float32Array.from(fixture.vae_dec_c1w));
+vae.decoder.rb0.norm2.weight.data.set(Float32Array.from(fixture.vae_dec_gn2w));
+vae.decoder.rb0.norm2.bias.data.set(Float32Array.from(fixture.vae_dec_gn2b));
+vae.decoder.rb0.conv2.weight.data.set(Float32Array.from(fixture.vae_dec_c2w));
+vae.decoder.up.weight.data.set(Float32Array.from(fixture.vae_up_w));
+vae.decoder.rb1.norm1.weight.data.set(Float32Array.from(fixture.vae_dec2_gn1w));
+vae.decoder.rb1.norm1.bias.data.set(Float32Array.from(fixture.vae_dec2_gn1b));
+vae.decoder.rb1.conv1.weight.data.set(Float32Array.from(fixture.vae_dec2_c1w));
+vae.decoder.rb1.norm2.weight.data.set(Float32Array.from(fixture.vae_dec2_gn2w));
+vae.decoder.rb1.norm2.bias.data.set(Float32Array.from(fixture.vae_dec2_gn2b));
+vae.decoder.rb1.conv2.weight.data.set(Float32Array.from(fixture.vae_dec2_c2w));
+vae.decoder.outNorm.weight.data.set(Float32Array.from(fixture.vae_out_gnw));
+vae.decoder.outNorm.bias.data.set(Float32Array.from(fixture.vae_out_gnb));
+vae.decoder.outConv.weight.data.set(Float32Array.from(fixture.vae_out_cw));
+vae.decoder.outConv.bias.data.set(Float32Array.from(fixture.vae_out_cb));
+const vaeX = Tensor.fromArray(fixture.vae_x, [2,2,8,8], true);
+const vaeEps = Tensor.fromArray(fixture.vae_eps, [2,4,4,4], false);
+const vaeOut = vae.forward(vaeX, vaeEps);
+const vaeDiff = vaeOut.recon.sub(vaeX);
+const vaeLoss = vaeDiff.mul(vaeDiff).mean();
+vaeLoss.grad = new Float32Array([1]);
+{
+  const topo=[];const seen=new Set();const build=(tt)=>{if(seen.has(tt))return;seen.add(tt);for(const q of tt._parents) build(q);topo.push(tt);};
+  build(vaeLoss);
+  for(let i=topo.length-1;i>=0;i--){const tt=topo[i];if(tt.grad===null&&!tt._gradGPUBuf&&!tt._pendingGradBuf) continue;const g=tt.grad||new Float32Array(tt.numel).fill(0);tt._backward(g, tt._gradGPUBuf||tt._pendingGradBuf||null);}
+}
+
 const unetNoise = Tensor.fromArray(fixture.unet_noise, [2,2,8,8], false);
 const unetDiff = unetY.sub(unetNoise);
 const unetLoss = unetDiff.mul(unetDiff).mean();
@@ -317,6 +366,14 @@ const report = {
   ct2_grad_x: maxAbs(ct2x.grad, fixture.ct2_x_grad),
   ct2_grad_w: maxAbs(ct2.weight.grad, fixture.ct2_w_grad),
   ct2_grad_b: maxAbs(ct2.bias.grad, fixture.ct2_b_grad),
+  vae_recon: maxAbs(vaeOut.recon.data, fixture.vae_recon),
+  vae_mu: maxAbs(vaeOut.mu.data, fixture.vae_mu),
+  vae_logvar: maxAbs(vaeOut.logvar.data, fixture.vae_logvar),
+  vae_z: maxAbs(vaeOut.z.data, fixture.vae_z),
+  vae_loss: vaeLoss.data[0],
+  vae_loss_err: Math.abs(vaeLoss.data[0] - fixture.vae_loss),
+  vae_g_stem: maxAbs(vae.encoder.stem.weight.grad, fixture.vae_g_stem),
+  vae_g_out: maxAbs(vae.decoder.outConv.weight.grad, fixture.vae_g_out),
   samp_fwd: maxAbs(sampOut.data, fixture.samp_out),
   unet_fwd: maxAbs(unetY.data, fixture.unet_y),
   unet_loss: unetLoss.data[0],
