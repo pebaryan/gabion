@@ -159,6 +159,9 @@ const cat2Y = cat2A.concat(cat2B, fixture.cat2_axis);
 cat2Y.grad = Float32Array.from(fixture.cat2_g);
 cat2Y._backward(cat2Y.grad);
 
+// SinusoidalTimestep
+const ste = new tg.nn.SinusoidalTimestep(fixture.ste_dim).forward(fixture.timesteps);
+
 const mp = Tensor.fromArray(fixture.muon_p, [4, 4], true);
 mp.grad = Float32Array.from(fixture.muon_g);
 const muon = tg.Muon([mp], { lr: 1e-3, warmupSteps: 1, gradClipNorm: 0 });
@@ -204,6 +207,7 @@ const report = {
   cat2_fwd: maxAbs(cat2Y.data, fixture.cat2_y),
   cat2_a_grad: maxAbs(cat2A.grad.slice(), fixture.cat2_a_grad),
   cat2_b_grad: maxAbs(cat2B.grad.slice(), fixture.cat2_b_grad),
+  ste: maxAbs(ste.data, fixture.ste_ref),
 };
 const outPath = fixturePath.replace(/\.json$/, "_js.json");
 fs.writeFileSync(outPath, JSON.stringify(report, null, 2));

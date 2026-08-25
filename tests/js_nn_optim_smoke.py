@@ -144,6 +144,17 @@ def build_fixture() -> dict:
     cat2_g = rng.normal(0, 1, size=tuple(cat2_y.shape)).astype(np.float32)
     cat2_a_grad, cat2_b_grad = (cat2_y * Tensor(cat2_g.tolist())).sum().gradient(cat2_at, cat2_bt)
 
+    # SinusoidalTimestep
+    ts = [0, 17, 333, 999]
+    half = 8
+    ste = np.zeros((4, 16), dtype=np.float64)
+    for b, t in enumerate(ts):
+        for i in range(half):
+            freq = np.exp(-np.log(10000.0) * (i / max(1, half - 1)))
+            ang = float(t) * freq
+            ste[b, i] = np.float32(np.sin(ang))
+            ste[b, half + i] = np.float32(np.cos(ang))
+
     mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mg = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mpt = Tensor(mp.tolist())
@@ -266,6 +277,9 @@ def build_fixture() -> dict:
         "cat2_g": cat2_g.astype(float).reshape(-1).tolist(),
         "cat2_a_grad": cat2_a_grad.numpy().astype(np.float64).reshape(-1).tolist(),
         "cat2_b_grad": cat2_b_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "timesteps": ts,
+        "ste_dim": 16,
+        "ste_ref": ste.reshape(-1).tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -307,6 +321,7 @@ def main() -> int:
         "pad_asym": report["pad2_fwd"] < 1e-5 and report["pad2_grad"] < 1e-5,
         "concat": report["cat_fwd"] < 1e-5 and report["cat_a_grad"] < 1e-5 and report["cat_b_grad"] < 1e-5,
         "concat_last_axis": report["cat2_fwd"] < 1e-5 and report["cat2_a_grad"] < 1e-5 and report["cat2_b_grad"] < 1e-5,
+        "sinusoidal_timestep": report["ste"] < 1e-6,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])

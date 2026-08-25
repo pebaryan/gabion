@@ -2688,6 +2688,36 @@
     }
   }
 
+  /**
+   * Sinusoidal timestep embedding (DDPM). Maps integer timesteps to
+   * [B, dim]: first half sin(t*freq), second half cos(t*freq),
+   * freq_i = exp(-log(10000) * i / (halfDim - 1))  (i in [0, halfDim)).
+   */
+  class SinusoidalTimestep extends Module {
+    constructor(dim, { maxPeriod = 10000 } = {}) {
+      super();
+      if (dim % 2 !== 0) throw new Error("SinusoidalTimestep: dim must be even");
+      this.dim = dim;
+      this.maxPeriod = maxPeriod;
+    }
+
+    forward(tInts) {
+      const half = this.dim / 2;
+      const B = tInts.length;
+      const out = new Float32Array(B * this.dim);
+      for (let b = 0; b < B; b++) {
+        const t = Math.max(0, tInts[b] | 0);
+        for (let i = 0; i < half; i++) {
+          const freq = Math.exp(-Math.log(this.maxPeriod) * (i / Math.max(1, half - 1)));
+          const ang = t * freq;
+          out[b * this.dim + i] = Math.sin(ang);
+          out[b * this.dim + half + i] = Math.cos(ang);
+        }
+      }
+      return new Tensor(out, [B, this.dim], false);
+    }
+  }
+
   /** Embedding layer: lookup rows from weight table. */
   class Embedding extends Module {
     constructor(numEmbeddings, embeddingDim, { requiresGrad = true } = {}) {
@@ -3077,6 +3107,7 @@
   const nn = {
     Module, Linear, Embedding, RMSNorm, LayerNorm, Dropout,
     Conv2d, Conv1d, ConvTranspose2d, ConvTranspose1d, GroupNorm, BatchNorm, BatchNorm2d: BatchNorm, LSTMCell,
+    SinusoidalTimestep,
   };
   const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD, LAMB, LARS, Muon };
 
