@@ -132,8 +132,8 @@ async function generate() {
     };
     await readyWait;
     const nReady = ready.filter(Boolean).length;
-    if (nReady < specs.length) throw new Error(`only ${nReady}/${specs.length} shard tabs became ready`);
-    $("shards").textContent = `shard tabs: ${nReady}/${specs.length} ready`;
+    if (nReady < specs.length) throw new Error(`only ${nReady}/${specs.length} shard workers became ready`);
+    log(`all ${specs.length} shard workers ready`);
     status(`coordinator: loading embedding + head…`);
 
     const coord = await gabionLoader.loadCoordinator(manifest, dir + "/coord.f16");
