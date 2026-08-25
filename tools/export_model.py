@@ -15,9 +15,15 @@ Sources:
   --from-tinygrad PATH   npz or safetensors checkpoint with tensors named
                          tok_emb, layer{i}.q/k/v/o/norm1/gate_up/norm2/down,
                          norm_f, lm_head (tie_weights uses tok_emb).
-  --from-gguf PATH       llama-family GGUF file. Supports F32/F16/Q8_0/Q4_0/
-                         Q4_1 tensors; requires attention.head_count ==
-                         attention.head_count_kv (no GQA yet).
+  --from-gguf PATH       llama-family GGUF file. Supports 26 quant types
+                         (F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/
+                         Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/IQ1_S/IQ1_M/IQ2_XXS/XS/S/
+                         IQ3_XXS/S/IQ4_NL/XS/MXFP4/NVFP4), GQA, untied lm_head,
+                         embedded BPE tokenizer.
+  --from-hf DIR          HuggingFace checkpoint dir (config.json +
+                         model.safetensors[.index.json], optional
+                         tokenizer.json). llama/qwen2/qwen3 family, F32/F16/
+                         BF16 dtypes, sharded or single-file.
 
   --with-tokenizer gpt2  downloads vocab.json + merges.txt and embeds them.
   --out PATH             output JSON (default: <source stem>.gabion.json)
@@ -27,6 +33,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import mmap
 import struct
 import sys
 import urllib.request
@@ -639,19 +646,218 @@ def _npy(path: Path, name: str) -> np.ndarray:
     return np.load(path)[name]
 
 
-def _safetensors(path: Path, name: str) -> np.ndarray:
-    import json as _json
+# safetensors dtype strings (HF spec) -> numpy dtype; BF16 is special-cased
+_ST_DTYPES = {
+    "F64": "<f8", "F32": "<f4", "F16": "<f2",
+    "I64": "<i8", "I32": "<i4", "I16": "<i2", "I8": "i1",
+    "U64": "<u8", "U32": "<u4", "U16": "<u2", "U8": "u1",
+}
+_ST_UNSUPPORTED = ("F8_E4M3", "F8_E5M2", "F4_E2M1", "BOOL", "U1")
 
+
+def _st_tensor(buf, hdr_len: int, info: dict) -> np.ndarray:
+    """Read one safetensors tensor from a buffer (bytes or mmap).
+
+    data_offsets are byte ranges in the payload; the header is 8-byte length +
+    JSON. Returns float32 for BF16, native dtype otherwise."""
+    dtype = info["dtype"]
+    if dtype in _ST_UNSUPPORTED:
+        raise NotImplementedError(f"safetensors dtype {dtype!r} is not supported")
+    start, end = info["data_offsets"]
+    if dtype == "BF16":
+        u = np.frombuffer(buf, dtype="<u2", count=(end - start) // 2, offset=8 + hdr_len + start)
+        f = (u.astype(np.int32) << 16).view(np.float32)
+        return f.reshape(info["shape"])
+    if dtype not in _ST_DTYPES:
+        raise NotImplementedError(f"safetensors dtype {dtype!r} is not supported")
+    dt = np.dtype(_ST_DTYPES[dtype])
+    arr = np.frombuffer(buf, dtype=dt, count=(end - start) // dt.itemsize,
+                        offset=8 + hdr_len + start)
+    return arr.reshape(info["shape"])
+
+
+def _safetensors(path: Path, name: str) -> np.ndarray:
     raw = Path(path).read_bytes()
     (hdr_len,) = struct.unpack_from("<Q", raw, 0)
-    hdr = _json.loads(raw[8:8 + hdr_len])
+    hdr = json.loads(raw[8:8 + hdr_len])
     info = hdr.get(name)
     if info is None:
         raise KeyError(f"{name} not in safetensors")
-    dt = np.dtype(info["dtype"]).newbyteorder("<")
-    arr = np.frombuffer(raw, 8 + hdr_len + info["data_offsets"][0],
-                        dtype=dt, count=info["data_offsets"][1] - info["data_offsets"][0])
-    return arr.reshape(info["shape"])
+    return _st_tensor(raw, hdr_len, info)
+
+
+def _hf_config(path: Path) -> dict:
+    """Read config.json for a llama-family (qwen2/qwen3/llama/gemma) checkpoint.
+
+    Multimodal wrappers (e.g. Qwen3.5) nest the text params under text_config."""
+    cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(cfg.get("text_config"), dict):
+        cfg = cfg["text_config"]
+    def num(key, default=None):
+        return cfg.get(key, cfg.get(f"num_{key}", default))
+    heads = int(num("attention_heads"))
+    kv_heads = int(num("key_value_heads", heads))
+    if kv_heads > heads:
+        raise ValueError(
+            f"head_count_kv={kv_heads} > head_count={heads}: more KV heads than query heads is not supported")
+    rope_theta = cfg.get("rope_theta")
+    if rope_theta is None and isinstance(cfg.get("rope_parameters"), dict):
+        rope_theta = cfg["rope_parameters"].get("rope_theta", 10000.0)
+    head_dim = cfg.get("head_dim")
+    d_model = int(cfg["hidden_size"])
+    if head_dim is not None and int(head_dim) != d_model // heads:
+        raise ValueError(f"head_dim={head_dim} != hidden_size/heads={d_model // heads}: "
+                         "non-uniform head dims are not supported")
+    return {
+        "vocab_size": int(cfg["vocab_size"]),
+        "d_model": d_model,
+        "n_heads": heads,
+        "n_kv_heads": kv_heads,
+        "n_layers": int(num("hidden_layers")),
+        "seq_len": min(int(cfg.get("max_position_embeddings", 2048)), 4096),
+        "d_ff": int(cfg.get("intermediate_size") or 4 * d_model),
+        "tie_weights": bool(cfg.get("tie_word_embeddings", True)),
+        "act_quant": True,
+        "rope_base": float(rope_theta or 10000.0),
+    }
+
+
+def _hf_tokenizer(path: Path) -> tuple[dict, list[str], str] | None:
+    """Read tokenizer.json (HF BPE schema) -> (vocab dict, merges, model_type).
+
+    The vocab is already {token: id}; merges are the same 'a b' strings the
+    GGML path embeds. Returns None if tokenizer.json is absent or not BPE."""
+    tj = Path(path) / "tokenizer.json"
+    if not tj.is_file():
+        return None
+    data = json.loads(tj.read_text(encoding="utf-8"))
+    model = data.get("model") or {}
+    if model.get("type", "BPE").upper() != "BPE":
+        return None
+    vocab = model.get("vocab")
+    merges = model.get("merges")
+    if not isinstance(vocab, dict) or not isinstance(merges, list):
+        return None
+    # drop merges that reference unknown tokens (added tokens can leak in)
+    known = set(vocab)
+    merges = [m for m in merges if isinstance(m, str) and " " in m
+              and all(tok in known for tok in m.split())]
+    return vocab, merges, str(data.get("tokenizer_class", "BPE"))
+
+
+def export_hf(path: Path, config: dict | None = None) -> dict:
+    """Export a HuggingFace safetensors checkpoint directory (config.json +
+    model.safetensors, optionally sharded via model.safetensors.index.json) to
+    the gabion wire format. The wire is identical to the GGUF path: llama-family
+    weights as f16, {vocab, merges} when tokenizer.json is present."""
+    cfg = _hf_config(path / "config.json")
+    if config is not None:
+        cfg = dict(config)
+    # tie_weights is decided by the checkpoint, not the caller (mirror GGUF path)
+    cfg.pop("tie_weights", None)
+
+    # locate the tensor shards
+    idx_path = path / "model.safetensors.index.json"
+    if idx_path.is_file():
+        idx = json.loads(idx_path.read_text(encoding="utf-8"))
+        weight_map = idx["weight_map"]
+    else:
+        st = path / "model.safetensors"
+        if not st.is_file():
+            raise ValueError(f"no model.safetensors or model.safetensors.index.json in {path}")
+        weight_map = None
+
+    files = {}
+    headers = {}
+
+    def shard_of(name: str):
+        if weight_map is None:
+            return path / "model.safetensors"
+        return path / weight_map[name]
+
+    def get(name: str) -> np.ndarray | None:
+        if weight_map is not None and name not in weight_map:
+            return None
+        spath = shard_of(name)
+        mm = files.get(spath)
+        if mm is None:
+            fh = open(spath, "rb")
+            (hdr_len,) = struct.unpack_from("<Q", fh.read(8))
+            fh.seek(0)
+            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            files[spath] = mm
+            headers[spath] = (hdr_len, json.loads(mm[8:8 + hdr_len]))
+        hdr_len, hdr = headers[spath]
+        info = hdr.get(name)
+        if info is None:
+            return None
+        return _st_tensor(mm, hdr_len, info)
+
+    def as_linear(name: str, want: tuple) -> np.ndarray:
+        # HF linear weights are stored (out, in); the wire wants (in, out).
+        t = get(name)
+        if t is None:
+            raise ValueError(f"checkpoint is missing required tensor '{name}'")
+        t = t.T
+        if t.shape != want:
+            raise ValueError(f"tensor '{name}': shape {t.shape} vs expected {want}")
+        return t
+
+    def build_flat() -> np.ndarray:
+        """Assemble the f16 wire flat. Inner scope so every mmap-derived view
+        becomes unreachable before the mmaps are closed (BufferError otherwise)."""
+        D, L, heads, kv_heads, d_ff, n_vocab = (
+            cfg["d_model"], cfg["n_layers"], cfg["n_heads"], cfg["n_kv_heads"],
+            cfg["d_ff"], cfg["vocab_size"])
+        kvD = D // heads * kv_heads
+
+        tok = get("model.embed_tokens.weight")
+        if tok is None:
+            raise ValueError("checkpoint is missing 'model.embed_tokens.weight'")
+        if tok.shape != (n_vocab, D):
+            raise ValueError(f"model.embed_tokens.weight: shape {tok.shape} vs expected {(n_vocab, D)}")
+        tensors = [tok]
+        for i in range(L):
+            q = as_linear(f"model.layers.{i}.self_attn.q_proj.weight", (D, D))
+            k = as_linear(f"model.layers.{i}.self_attn.k_proj.weight", (D, kvD))
+            v = as_linear(f"model.layers.{i}.self_attn.v_proj.weight", (D, kvD))
+            o = as_linear(f"model.layers.{i}.self_attn.o_proj.weight", (D, D))
+            n1 = get(f"model.layers.{i}.input_layernorm.weight")
+            if n1 is None:
+                raise ValueError(f"missing model.layers.{i}.input_layernorm.weight")
+            gate = as_linear(f"model.layers.{i}.mlp.gate_proj.weight", (D, d_ff))
+            up = as_linear(f"model.layers.{i}.mlp.up_proj.weight", (D, d_ff))
+            gate_up = np.concatenate([gate, up], axis=1)  # JS splitLast([dFF, dFF]) -> gate first
+            n2 = get(f"model.layers.{i}.post_attention_layernorm.weight")
+            if n2 is None:
+                raise ValueError(f"missing model.layers.{i}.post_attention_layernorm.weight")
+            down = as_linear(f"model.layers.{i}.mlp.down_proj.weight", (d_ff, D))
+            tensors += [q, k, v, o, n1.reshape(-1), gate_up, n2.reshape(-1), down]
+        tensors.append(get("model.norm.weight").reshape(-1))
+
+        if get("lm_head.weight") is None:
+            tie = True
+            print("[info] checkpoint has no lm_head; using tied embedding")
+        else:
+            tie = False
+            tensors.append(as_linear("lm_head.weight", (D, n_vocab)))
+        cfg["tie_weights"] = tie
+
+        # f16 flat directly (no f32 copy): halves peak RAM on big checkpoints
+        return np.concatenate([np.asarray(t).astype(np.float16).reshape(-1) for t in tensors])
+
+    flat16 = build_flat()
+    wire = {"config": cfg,
+            "weights_b64": base64.b64encode(flat16.view("<u2").tobytes()).decode("ascii")}
+    tokdata = _hf_tokenizer(path)
+    if tokdata is not None:
+        vocab, merges, toktype = tokdata
+        wire["vocab"] = vocab
+        wire["merges"] = merges
+        cfg["tokenizer"] = f"hf:{toktype}"
+    for mm in files.values():
+        mm.close()
+    return wire
 
 
 def export_tinygrad(path: Path, config: dict) -> dict:
@@ -815,6 +1021,8 @@ def main() -> int:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--from-tinygrad", type=Path, metavar="PATH")
     src.add_argument("--from-gguf", type=Path, metavar="PATH")
+    src.add_argument("--from-hf", type=Path, metavar="DIR",
+                     help="HuggingFace checkpoint dir (config.json + model.safetensors[.index.json])")
     ap.add_argument("--d-model", type=int, default=64)
     ap.add_argument("--n-heads", type=int, default=4)
     ap.add_argument("--n-kv-heads", type=int, default=None)
@@ -830,6 +1038,8 @@ def main() -> int:
 
     if args.from_gguf:
         out = export_gguf(args.from_gguf)
+    elif args.from_hf:
+        out = export_hf(args.from_hf)
     else:
         cfg = {
             "vocab_size": args.vocab_size, "d_model": args.d_model,
@@ -854,7 +1064,7 @@ def main() -> int:
             out["config"]["tokenizer"] = args.with_tokenizer
 
     n_weights = len(f16_decode(out["weights_b64"]))
-    out_path = args.out or Path(str((args.from_gguf or args.from_tinygrad)) + ".gabion.json")
+    out_path = args.out or Path(str((args.from_gguf or args.from_tinygrad or args.from_hf)) + ".gabion.json")
     out_path.write_text(json.dumps(out), encoding="utf-8")
     print(f"wrote {out_path} ({n_weights} weights, "
           f"{len(out.get('vocab', {})) if out.get('vocab') else 0} vocab tokens)")

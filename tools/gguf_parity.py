@@ -29,7 +29,7 @@ for _p in (str(ROOT), str(ROOT / "gabion")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools.export_model import export_gguf, f16_decode  # noqa: E402
+from tools.export_model import export_gguf, export_hf, f16_decode  # noqa: E402
 
 
 def build_reference(out: dict, tokens: list[int], B: int = 1, T: int = 8):
@@ -188,14 +188,21 @@ for (const rel of ['gabion/web/tinygrad_v0.js','gabion/web/bbt_forward.js','gabi
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("gguf", type=Path)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("gguf", type=Path, nargs="?", help="GGUF model file")
+    src.add_argument("--from-hf", type=Path, metavar="DIR",
+                     help="HuggingFace checkpoint dir (config.json + model.safetensors)")
     ap.add_argument("--tokens", type=int, nargs="*", default=None)
     ap.add_argument("--seq", type=int, default=8)
     ap.add_argument("--out-json", type=Path, default=None)
     args = ap.parse_args()
 
-    print(f"[1/3] exporting {args.gguf} ...")
-    out = export_gguf(args.gguf)
+    if args.from_hf:
+        print(f"[1/3] exporting HF dir {args.from_hf} ...")
+        out = export_hf(args.from_hf)
+    else:
+        print(f"[1/3] exporting {args.gguf} ...")
+        out = export_gguf(args.gguf)
     cfg = out["config"]
     print("     config:", {k: cfg[k] for k in ("vocab_size", "d_model", "n_heads", "n_kv_heads", "n_layers", "d_ff", "tie_weights", "rope_base")})
     if args.out_json:
