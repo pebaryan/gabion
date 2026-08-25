@@ -124,6 +124,7 @@ async function generate() {
       maxNewTokens: maxNew,
       temperature: Number.isFinite(temp) ? temp : 0.8,
       topK: 40,
+      debugNaN: true,
       onToken: (tok, logits, tokens) => {
         const piece = model.tokenizer ? model.tokenizer.decode([tok]) : "";
         streamed += piece;
@@ -169,6 +170,39 @@ async function generate() {
   catch (e) { status("WebGPU init failed (" + e.message + ") — CPU fallback"); }
   $("go").onclick = generate;
   const p = new URLSearchParams(location.search);
+  if (p.get("mode") === "ref") {
+    // diagnostic: GPU forward on the full prompt, last-row logits only
+    try {
+      const url = $("modelUrl").value.trim() || "/gabion/web/models/qwen2.5-0.5b.gabion.json";
+      const binary = p.get("binary") !== "0";
+      const model = binary
+        ? await gabionLoader.loadBBTModelBin(url.replace(/\.gabion\.json$/, ".json"), url.replace(/\.gabion\.json$/, ".f16"))
+        : await gabionLoader.loadBBTModel(url);
+      let prompt = p.get("prompt") || "The capital of France is";
+      if (model.chatTemplate) {
+        prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+      }
+      const ids = model.tokenize(prompt);
+      const t0 = performance.now();
+      const fwd = await model.forward(new Int32Array(ids), 1, ids.length);
+      const ms = performance.now() - t0;
+      const lg = fwd.data.subarray((ids.length - 1) * model.V, ids.length * model.V);
+      const top = Array.from({ length: model.V }, (_, i) => i).sort((a, b) => lg[b] - lg[a]).slice(0, 8);
+      out.refForward = {
+        promptTokens: ids.length, ms,
+        topIds: top,
+        topText: top.map(i => model.tokenizer.decode([i])),
+        logit: { min: lg[0], max: lg[0] },
+      };
+      for (let i = 1; i < lg.length; i++) { if (lg[i] < out.refForward.logit.min) out.refForward.logit.min = lg[i]; if (lg[i] > out.refForward.logit.max) out.refForward.logit.max = lg[i]; }
+      status("ref forward done");
+    } catch (e) {
+      out.error = String(e && e.stack || e);
+      status("ref error: " + out.error, "err");
+    }
+    setResult();
+    return;
+  }
   if (p.get("auto")) {
     if (p.get("model")) $("modelUrl").value = p.get("model");
     if (p.get("prompt") != null) $("prompt").value = p.get("prompt");

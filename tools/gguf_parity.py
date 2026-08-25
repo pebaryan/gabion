@@ -88,9 +88,9 @@ def build_reference(out: dict, tokens: list[int], B: int = 1, T: int = 8):
         q = h @ q_w  # [B,T,D]
         k = h @ k_w
         v = h @ v_w
-        if qb: q = q + qb.reshape(1, 1, -1)
-        if kb: k = k + kb.reshape(1, 1, -1)
-        if vb: v = v + vb.reshape(1, 1, -1)
+        if qb is not None: q = q + qb.reshape(1, 1, -1)
+        if kb is not None: k = k + kb.reshape(1, 1, -1)
+        if vb is not None: v = v + vb.reshape(1, 1, -1)
         q = q.reshape(B, T, H, hd).transpose(0, 2, 1, 3)  # [B,H,T,hd]
         k = k.reshape(B, T, kvH, hd).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, kvH, hd).transpose(0, 2, 1, 3)
