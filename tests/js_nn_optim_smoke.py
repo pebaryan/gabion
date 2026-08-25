@@ -155,6 +155,38 @@ def build_fixture() -> dict:
             ste[b, i] = np.float32(np.sin(ang))
             ste[b, half + i] = np.float32(np.cos(ang))
 
+    # ResBlock reference (mirrors JS composition)
+    from tinygrad.nn import GroupNorm as TGGroupNorm, Conv2d as TGConv2d
+    rb_x = rng.normal(0, 1, size=(2, 8, 6, 6)).astype(np.float32)
+    rb_t = rng.normal(0, 1, size=(2, 16)).astype(np.float32)
+    rb_gn1 = TGGroupNorm(4, 8, eps=1e-5)
+    rb_conv1 = TGConv2d(8, 12, 3, padding=1, bias=False)
+    rb_gn2 = TGGroupNorm(4, 12, eps=1e-5)
+    rb_conv2 = TGConv2d(12, 12, 3, padding=1, bias=False)
+    rb_mlp_w = rng.normal(0, 0.5, size=(16, 12)).astype(np.float32)
+    rb_mlp_wt = Tensor(rb_mlp_w.tolist())
+    rb_skip = TGConv2d(8, 12, 1, bias=False)
+
+    def rb_forward(xt, tt):
+        h = rb_gn1(xt).silu()
+        h = rb_conv1(h)
+        h = rb_gn2(h).silu()
+        h = rb_conv2(h)
+        h = h + tt.matmul(rb_mlp_wt).reshape(2, 12, 1, 1)
+        return h + rb_skip(xt)
+
+    rb_xt = Tensor(rb_x.tolist())
+    rb_tt = Tensor(rb_t.tolist())
+    rb_yt = rb_forward(rb_xt, rb_tt)
+    rb_y = rb_yt.numpy().astype(np.float64).reshape(-1)
+    rb_gout = rng.normal(0, 1, size=tuple(rb_yt.shape)).astype(np.float32)
+    grads = (rb_yt * Tensor(rb_gout.tolist())).sum().gradient(
+        rb_xt, rb_gn1.weight, rb_gn1.bias, rb_conv1.weight,
+        rb_gn2.weight, rb_gn2.bias, rb_conv2.weight, rb_mlp_wt, rb_skip.weight,
+    )
+    (rb_x_grad, rb_gn1w_grad, rb_gn1b_grad, rb_conv1w_grad,
+     rb_gn2w_grad, rb_gn2b_grad, rb_conv2w_grad, rb_mlp_grad, rb_skipw_grad) = [g.numpy().astype(np.float64).reshape(-1) for g in grads]
+
     mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mg = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mpt = Tensor(mp.tolist())
@@ -280,6 +312,29 @@ def build_fixture() -> dict:
         "timesteps": ts,
         "ste_dim": 16,
         "ste_ref": ste.reshape(-1).tolist(),
+        "rb_x": rb_x.astype(float).reshape(-1).tolist(),
+        "rb_x_shape": list(rb_x.shape),
+        "rb_t": rb_t.astype(float).reshape(-1).tolist(),
+        "rb_gn1w": rb_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "rb_gn1b": rb_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "rb_conv1w": rb_conv1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "rb_gn2w": rb_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "rb_gn2b": rb_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "rb_conv2w": rb_conv2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "rb_mlpw": rb_mlp_w.astype(float).reshape(-1).tolist(),
+        "rb_mlpw_shape": [16, 12],
+        "rb_skipw": rb_skip.weight.numpy().astype(float).reshape(-1).tolist(),
+        "rb_y": rb_y.tolist(),
+        "rb_gout": rb_gout.astype(float).reshape(-1).tolist(),
+        "rb_x_grad": rb_x_grad.tolist(),
+        "rb_gn1w_grad": rb_gn1w_grad.tolist(),
+        "rb_gn1b_grad": rb_gn1b_grad.tolist(),
+        "rb_conv1w_grad": rb_conv1w_grad.tolist(),
+        "rb_gn2w_grad": rb_gn2w_grad.tolist(),
+        "rb_gn2b_grad": rb_gn2b_grad.tolist(),
+        "rb_conv2w_grad": rb_conv2w_grad.tolist(),
+        "rb_mlp_grad": rb_mlp_grad.tolist(),
+        "rb_skipw_grad": rb_skipw_grad.tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -322,6 +377,10 @@ def main() -> int:
         "concat": report["cat_fwd"] < 1e-5 and report["cat_a_grad"] < 1e-5 and report["cat_b_grad"] < 1e-5,
         "concat_last_axis": report["cat2_fwd"] < 1e-5 and report["cat2_a_grad"] < 1e-5 and report["cat2_b_grad"] < 1e-5,
         "sinusoidal_timestep": report["ste"] < 1e-6,
+        "resblock": report["rb_fwd"] < 1e-4 and max(
+            report["rb_grad_x"], report["rb_grad_gn1w"], report["rb_grad_gn1b"],
+            report["rb_grad_conv1w"], report["rb_grad_gn2w"], report["rb_grad_gn2b"],
+            report["rb_grad_conv2w"], report["rb_grad_mlpw"], report["rb_grad_skipw"]) < 1e-4,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])

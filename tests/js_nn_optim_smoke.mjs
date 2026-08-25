@@ -162,6 +162,38 @@ cat2Y._backward(cat2Y.grad);
 // SinusoidalTimestep
 const ste = new tg.nn.SinusoidalTimestep(fixture.ste_dim).forward(fixture.timesteps);
 
+// ResBlock fwd + backward
+const rb = new tg.nn.ResBlock(8, 12, 16, { numGroups: 4 });
+rb.norm1.weight.data.set(Float32Array.from(fixture.rb_gn1w));
+rb.norm1.bias.data.set(Float32Array.from(fixture.rb_gn1b));
+rb.conv1.weight.data.set(Float32Array.from(fixture.rb_conv1w));
+rb.norm2.weight.data.set(Float32Array.from(fixture.rb_gn2w));
+rb.norm2.bias.data.set(Float32Array.from(fixture.rb_gn2b));
+rb.conv2.weight.data.set(Float32Array.from(fixture.rb_conv2w));
+rb.timeMlp.weight.data.set(Float32Array.from(fixture.rb_mlpw));
+rb.skip.weight.data.set(Float32Array.from(fixture.rb_skipw));
+const rbX = Tensor.fromArray(fixture.rb_x, fixture.rb_x_shape, true);
+const rbT = Tensor.fromArray(fixture.rb_t, [2, 16], false);
+const rbY = rb.forward(rbX, rbT);
+rbY.grad = Float32Array.from(fixture.rb_gout);
+// deep graph: full topo walk like backward() but seeded with gout
+{
+  const topo = [];
+  const seen = new Set();
+  const build = (t) => {
+    if (seen.has(t)) return;
+    seen.add(t);
+    for (const p of t._parents) build(p);
+    topo.push(t);
+  };
+  build(rbY);
+  for (let i = topo.length - 1; i >= 0; i--) {
+    const t = topo[i];
+    if (t.grad === null || t.grad === undefined) continue;
+    t._backward(t.grad, t._gradGPUBuf || t._pendingGradBuf || null);
+  }
+}
+
 const mp = Tensor.fromArray(fixture.muon_p, [4, 4], true);
 mp.grad = Float32Array.from(fixture.muon_g);
 const muon = tg.Muon([mp], { lr: 1e-3, warmupSteps: 1, gradClipNorm: 0 });
@@ -208,6 +240,16 @@ const report = {
   cat2_a_grad: maxAbs(cat2A.grad.slice(), fixture.cat2_a_grad),
   cat2_b_grad: maxAbs(cat2B.grad.slice(), fixture.cat2_b_grad),
   ste: maxAbs(ste.data, fixture.ste_ref),
+  rb_fwd: maxAbs(rbY.data, fixture.rb_y),
+  rb_grad_x: maxAbs(rbX.grad.slice(), fixture.rb_x_grad),
+  rb_grad_gn1w: maxAbs(rb.norm1.weight.grad, fixture.rb_gn1w_grad),
+  rb_grad_gn1b: maxAbs(rb.norm1.bias.grad, fixture.rb_gn1b_grad),
+  rb_grad_conv1w: maxAbs(rb.conv1.weight.grad, fixture.rb_conv1w_grad),
+  rb_grad_gn2w: maxAbs(rb.norm2.weight.grad, fixture.rb_gn2w_grad),
+  rb_grad_gn2b: maxAbs(rb.norm2.bias.grad, fixture.rb_gn2b_grad),
+  rb_grad_conv2w: maxAbs(rb.conv2.weight.grad, fixture.rb_conv2w_grad),
+  rb_grad_mlpw: maxAbs(rb.timeMlp.weight.grad, fixture.rb_mlp_grad),
+  rb_grad_skipw: maxAbs(rb.skip.weight.grad, fixture.rb_skipw_grad),
 };
 const outPath = fixturePath.replace(/\.json$/, "_js.json");
 fs.writeFileSync(outPath, JSON.stringify(report, null, 2));

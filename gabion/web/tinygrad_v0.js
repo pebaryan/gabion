@@ -1175,6 +1175,44 @@
     }
 
     /**
+     * Broadcast-add a [B, C] channel map over NCHW input:
+     * out[b,c,h,w] = x[b,c,h,w] + chan[b,c].
+     */
+    addChannelMap(chan) {
+      const [N, C] = this.shape;
+      if (chan.shape.length !== 2 || chan.shape[0] !== N || chan.shape[1] !== C)
+        throw new Error(`addChannelMap: x ${this.shape} vs chan ${chan.shape}`);
+      const rest = this.numel / (N * C);
+      const out = new Float32Array(this.numel);
+      for (let n = 0; n < N; n++) {
+        for (let c = 0; c < C; c++) {
+          const off = (n * C + c) * rest;
+          const v = chan.data[n * C + c];
+          for (let i = 0; i < rest; i++) out[off + i] = this.data[off + i] + v;
+        }
+      }
+      const req = this.requiresGrad || chan.requiresGrad;
+      const t = new Tensor(out, [...this.shape], req, [this, chan], () => {});
+      t._backward = (gout) => {
+        if (this.requiresGrad) {
+          if (!this.grad) this.grad = new Float32Array(this.numel);
+          for (let i = 0; i < this.numel; i++) this.grad[i] += gout[i];
+        }
+        if (chan.requiresGrad) {
+          if (!chan.grad) chan.grad = new Float32Array(N * C);
+          for (let n = 0; n < N; n++)
+            for (let c = 0; c < C; c++) {
+              const off = (n * C + c) * rest;
+              let s = 0;
+              for (let i = 0; i < rest; i++) s += gout[off + i];
+              chan.grad[n * C + c] += s;
+            }
+        }
+      };
+      return t;
+    }
+
+    /**
      * Zero-pad. paddings: array of [before, after] per dim, length === ndim.
      */
     pad(paddings) {
@@ -2854,6 +2892,36 @@
     }
   }
 
+  /**
+   * Diffusion ResBlock: h = conv2(silu(gn2(conv1(silu(gn1(x)))))) + time_mlp(t_emb)
+   * with channel-projecting skip. NCHW, stride 1, kernel 3 pad 1.
+   */
+  class ResBlock extends Module {
+    constructor(inChannels, outChannels, timeDim, { numGroups = 4, eps = 1e-5, requiresGrad = true } = {}) {
+      super();
+      this.inChannels = inChannels;
+      this.outChannels = outChannels;
+      this.norm1 = new GroupNorm(Math.min(numGroups, inChannels), inChannels, { eps, requiresGrad });
+      this.conv1 = new Conv2d(inChannels, outChannels, 3, { padding: 1, bias: false });
+      this.norm2 = new GroupNorm(Math.min(numGroups, outChannels), outChannels, { eps, requiresGrad });
+      this.conv2 = new Conv2d(outChannels, outChannels, 3, { padding: 1, bias: false });
+      this.timeMlp = new Linear(timeDim, outChannels, { bias: false, requiresGrad });
+      this.skip = inChannels !== outChannels
+        ? new Conv2d(inChannels, outChannels, 1, { bias: false })
+        : null;
+    }
+
+    forward(x, tEmb) {
+      let h = this.norm1.forward(x).silu();
+      h = this.conv1.forward(h);
+      h = this.norm2.forward(h).silu();
+      h = this.conv2.forward(h);
+      if (tEmb) h = h.addChannelMap(this.timeMlp.forward(tEmb));
+      const skip = this.skip ? this.skip.forward(x) : x;
+      return h.add(skip);
+    }
+  }
+
   class BatchNorm extends Module {
     constructor(sz, { eps = 1e-5, affine = true, momentum = 0.1 } = {}) {
       super();
@@ -3108,6 +3176,7 @@
     Module, Linear, Embedding, RMSNorm, LayerNorm, Dropout,
     Conv2d, Conv1d, ConvTranspose2d, ConvTranspose1d, GroupNorm, BatchNorm, BatchNorm2d: BatchNorm, LSTMCell,
     SinusoidalTimestep,
+    ResBlock,
   };
   const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD, LAMB, LARS, Muon };
 
