@@ -426,6 +426,34 @@ def test_dequant_matches_gguf_py():
         got = _dequant(name, raw, (nb * 256,), name)
         assert np.array_equal(got, ref.reshape(-1)), f"{name}: max {np.abs(got - ref).max()}"
 
+    # ---- remaining quant family (round 9284259+: Q5_1/BF16/MXFP4 have quantizers) ----
+    for name, qt in [("Q5_1", QT.Q5_1), ("BF16", QT.BF16), ("MXFP4", QT.MXFP4)]:
+        x = rng.standard_normal(1024).astype(np.float32) * 0.5
+        raw = gguf.quants.quantize(x, qt).tobytes()
+        ref = gguf.quants.dequantize(np.frombuffer(raw, np.uint8), qt).astype(np.float32)
+        got = _dequant(name, raw, (1024,), name)
+        assert np.array_equal(got, ref.reshape(-1)), f"{name}: max {np.abs(got - ref).max()}"
+
+    # ---- the rest: dequant-only types from random blocks (f16 slots tamed) ----
+    # (block_bytes, block_elems) per type; NVFP4's ue4m3 scales cannot produce
+    # NaN so it needs no taming but the odd-byte mask is harmless there.
+    for name, qt, block_bytes, block_elems in [
+        ("Q3_K", QT.Q3_K, 110, 256), ("Q5_K", QT.Q5_K, 176, 256),
+        ("TQ1_0", QT.TQ1_0, 54, 256), ("IQ2_XXS", QT.IQ2_XXS, 66, 256),
+        ("IQ2_XS", QT.IQ2_XS, 74, 256), ("IQ2_S", QT.IQ2_S, 82, 256),
+        ("IQ3_XXS", QT.IQ3_XXS, 98, 256), ("IQ3_S", QT.IQ3_S, 110, 256),
+        ("IQ1_S", QT.IQ1_S, 50, 256), ("IQ1_M", QT.IQ1_M, 56, 256),
+        ("IQ4_NL", QT.IQ4_NL, 18, 32), ("IQ4_XS", QT.IQ4_XS, 136, 256),
+        ("NVFP4", QT.NVFP4, 36, 64),
+    ]:
+        nb = 4
+        raw = rng.integers(0, 256, nb * block_bytes, dtype=np.uint8)
+        raw[1::2] &= 0x3B  # tame f16 exponent slots -> no NaN/Inf in either side
+        raw = raw.tobytes()
+        ref = gguf.quants.dequantize(np.frombuffer(raw, np.uint8), qt).astype(np.float32)
+        got = _dequant(name, raw, (nb * block_elems,), name)
+        assert np.array_equal(got, ref.reshape(-1)), f"{name}: max {np.abs(got - ref).max()}"
+
 
 def test_gguf_merges_keep_hash_prefixed_entries(tmp_path):
     """Byte-level BPE has real merges starting with '#'; they must survive export."""

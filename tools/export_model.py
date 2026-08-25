@@ -51,9 +51,11 @@ def f16_decode(b64: str) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
-# GGUF reader (subset: metadata + F32/F16/Q4_0/Q4_1/Q5_0/Q8_0/Q2_K/Q4_K/Q6_K/
-# TQ2_0 tensors). Every dequant is byte-exact against gguf-py -- see
-# tests/test_export_model.py::test_dequant_matches_gguf_py.
+# GGUF reader (subset: metadata + F32/F16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/
+# Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/BF16/IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/
+# IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS/MXFP4/NVFP4 tensors). Every dequant is
+# byte-exact against gguf-py -- see tests/test_export_model.py::
+# test_dequant_matches_gguf_py and tests/_check_real_iq.py (real files).
 # --------------------------------------------------------------------------
 
 # Current ggml/GGUF type enum (gguf-py GGMLQuantizationType; note the 2025
@@ -64,7 +66,8 @@ GGML_TYPE = {
     14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS",
     19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS",
     24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M",
-    30: "BF16", 34: "TQ1_0", 35: "TQ2_0",
+    30: "BF16", 34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4", 40: "NVFP4",
+    41: "Q1_0",
 }
 
 GGUF_META_TYPES = {  # value_type -> (struct fmt, size) for scalars
@@ -176,6 +179,12 @@ def _dequant(name: str, raw: bytes, dims: tuple, gtype: str) -> np.ndarray:
         return _dequant_k(raw, n, gtype).reshape(shape)
     if gtype in ("Q2_K", "TQ2_0"):
         return _dequant_k2(raw, n, gtype).reshape(shape)
+    if gtype in ("Q3_K", "Q5_K"):
+        return _dequant_k3(raw, n, gtype).reshape(shape)
+    if gtype in ("Q5_1", "BF16", "TQ1_0", "IQ4_NL", "MXFP4", "NVFP4"):
+        return _dequant_simple(raw, n, gtype).reshape(shape)
+    if gtype in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M", "IQ4_XS"):
+        return _dequant_iq(raw, n, gtype).reshape(shape)
     if gtype == "Q5_0":
         # block of 32: f16 d + u32 qh + qs[16] (22 B)
         nb = n // 32
@@ -292,8 +301,326 @@ def _dequant_k2(raw: bytes, n: int, gtype: str) -> np.ndarray:
     return ((bits.astype(np.float32) - 1.0) * f16s[:, None]).reshape(-1)
 
 
+# --------------------------------------------------------------------------
+# New quant family (Q3_K / Q5_K / TQ1_0 / BF16 / Q5_1 / IQ* / MXFP4 / NVFP4).
+# Every dequant below is a direct port of gguf-py's gguf.quants classes and is
+# verified byte-exact against gguf-py on random data (test_dequant_matches_gguf_py).
+# --------------------------------------------------------------------------
+
+try:  # repo-root on sys.path (PYTHONPATH="D:/code/gabion") or script dir
+    import _iq_tables as IQT
+except ImportError:
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(__file__))
+    import _iq_tables as IQT
+
+
+def _iq_grid(grid_hex: bytes, grid_map, grid_shape) -> np.ndarray:
+    """Decode a llama.cpp iq grid (hex-encoded packed table) into the float
+    lookup table. Port of gguf-py __Quant.init_grid. Returns (1,1,R,C)."""
+    bits_per_elem = int(np.ceil(np.log2(len(grid_map))))
+    elems_per_byte = 8 // bits_per_elem
+    g = np.frombuffer(grid_hex, dtype=np.uint8)
+    g = g.reshape((-1, 2))
+    g = (np.where(g > 0x40, g + 9, g) & 0x0F) << np.array([4, 0], dtype=np.uint8).reshape((1, 2))
+    g = g[..., 0] | g[..., 1]
+    g = g.reshape((-1, 1)) >> np.array(list(range(0, 8, 8 // elems_per_byte)), dtype=np.uint8).reshape((1, elems_per_byte))
+    g = (g & ((1 << bits_per_elem) - 1)).reshape((-1, 1))
+    gm = np.array(grid_map, dtype=np.float32).reshape((1, -1))
+    g = np.take_along_axis(gm, g, axis=-1)
+    return g.reshape((1, 1, *grid_shape))
+
+
+_IQ_GRIDS = {
+    "IQ2_XXS": _iq_grid(IQT.IQ2_XXS_GRID_HEX, IQT.IQ2_XXS_GRID_MAP, IQT.IQ2_XXS_GRID_SHAPE),
+    "IQ2_XS": _iq_grid(IQT.IQ2_XS_GRID_HEX, IQT.IQ2_XS_GRID_MAP, IQT.IQ2_XS_GRID_SHAPE),
+    "IQ2_S": _iq_grid(IQT.IQ2_S_GRID_HEX, IQT.IQ2_S_GRID_MAP, IQT.IQ2_S_GRID_SHAPE),
+    "IQ3_XXS": _iq_grid(IQT.IQ3_XXS_GRID_HEX, IQT.IQ3_XXS_GRID_MAP, IQT.IQ3_XXS_GRID_SHAPE),
+    "IQ3_S": _iq_grid(IQT.IQ3_S_GRID_HEX, IQT.IQ3_S_GRID_MAP, IQT.IQ3_S_GRID_SHAPE),
+    "IQ1_S": _iq_grid(IQT.IQ1_S_GRID_HEX, IQT.IQ1_S_GRID_MAP, IQT.IQ1_S_GRID_SHAPE),
+    "IQ1_M": _iq_grid(IQT.IQ1_S_GRID_HEX, IQT.IQ1_S_GRID_MAP, IQT.IQ1_S_GRID_SHAPE),
+}
+_KSIGNS = np.frombuffer(IQT.KSIGNS, dtype=np.uint8).reshape((1, 1, 1, 128))
+_IQ4_KVALUES = np.array(IQT.IQ4_NL_KVALUES, dtype=np.int8).reshape((1, 1, 16))
+_IQ1_DELTA = np.float32(IQT.IQ1_S_DELTA)
+
+
+def _dequant_k3(raw: bytes, n: int, gtype: str) -> np.ndarray:
+    """Q3_K / Q5_K (llama.cpp ggml-quants.c, QK_K = 256). Vectorized."""
+    nb = n // 256
+    if gtype == "Q3_K":
+        # FILE layout: hmask[32], qs[64], scales[12], d[2] (110 B) — d at END.
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 110).reshape(nb, 110)
+        hmask = blk[:, 0:32]
+        qs = blk[:, 32:96]
+        scales = blk[:, 96:108]
+        d = blk[:, 108:110].copy().view("<f2")[:, 0].astype(np.float32)
+        # scales packed 6-bit: low nibbles in bytes 0..7, high 2 bits in 8..11
+        lscales = scales[:, 0:8].reshape(nb, 1, 8) >> np.array([0, 4], dtype=np.uint8).reshape((1, 2, 1))
+        lscales = lscales.reshape(nb, 16)
+        hscales = scales[:, 8:12].reshape(nb, 1, 4) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 4, 1))
+        hscales = hscales.reshape(nb, 16)
+        sc = (lscales & 0x0F) | ((hscales & 0x03) << 4)
+        sc = (sc.astype(np.int8) - np.int8(32)).astype(np.float32)
+        dl = (d[:, None] * sc).reshape(nb, 16, 1)
+        ql = qs.reshape(nb, -1, 1, 32) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4, 1))
+        qh = hmask.reshape(nb, -1, 1, 32) >> np.array(list(range(8)), dtype=np.uint8).reshape((1, 1, 8, 1))
+        ql = ql.reshape(nb, 16, 16) & 0x03
+        qh = (qh.reshape(nb, 16, 16) & 0x01) ^ 0x01  # offset is zero when the bitmask is 1
+        q = (ql.astype(np.int8) - (qh << 2).astype(np.int8)).astype(np.float32)
+        return (dl * q).reshape(-1)
+    # Q5_K: FILE layout: d[2], dmin[2], scales[12], qh[32], qs[128] (176 B)
+    blk = np.frombuffer(raw, dtype="<u1", count=nb * 176).reshape(nb, 176)
+    d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+    dmin = blk[:, 2:4].copy().view("<f2")[:, 0].astype(np.float32)
+    scales = blk[:, 4:16]
+    qh = blk[:, 16:48]
+    qs = blk[:, 48:176]
+    # get_scale_min_k4 over the 12 scale bytes (see _dequant_k)
+    sc = np.empty((nb, 8), dtype=np.uint16)
+    mn = np.empty((nb, 8), dtype=np.uint16)
+    sc[:, 0] = scales[:, 0] & 63; mn[:, 0] = scales[:, 4] & 63
+    sc[:, 1] = scales[:, 1] & 63; mn[:, 1] = scales[:, 5] & 63
+    sc[:, 2] = scales[:, 2] & 63; mn[:, 2] = scales[:, 6] & 63
+    sc[:, 3] = scales[:, 3] & 63; mn[:, 3] = scales[:, 7] & 63
+    sc[:, 4] = (scales[:, 8] & 0xF) | ((scales[:, 0] >> 6) << 4); mn[:, 4] = (scales[:, 8] >> 4) | ((scales[:, 4] >> 6) << 4)
+    sc[:, 5] = (scales[:, 9] & 0xF) | ((scales[:, 1] >> 6) << 4); mn[:, 5] = (scales[:, 9] >> 4) | ((scales[:, 5] >> 6) << 4)
+    sc[:, 6] = (scales[:, 10] & 0xF) | ((scales[:, 2] >> 6) << 4); mn[:, 6] = (scales[:, 10] >> 4) | ((scales[:, 6] >> 6) << 4)
+    sc[:, 7] = (scales[:, 11] & 0xF) | ((scales[:, 3] >> 6) << 4); mn[:, 7] = (scales[:, 11] >> 4) | ((scales[:, 7] >> 6) << 4)
+    d = (d[:, None] * sc.astype(np.float32)).reshape(nb, -1, 1)
+    dm = (dmin[:, None] * mn.astype(np.float32)).reshape(nb, -1, 1)
+    ql = qs.reshape(nb, -1, 1, 32) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+    qhb = qh.reshape(nb, -1, 1, 32) >> np.array(list(range(8)), dtype=np.uint8).reshape((1, 1, 8, 1))
+    ql = (ql & 0x0F).reshape(nb, -1, 32)
+    qhb = (qhb & 0x01).reshape(nb, -1, 32)
+    q = (ql | (qhb << 4)).astype(np.float32)
+    return (d * q - dm).reshape(-1)
+
+
+def _dequant_simple(raw: bytes, n: int, gtype: str) -> np.ndarray:
+    """Q5_1 / BF16 / TQ1_0 / IQ4_NL / MXFP4 / NVFP4 — the small-block types."""
+    if gtype == "BF16":
+        return (np.frombuffer(raw, dtype="<i2", count=n).astype(np.int32) << 16).view(np.float32)
+    if gtype == "Q5_1":
+        # block of 32: f16 d, f16 m, u32 qh, qs[16] (24 B); value = d*q + m
+        # NOTE: unlike Q5_0, qh bit j is the 5th bit of ELEMENT j (0..31) —
+        # bits 0..15 go to the low half, bits 16..31 to the high half.
+        nb = n // 32
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 24).reshape(nb, 24)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        m = blk[:, 2:4].copy().view("<f2")[:, 0].astype(np.float32)
+        qh = blk[:, 4:8].copy().view("<u4")[:, 0].astype(np.uint32)
+        qs = blk[:, 8:]
+        j32 = np.arange(32)
+        qhb = ((qh[:, None] >> j32) & 0x01).astype(np.int32)
+        lo = ((qs & 0x0F).astype(np.int32) | (qhb[:, :16] << 4))
+        hi = ((qs >> 4).astype(np.int32) | (qhb[:, 16:] << 4))
+        out = np.empty((nb, 32), dtype=np.float32)
+        out[:, :16] = lo * d[:, None] + m[:, None]
+        out[:, 16:] = hi * d[:, None] + m[:, None]
+        return out.reshape(-1)
+    if gtype == "TQ1_0":
+        # FILE layout: qs[48], qh[4], d[2] (54 B); base-3 packed, val = (code-1)*d
+        nb = n // 256
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 54).reshape(nb, 54)
+        d = blk[:, 52:54].copy().view("<f2")[:, 0].astype(np.float32)
+        qs0 = blk[:, 0:32]
+        qs1 = blk[:, 32:48]
+        qh = blk[:, 48:52]
+        q0 = (qs0.reshape(nb, -1, 1, 32) * np.array([1, 3, 9, 27, 81], dtype=np.uint8).reshape(1, 1, 5, 1)).reshape(nb, -1)
+        q1 = (qs1.reshape(nb, -1, 1, 16) * np.array([1, 3, 9, 27, 81], dtype=np.uint8).reshape(1, 1, 5, 1)).reshape(nb, -1)
+        q2 = (qh.reshape(nb, -1, 1, 4) * np.array([1, 3, 9, 27], dtype=np.uint8).reshape(1, 1, 4, 1)).reshape(nb, -1)
+        qs = np.concatenate([q0, q1, q2], axis=-1)
+        qs = ((qs.astype(np.uint16) * 3) >> 8).astype(np.int8) - np.int8(1)
+        return (d[:, None] * qs.astype(np.float32)).reshape(-1)
+    if gtype == "IQ4_NL":
+        # block of 32: f16 d + qs[16] nibbles (18 B); 16-entry kvalue lookup
+        nb = n // 32
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 18).reshape(nb, 18)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 2:]
+        q = (qs.reshape(nb, -1, 1, 16) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1)) & 0x0F
+        q = q.reshape(nb, 32, 1)
+        q = np.take_along_axis(_IQ4_KVALUES, q, axis=-1).astype(np.float32).reshape(nb, 32)
+        return (d[:, None] * q).reshape(-1)
+    if gtype == "MXFP4":
+        # block of 32: e8m0 exponent byte + 16 nibble bytes (17 B); e2m1 kvalues
+        nb = n // 32
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 17).reshape(nb, 17)
+        e = blk[:, 0:1].astype(np.uint32)
+        qs = blk[:, 1:]
+        bits = np.where(e < 2, np.uint32(0x00200000) << e, np.uint32(e - 1) << np.uint32(23))
+        d = bits.view(np.float32)
+        q = (qs.reshape(nb, 1, 16) >> np.array([0, 4], dtype=np.uint8).reshape(1, 2, 1)) & 0x0F
+        q = q.view(np.int8)
+        q = np.take_along_axis(np.array(IQT.MXFP4_KVALUES, dtype=np.int8).reshape(1, 1, 16), q, axis=-1).reshape(nb, 32)
+        return (d * q.astype(np.float32)).reshape(-1)
+    # NVFP4: block of 64: 4x ue4m3 scales + 32 nibble bytes (36 B)
+    nb = n // 64
+    blk = np.frombuffer(raw, dtype="<u1", count=nb * 36).reshape(nb, 36)
+    db = blk[:, 0:4]
+    qs = blk[:, 4:]
+    exp = (db >> 3).astype(np.int32) & 0xF
+    man = (db & 0x7).astype(np.float32)
+    rawd = np.where(exp == 0, man * 2.0 ** -9, (1.0 + man / 8.0) * (2.0 ** (exp.astype(np.float32) - 7)))
+    d = np.where((db == 0) | (db == 0x7F), 0.0, rawd * 0.5).reshape(nb, 4, 1)
+    qb = qs.reshape(nb, 4, 8)
+    lo = (qb & 0x0F).view(np.int8)
+    hi = (qb >> 4).view(np.int8)
+    vals = np.concatenate([lo, hi], axis=-1)
+    vals = np.take_along_axis(np.array(IQT.NVFP4_KVALUES, dtype=np.int8).reshape(1, 1, 16), vals, axis=-1)
+    return (d * vals.astype(np.float32)).reshape(-1)
+
+
+def _dequant_iq(raw: bytes, n: int, gtype: str) -> np.ndarray:
+    """The i-quants (IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M/IQ4_XS).
+
+    Port of gguf-py's dequantize_blocks. All blocks are QK_K = 256 elements;
+    grid rows are indexed by raw packed codes (bytes/words), signs come from a
+    ksigns table or plain bit masks, and each sub-block has its own scale.
+    """
+    nb = n // 256
+    if gtype == "IQ2_XXS":
+        # d[2] + qs[64] (66 B): 8 u32 pairs; low u32 = 4 grid indices, high = signs+scale
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 66).reshape(nb, 66)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 2:].copy().view("<u4").reshape(nb, -1, 2)
+        db = d[:, None] * (np.float32(0.5) + (qs[..., 1] >> 28).astype(np.float32)) * np.float32(0.25)
+        db = db.reshape(nb, -1, 1, 1)
+        signs = (qs[..., 1].reshape(nb, -1, 1) >> np.array([0, 7, 14, 21], dtype=np.uint32).reshape(1, 1, 4)) & 0x7F
+        signs = signs.reshape(nb, -1, 4, 1)
+        signs = np.take_along_axis(_KSIGNS, signs, axis=-1)
+        signs = signs.reshape(nb, -1, 4, 1) >> np.array(list(range(8)), dtype=np.uint8).reshape(1, 1, 1, 8)
+        signs = np.where((signs & 0x01) == 0, np.float32(1.0), np.float32(-1.0))
+        signs = signs.reshape(nb, -1, 4, 8)
+        grid = np.take_along_axis(_IQ_GRIDS["IQ2_XXS"], qs[..., 0].copy().view(np.uint8).reshape(nb, -1, 1, 1), axis=-2)
+        grid = grid.reshape(nb, -1, 4, 8)
+        return (db * grid * signs).reshape(-1)
+    if gtype == "IQ2_XS":
+        # d[2] + qs[64] (u16) + scales[8] (74 B)
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 74).reshape(nb, 74)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 2:66].copy().view("<u2")
+        scales = blk[:, 66:74]
+        scales = (scales.reshape(nb, -1, 1) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2)) & 0x0F
+        scales = scales.reshape(nb, -1)
+        db = d[:, None] * (np.float32(0.5) + scales) * np.float32(0.25)
+        db = db.reshape(nb, -1, 1, 1)
+        signs = np.take_along_axis(_KSIGNS.reshape(1, 1, 128), (qs >> 9).reshape(nb, -1, 1), axis=-1)
+        signs = signs.reshape(nb, -1, 1) >> np.array(list(range(8)), dtype=np.uint8).reshape(1, 1, 8)
+        signs = np.where((signs & 0x01) == 0, np.float32(1.0), np.float32(-1.0))
+        signs = signs.reshape(nb, -1, 2, 8)
+        grid = np.take_along_axis(_IQ_GRIDS["IQ2_XS"], (qs & np.uint16(511)).reshape(nb, -1, 1, 1), axis=-2)
+        grid = grid.reshape(nb, -1, 2, 8)
+        return (db * grid * signs).reshape(-1)
+    if gtype == "IQ2_S":
+        # d[2] + qs[32] + signs[32] + qh[8] + scales[8] (82 B)
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 82).reshape(nb, 82)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 2:34]
+        sgn = blk[:, 34:66]
+        qh = blk[:, 66:74]
+        scales = blk[:, 74:82]
+        scales = (scales.reshape(nb, -1, 1) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2)) & 0x0F
+        db = d[:, None] * (np.float32(0.5) + scales.reshape(nb, -1)) * np.float32(0.25)
+        db = db.reshape(nb, -1, 1, 1)
+        signs = (sgn.reshape(nb, -1, 1) >> np.array(list(range(8)), dtype=np.uint8).reshape(1, 1, 8)) & 0x01
+        signs = np.where(signs == 0, np.float32(1.0), np.float32(-1.0)).reshape(nb, -1, 2, 8)
+        qh2 = (qh.reshape(nb, -1, 1) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape(1, 1, 4)) & 0x03
+        qi = qs.astype(np.uint16) | (qh2.astype(np.uint16) << 8).reshape(nb, -1)
+        grid = np.take_along_axis(_IQ_GRIDS["IQ2_S"], qi.reshape(nb, -1, 1, 1), axis=-2)
+        grid = grid.reshape(nb, -1, 2, 8)
+        return (db * grid * signs).reshape(-1)
+    if gtype == "IQ3_XXS":
+        # d[2] + qs[64] + scales[32] (u32) (98 B)
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 98).reshape(nb, 98)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 2:66]
+        scales = blk[:, 66:98].copy().view("<u4")
+        db = d[:, None] * (np.float32(0.5) + (scales >> 28).astype(np.float32)) * np.float32(0.5)
+        db = db.reshape(nb, -1, 1, 1)
+        signs = (scales.reshape(nb, -1, 1) >> np.array([0, 7, 14, 21], dtype=np.uint32).reshape(1, 1, 4)) & 0x7F
+        signs = signs.reshape(nb, -1, 4, 1)
+        signs = np.take_along_axis(_KSIGNS, signs, axis=-1)
+        signs = signs.reshape(nb, -1, 4, 1) >> np.array(list(range(8)), dtype=np.uint8).reshape(1, 1, 1, 8)
+        signs = np.where((signs & 0x01) == 0, np.float32(1.0), np.float32(-1.0))
+        signs = signs.reshape(nb, -1, 4, 8)
+        grid = np.take_along_axis(_IQ_GRIDS["IQ3_XXS"], qs.reshape(nb, -1, 1, 1), axis=-2)
+        grid = grid.reshape(nb, -1, 4, 8)
+        return (db * grid * signs).reshape(-1)
+    if gtype == "IQ3_S":
+        # d[2] + qs[64] + qh[8] + signs[32] + scales[4] (110 B)
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 110).reshape(nb, 110)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 2:66]
+        qh = blk[:, 66:74]
+        sgn = blk[:, 74:106]
+        scales = blk[:, 106:110]
+        scales = (scales.reshape(nb, -1, 1) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2)) & 0x0F
+        db = d[:, None] * (1 + 2 * scales.reshape(nb, -1))
+        db = db.reshape(nb, -1, 1, 1)
+        signs = (sgn.reshape(nb, -1, 1) >> np.array(list(range(8)), dtype=np.uint8).reshape(1, 1, 8)) & 0x01
+        signs = np.where(signs == 0, np.float32(1.0), np.float32(-1.0)).reshape(nb, -1, 4, 8)
+        qhb = ((qh.reshape(nb, -1, 1) >> np.array(list(range(8)), dtype=np.uint8).reshape(1, 1, 8)) & 0x01).astype(np.uint16)
+        qi = qs.astype(np.uint16) | (qhb.reshape(nb, -1) << 8)
+        grid = np.take_along_axis(_IQ_GRIDS["IQ3_S"], qi.reshape(nb, -1, 1, 1), axis=-2)
+        grid = grid.reshape(nb, -1, 4, 8)
+        return (db * grid * signs).reshape(-1)
+    if gtype == "IQ1_S":
+        # d[2] + qs[32] + qh[16] (u16) (50 B)
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 50).reshape(nb, 50)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 2:34]
+        qh = blk[:, 34:50].copy().view("<u2")
+        dl = d[:, None] * (2 * ((qh >> 12) & 7) + 1)
+        dl = dl.reshape(nb, -1, 1, 1)
+        delta = np.where((qh & np.uint16(0x8000)) == 0, _IQ1_DELTA, -_IQ1_DELTA).reshape(nb, -1, 1, 1)
+        qhb = (qh.reshape(nb, -1, 1) >> np.array([0, 3, 6, 9], dtype=np.uint16).reshape(1, 1, 4)) & 7
+        qi = qs.astype(np.uint16) | (qhb.reshape(nb, -1) << 8)
+        grid = np.take_along_axis(_IQ_GRIDS["IQ1_S"], qi.reshape(nb, -1, 1, 1), axis=-2)
+        grid = grid.reshape(nb, -1, 4, 8)
+        return (dl * (grid + delta)).reshape(-1)
+    if gtype == "IQ1_M":
+        # qs[32] + qh[16] + scales[8] (56 B) — the f16 scale is packed across bytes
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 56).reshape(nb, 56)
+        qs = blk[:, 0:32]
+        qh = blk[:, 32:48]
+        scales = blk[:, 48:56].copy().view("<u2")
+        d = ((scales.reshape(nb, 4) & np.uint16(0xF000)) >> np.array([12, 8, 4, 0], dtype=np.uint16).reshape(1, 4))
+        d = (d[..., 0] | d[..., 1] | d[..., 2] | d[..., 3]).view("<f2").astype(np.float32).reshape(nb, 1)
+        sc = (scales.reshape(nb, -1, 1) >> np.array([0, 3, 6, 9], dtype=np.uint16).reshape(1, 1, 4)) & 7
+        dl = d * (2 * sc.reshape(nb, -1) + 1)
+        dl = dl.reshape(nb, -1, 2, 1, 1)
+        qhb = (qh.reshape(nb, -1, 1) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2)) & 7
+        qi = qs.astype(np.uint16) | (qhb.astype(np.uint16).reshape(nb, -1) << 8)
+        delta = np.where((qh.reshape(nb, -1, 1) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2)) & 8 == 0, _IQ1_DELTA, -_IQ1_DELTA)
+        delta = delta.reshape(nb, -1, 2, 2, 1)
+        grid = np.take_along_axis(_IQ_GRIDS["IQ1_S"], qi.reshape(nb, -1, 1, 1), axis=-2)
+        grid = grid.reshape(nb, -1, 2, 2, 8)
+        return (dl * (grid + delta)).reshape(-1)
+    # IQ4_XS: d[2] + scales_h[2] (u16) + scales_l[4] + qs[128] (136 B)
+    blk = np.frombuffer(raw, dtype="<u1", count=nb * 136).reshape(nb, 136)
+    d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+    scales_h = blk[:, 2:4].copy().view("<u2")
+    scales_l = blk[:, 4:8]
+    qs = blk[:, 8:136]
+    sl = (scales_l.reshape(nb, -1, 1) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2)) & 0x0F
+    sh = (scales_h.reshape(nb, 1, -1) >> np.array([2 * i for i in range(8)], dtype=np.uint16).reshape(1, -1, 1))
+    sl = sl.reshape(nb, -1) & 0x0F
+    sh = sh.reshape(nb, -1).astype(np.uint8) & 0x03
+    scales = (sl | (sh << 4)).astype(np.int8) - np.int8(32)
+    dl = (d[:, None] * scales.astype(np.float32)).reshape(nb, -1, 1)
+    q = (qs.reshape(nb, -1, 1, 16) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1)).reshape(nb, -1, 32, 1) & 0x0F
+    q = np.take_along_axis(_IQ4_KVALUES.reshape(1, 1, 1, 16), q, axis=-1).astype(np.float32).reshape(nb, -1, 32)
+    return (dl * q).reshape(-1)
+
+
 def _tensor_data(buf: bytes, name: str, dims: tuple, gtype: str, offset: int, base: int = 0) -> np.ndarray:
-    if gtype in ("F32", "F16", "Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q4_K", "Q6_K", "Q2_K", "TQ2_0"):
+    if gtype in ("F32", "F16", "Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q4_K", "Q6_K", "Q2_K", "TQ2_0",
+                 "Q5_1", "BF16", "Q3_K", "Q5_K", "TQ1_0", "IQ2_XXS", "IQ2_XS", "IQ2_S",
+                 "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "MXFP4", "NVFP4"):
         # memoryview, not buf[base + offset:]: slicing bytes COPIES the whole tail,
         # which on a multi-hundred-MB GGUF costs a full-file copy per tensor.
         # np.frombuffer and struct.unpack_from both accept a memoryview.
