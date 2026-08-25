@@ -368,11 +368,20 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
     d_ff = int(kv("feed_forward_length") or 4 * D)
     rope_base = float(kv("rope.freq_base") or 10000.0)
     ctx = int(kv("context_length") or 2048)
-    # vocab size: explicit key, else the embedded tokenizer table
-    n_vocab = int(kv("vocab_size") or 32000)
     tokens = meta.get("tokenizer.ggml.tokens")
-    if tokens:
-        n_vocab = max(n_vocab, len(tokens))
+    # Vocab size: token_embd's own ne is authoritative (ne = (n_embd, n_vocab)).
+    # Metadata can disagree with the actual matrix, and falling back to a bare
+    # 32000 invents a size for any model whose vocab is smaller.
+    tok_dims = by_name["token_embd.weight"][0] if "token_embd.weight" in by_name else ()
+    if len(tok_dims) == 2:
+        n_vocab = int(tok_dims[1])
+    elif kv("vocab_size"):
+        n_vocab = int(kv("vocab_size"))
+    elif tokens:
+        n_vocab = len(tokens)
+    else:
+        raise ValueError("cannot determine vocab size: no token_embd.weight, "
+                         "no vocab_size metadata, no tokenizer table")
 
     def get(name: str) -> np.ndarray | None:
         if name not in by_name:
@@ -419,12 +428,26 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
     else:
         tie = False
         tensors.append(as_linear("output.weight", (D, n_vocab)))
-    cfg = config or {
-        "vocab_size": n_vocab, "d_model": D, "n_heads": heads,
-        "n_kv_heads": kv_heads, "n_layers": L,
-        "seq_len": min(ctx, 4096), "d_ff": d_ff, "tie_weights": tie,
-        "act_quant": True, "rope_base": rope_base,
-    }
+    if config is None:
+        cfg = {
+            "vocab_size": n_vocab, "d_model": D, "n_heads": heads,
+            "n_kv_heads": kv_heads, "n_layers": L,
+            "seq_len": min(ctx, 4096), "d_ff": d_ff, "tie_weights": tie,
+            "act_quant": True, "rope_base": rope_base,
+        }
+    else:
+        # Copy: cfg picks up a "tokenizer" key below, and that must not leak back
+        # into the caller's dict.
+        cfg = dict(config)
+        # tie_weights is not a free choice -- it describes whether lm_head is in
+        # the flat buffer, which is decided by the GGUF. Disagreeing silently
+        # mis-sizes lm_head at load (subarray clamps, leaving it zero-filled).
+        if "tie_weights" in cfg and bool(cfg["tie_weights"]) != tie:
+            raise ValueError(
+                f"config sets tie_weights={cfg['tie_weights']}, but this GGUF "
+                f"{'has no' if tie else 'has an'} output.weight tensor, so the "
+                f"weight buffer is built {'tied' if tie else 'untied'}")
+        cfg["tie_weights"] = tie
     flat = np.concatenate([np.asarray(t, dtype=np.float32).reshape(-1) for t in tensors])
     wire = {"config": cfg, "weights_b64": f16_base64(flat)}
     # Embed the GGUF's own byte-level BPE tokenizer when present (the JS

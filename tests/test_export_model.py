@@ -450,6 +450,93 @@ def test_gguf_merges_keep_hash_prefixed_entries(tmp_path):
     assert out["vocab"] == {"a": 0, "b": 1, "#": 2, "##": 3}
 
 
+def _minimal_gguf(tmp_path, name, V=17, D=8, dFF=16, untied=False,
+                  vocab_size_meta=True):
+    """One-layer llama GGUF in torch orientation; optionally with output.weight."""
+    rng = np.random.default_rng(2)
+    meta = {
+        "general.architecture": "llama", "llama.block_count": 1,
+        "llama.embedding_length": D, "llama.attention.head_count": 2,
+        "llama.attention.head_count_kv": 2, "llama.feed_forward_length": dFF,
+        "llama.context_length": 32,
+    }
+    if vocab_size_meta is not False:   # True -> V, or an explicit override value
+        meta["llama.vocab_size"] = V if vocab_size_meta is True else vocab_size_meta
+    t = {
+        "token_embd.weight": rng.normal(0, 0.1, (V, D)).astype(np.float32),
+        "blk.0.attn_norm.weight": np.ones(D, np.float32),
+        "blk.0.attn_q.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
+        "blk.0.attn_k.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
+        "blk.0.attn_v.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
+        "blk.0.attn_output.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
+        "blk.0.ffn_norm.weight": np.ones(D, np.float32),
+        "blk.0.ffn_gate.weight": rng.normal(0, 0.1, (dFF, D)).astype(np.float32),
+        "blk.0.ffn_up.weight": rng.normal(0, 0.1, (dFF, D)).astype(np.float32),
+        "blk.0.ffn_down.weight": rng.normal(0, 0.1, (D, dFF)).astype(np.float32),
+        "output_norm.weight": np.ones(D, np.float32),
+    }
+    if untied:
+        t["output.weight"] = rng.normal(0, 0.1, (V, D)).astype(np.float32)
+    path = tmp_path / name
+    _write_gguf(path, meta, t)
+    return path
+
+
+def test_vocab_size_comes_from_token_embd(tmp_path):
+    """Vocab size follows the embedding matrix, not a metadata guess."""
+    # no vocab_size key and no tokenizer table: the old code defaulted to 32000
+    gguf = _minimal_gguf(tmp_path, "novocab.gguf", V=17, vocab_size_meta=False)
+    assert export_gguf(gguf)["config"]["vocab_size"] == 17
+
+    # metadata that disagrees with the actual matrix loses to the matrix
+    gguf2 = _minimal_gguf(tmp_path, "wrongvocab.gguf", V=17, vocab_size_meta=99999)
+    assert export_gguf(gguf2)["config"]["vocab_size"] == 17
+
+
+def test_config_tie_weights_must_match_tensors(tmp_path):
+    """A caller config cannot claim a tie_weights the weight buffer contradicts."""
+    untied = _minimal_gguf(tmp_path, "untied.gguf", untied=True)
+    tied = _minimal_gguf(tmp_path, "tied.gguf", untied=False)
+
+    base = {"vocab_size": 17, "d_model": 8, "n_heads": 2, "n_kv_heads": 2,
+            "n_layers": 1, "seq_len": 32, "d_ff": 16, "act_quant": True}
+
+    with pytest.raises(ValueError, match="tie_weights"):
+        export_gguf(untied, {**base, "tie_weights": True})
+    with pytest.raises(ValueError, match="tie_weights"):
+        export_gguf(tied, {**base, "tie_weights": False})
+
+    # agreeing values are accepted, and the flat buffer length matches
+    out = export_gguf(untied, {**base, "tie_weights": False})
+    assert out["config"]["tie_weights"] is False
+    D, dFF, V = 8, 16, 17
+    per = 4 * D * D + 2 * D + 2 * D * dFF + dFF * D
+    assert len(f16_decode(out["weights_b64"])) == V * D + per + D + D * V
+
+
+def test_export_gguf_does_not_mutate_caller_config(tmp_path):
+    """cfg picks up a 'tokenizer' key; that must not leak into the caller's dict."""
+    meta_extra = {"tokenizer.ggml.tokens": ["a", "b"],
+                  "tokenizer.ggml.merges": ["a b"]}
+    rng = np.random.default_rng(4)
+    D, dFF, V = 8, 16, 2
+    meta = {"general.architecture": "llama", "llama.block_count": 0,
+            "llama.embedding_length": D, "llama.attention.head_count": 2,
+            "llama.attention.head_count_kv": 2, "llama.feed_forward_length": dFF,
+            "llama.context_length": 32, **meta_extra}
+    t = {"token_embd.weight": rng.normal(0, 0.1, (V, D)).astype(np.float32),
+         "output_norm.weight": np.ones(D, np.float32)}
+    gguf = tmp_path / "tokmut.gguf"
+    _write_gguf(gguf, meta, t)
+
+    cfg = {"vocab_size": V, "d_model": D, "n_heads": 2, "n_kv_heads": 2,
+           "n_layers": 0, "seq_len": 32, "d_ff": dFF, "act_quant": True}
+    before = dict(cfg)
+    out = export_gguf(gguf, cfg)
+    assert cfg == before, f"caller config was mutated: {cfg}"
+    assert "tokenizer" in out["config"]        # the copy did get it
+
+
 def test_export_cli(tmp_path, monkeypatch):
     import tools.export_model as em
     from tools.export_model import main as main_fn
