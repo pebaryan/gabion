@@ -1044,6 +1044,7 @@
         if (this._q35ConvStates) this._q35ConvStates.fill(0);
         if (this._q35RecStates) this._q35RecStates.fill(0);
       }
+      if (this._q35Debug0) this._q35Debug0.push({ pos: startPos, x: Float32Array.from(h.data) });
       for (let r = 0; r < T; r++) {
         const pos = startPos + r;
         let x = Tensor.fromArray(h.data.subarray(r * D, (r + 1) * D), [B, 1, D], false);
@@ -1063,14 +1064,15 @@
             const alphaRaw = (await h2d.matmul(bl.sAlpha.weight).toCPU()).data; // [nv]
             chk("layer" + l + ".qkv", qkv); chk("layer" + l + ".z", z);
 
-            // causal conv1d (kernel dConv): y[c] = w0*qkv[c] + w1*prev1 + w2*prev2...
+            // causal conv1d (kernel dConv), taps matched to the tinygrad oracle:
+            // out[t] = w[k-1]*x[t] + w[k-2]*x[t-1] + ... + w[0]*x[t-(k-1)]
             const st = this._q35ConvStates.subarray(
               l * (S.dConv - 1) * S.convDim, (l + 1) * (S.dConv - 1) * S.convDim);
             const cv = bl.convW.data;  // [convDim, dConv]
             const y = new Float32Array(S.convDim);
             for (let c = 0; c < S.convDim; c++) {
-              let acc = cv[c * S.dConv] * qkv[c];
-              for (let i = 1; i < S.dConv; i++) acc += cv[c * S.dConv + i] * st[(i - 1) * S.convDim + c];
+              let acc = cv[c * S.dConv + S.dConv - 1] * qkv[c];
+              for (let i = 0; i < S.dConv - 1; i++) acc += cv[c * S.dConv + i] * st[(S.dConv - 2 - i) * S.convDim + c];
               const silu = acc / (1 + Math.exp(-acc));
               y[c] = silu;
             }
@@ -1097,14 +1099,14 @@
             for (let h = 0; h < S.nk; h++) {
               let sq = 0, sk = 0;
               for (let j = 0; j < S.hk; j++) {
-                sq += qkv[h * S.hk + j] ** 2;
+                sq += y[h * S.hk + j] ** 2;
                 sk += y[kd + h * S.hk + j] ** 2;
               }
               const iq = 1 / Math.sqrt(sq + 1e-6) * qScale;
               const ik = 1 / Math.sqrt(sk + 1e-6);
               for (let r = 0; r < rep; r++) {
                 for (let j = 0; j < S.hk; j++) {
-                  q2[(h * rep + r) * S.hk + j] = qkv[h * S.hk + j] * iq;
+                  q2[(h * rep + r) * S.hk + j] = y[h * S.hk + j] * iq;
                   k2[(h * rep + r) * S.hk + j] = y[kd + h * S.hk + j] * ik;
                 }
               }
@@ -1142,6 +1144,7 @@
               }
             }
             chk("layer" + l + ".delta", out);
+            if (this._q35DbgLin) this._q35DbgLin[l] = { core0: Float32Array.from(out) };
 
             // gated norm: RMSNorm over each v-head (w) * silu(z)
             const sn = bl.sNorm.data;
@@ -1158,6 +1161,18 @@
             }
             const o = (await Tensor.fromArray(out, [1, vd], false).matmul(bl.sOut.weight).toCPU()).data;
             chk("layer" + l + ".ssm_out", o);
+            if (this._q35DbgLin) {
+              const dbg = this._q35DbgLin[l];
+              dbg.qkv = Float32Array.from(qkv);
+              dbg.conv = Float32Array.from(y);
+              dbg.core = dbg.core0; delete dbg.core0;
+              dbg.z = Float32Array.from(out);  // after the gated norm
+              dbg.out = Float32Array.from(o);
+              dbg.alpha = Float32Array.from(alpha);
+              dbg.beta = Float32Array.from(beta);
+              dbg.state = Float32Array.from(
+                this._q35RecStates.subarray(l * S.nv * S.hv * S.hk, (l + 1) * S.nv * S.hv * S.hk));
+            }
             x = x.add(Tensor.fromArray(o, [1, 1, D], false));
           } else if (this.arch === "lfm2" && bl.isConv) {
             // ---- LFM2 shortconv block (gated depthwise causal conv1d) ----
@@ -1198,12 +1213,21 @@
           if (k.onGPU) await k.toCPU();
           if (v.onGPU) await v.toCPU();
           chk("layer" + l + ".q", q.data); chk("layer" + l + ".k", k.data); chk("layer" + l + ".v", v.data);
-          // Qwen3.5 full attention: the q projection outputs q+gate fused — split
-          // the gate now (per-head sigmoid applied after the attention).
+          // Qwen3.5 full attention: the q projection outputs q+gate INTERLEAVED per
+          // head (reshape [H, 2, hd] -> q=[...,0,:], gate=[...,1,:]) — de-interleave.
           if (this.arch === "qwen35") {
             const hdq = this.H * headDim;
-            qGate = q.data.slice(hdq, 2 * hdq);
-            q = Tensor.fromArray(q.data.subarray(0, hdq), [1, hdq], false);
+            qGate = new Float32Array(hdq);
+            const qOnly = new Float32Array(hdq);
+            const qd = q.data;
+            for (let h = 0; h < this.H; h++) {
+              const b2 = h * 2 * headDim;
+              for (let j = 0; j < headDim; j++) {
+                qOnly[h * headDim + j] = qd[b2 + j];
+                qGate[h * headDim + j] = qd[b2 + headDim + j];
+              }
+            }
+            q = Tensor.fromArray(qOnly, [1, hdq], false);
           }
           // LFM2 / Qwen3.5: per-head RMSNorm on q/k (before any bias — none here)
           if (this.arch === "lfm2" || this.arch === "qwen35") {
@@ -1255,6 +1279,13 @@
             // Qwen3.5 full attention: attn_output * sigmoid(gate) per head
             for (let i = 0; i < yData.length; i++) yData[i] *= 1 / (1 + Math.exp(-qGate[i]));
           }
+          if (this._q35DbgFull) {
+            this._q35DbgFull[l] = {
+              q: Float32Array.from(q.data), gate: Float32Array.from(qGate),
+              k: Float32Array.from(k.data), qr: Float32Array.from(q.data),
+              kr: Float32Array.from(k.data), y: Float32Array.from(yData),
+            };
+          }
           const y3 = this._reshapeFromHeads(Tensor.fromArray(yData, [BH, 1, headDim], false), 1, 1, H, headDim);
           // qwen35's attention output is H*headDim (not D) — o_proj is [H*hd, D]
           const attnOut = this.arch === "qwen35" ? this.H * headDim : D;
@@ -1273,6 +1304,7 @@
           if (h2.onGPU) await h2.toCPU();
           chk("layer" + l + ".h2", h2.data);
           x = x.add(h2);
+          if (this._q35Debug) this._q35Debug.push({ l, x: Float32Array.from(x.data) });
           chk("layer" + l + ".x2", x.data);
           if (state.trace && state.trace[l]) state.trace[l](x.data);
         }
