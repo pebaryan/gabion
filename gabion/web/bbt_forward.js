@@ -45,7 +45,7 @@
       this.dFF = config.dFF || (this.D * 4);
       this.tieWeights = config.tieWeights !== false;
       this.ropeBase = config.ropeBase || 10000.0;
-      this.headDim = this.D / this.H;
+      this.headDim = config.headDim || (this.D / this.H);
       this.kvD = this.kvH * this.headDim;
       this.eps = config.normEps != null ? config.normEps : 1e-6;
       this.actQuant = config.actQuant !== false; // default true
@@ -54,7 +54,6 @@
       this.arch = config.arch || "llama";
       this.layerTypes = config.layerTypes || null;
       this.convLCache = config.convLCache || 3;
-      this.headDim = config.headDim || (this.D / this.H);
       // Qwen3.5 rotates only the first ropeDim dims of each head (MRoPE, 64 of 256).
       this.ropeDim = config.ropeDim || this.headDim;
       // GatedDeltaNet (linear attention) hyperparameters — qwen35 arch.

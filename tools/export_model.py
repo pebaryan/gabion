@@ -1157,6 +1157,10 @@ def _export_gguf_qwen35(meta: dict, by_name: dict, buf: bytes, data_base, config
     if "output.weight" in by_name:
         raise ValueError("qwen35 wire assumes tied embeddings; unexpected output.weight")
     tie = True
+    norm_f = get("output_norm.weight")
+    if norm_f is None:
+        raise ValueError("GGUF is missing required tensor 'output_norm.weight'")
+    tensors.append(norm_f.reshape(-1))
 
     if config is None:
         cfg = {
