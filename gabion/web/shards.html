@@ -249,7 +249,13 @@ async function generate() {
     let stopped = false;
     const sampleK = (n) => {
       const toks = [];
-      for (let i = 0; i < n; i++) toks.push(coord._sample(lg, temp, topK, topP, rng || undefined));
+      let guard = 0;
+      while (toks.length < n && guard < 40) {
+        guard++;
+        const t = coord._sample(lg, temp, topK, topP, rng || undefined);
+        if (toks.indexOf(t) === -1) toks.push(t); // distinct continuations
+      }
+      while (toks.length < n) toks.push(coord._sample(lg, temp, topK, topP, rng || undefined));
       return toks;
     };
     while (gen.length < maxNew) {
