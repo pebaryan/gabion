@@ -187,6 +187,40 @@ def build_fixture() -> dict:
     (rb_x_grad, rb_gn1w_grad, rb_gn1b_grad, rb_conv1w_grad,
      rb_gn2w_grad, rb_gn2b_grad, rb_conv2w_grad, rb_mlp_grad, rb_skipw_grad) = [g.numpy().astype(np.float64).reshape(-1) for g in grads]
 
+    # SpatialAttention reference (mirrors JS nchwToBhwc + qkv + attn)
+    sa_x = rng.normal(0, 1, size=(2, 4, 8, 8)).astype(np.float32)
+    sa_gn = TGGroupNorm(2, 4, eps=1e-5)
+    sa_qkv_w = rng.normal(0, 0.5, size=(4, 12)).astype(np.float32)
+    sa_qkv_wt = Tensor(sa_qkv_w.tolist())
+    sa_proj_w = rng.normal(0, 0.5, size=(4, 4)).astype(np.float32)
+    sa_proj_wt = Tensor(sa_proj_w.tolist())
+
+    def sa_forward(xt):
+        h = sa_gn(xt)
+        bhwc = h.permute(0, 2, 3, 1).reshape(2, 64, 4)
+        flat = bhwc.reshape(128, 4)
+        qkvFlat = flat.matmul(sa_qkv_wt)
+        qkv3d = qkvFlat.reshape(2, 64, 12)
+        q, k, v = qkv3d.chunk(3, dim=2)
+        scale = 1 / np.sqrt(4)
+        scores = (q @ k.transpose(1, 2)) * scale
+        attn = scores.softmax(axis=-1)
+        out = attn @ v
+        outFlat = out.reshape(128, 4)
+        projFlat = outFlat.matmul(sa_proj_wt)
+        proj3d = projFlat.reshape(2, 64, 4)
+        projNchw = proj3d.reshape(2, 8, 8, 4).permute(0, 3, 1, 2)
+        return projNchw + xt
+
+    sa_xt = Tensor(sa_x.tolist())
+    sa_yt = sa_forward(sa_xt)
+    sa_y = sa_yt.numpy().astype(np.float64).reshape(-1)
+    sa_gout = rng.normal(0, 1, size=tuple(sa_yt.shape)).astype(np.float32)
+    sa_grads = (sa_yt * Tensor(sa_gout.tolist())).sum().gradient(
+        sa_xt, sa_gn.weight, sa_gn.bias, sa_qkv_wt, sa_proj_wt
+    )
+    sa_x_grad, sa_gnw_grad, sa_gnb_grad, sa_qkv_grad, sa_proj_grad = [g.numpy().astype(np.float64).reshape(-1) for g in sa_grads]
+
     mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mg = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mpt = Tensor(mp.tolist())
@@ -335,6 +369,19 @@ def build_fixture() -> dict:
         "rb_conv2w_grad": rb_conv2w_grad.tolist(),
         "rb_mlp_grad": rb_mlp_grad.tolist(),
         "rb_skipw_grad": rb_skipw_grad.tolist(),
+        "sa_x": sa_x.astype(float).reshape(-1).tolist(),
+        "sa_x_shape": list(sa_x.shape),
+        "sa_gnw": sa_gn.weight.numpy().astype(float).reshape(-1).tolist(),
+        "sa_gnb": sa_gn.bias.numpy().astype(float).reshape(-1).tolist(),
+        "sa_qkvw": sa_qkv_w.astype(float).reshape(-1).tolist(),
+        "sa_projw": sa_proj_w.astype(float).reshape(-1).tolist(),
+        "sa_y": sa_y.tolist(),
+        "sa_gout": sa_gout.astype(float).reshape(-1).tolist(),
+        "sa_x_grad": sa_x_grad.tolist(),
+        "sa_gnw_grad": sa_gnw_grad.tolist(),
+        "sa_gnb_grad": sa_gnb_grad.tolist(),
+        "sa_qkv_grad": sa_qkv_grad.tolist(),
+        "sa_proj_grad": sa_proj_grad.tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -381,6 +428,8 @@ def main() -> int:
             report["rb_grad_x"], report["rb_grad_gn1w"], report["rb_grad_gn1b"],
             report["rb_grad_conv1w"], report["rb_grad_gn2w"], report["rb_grad_gn2b"],
             report["rb_grad_conv2w"], report["rb_grad_mlpw"], report["rb_grad_skipw"]) < 1e-4,
+        "spatial_attention": report["sa_fwd"] < 1e-4 and max(
+            report["sa_grad_x"], report["sa_gnw"], report["sa_gnb"], report["sa_qkv"], report["sa_proj"]) < 1e-4,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])

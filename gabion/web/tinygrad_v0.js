@@ -1212,6 +1212,66 @@
       return t;
     }
 
+    /** NCHW [B,C,H,W] -> BHWC [B, HW, C] permute (for attention). */
+    nchwToBhwc() {
+      if (this.shape.length !== 4) throw new Error(`nchwToBhwc expects 4D NCHW, got ${this.shape}`);
+      const [B, C, H, W] = this.shape;
+      const HW = H * W;
+      const out = new Float32Array(B * HW * C);
+      const src = this.data;
+      for (let b = 0; b < B; b++) {
+        for (let c = 0; c < C; c++) {
+          for (let h = 0; h < H; h++) {
+            for (let w = 0; w < W; w++) {
+              const hw = h * W + w;
+              out[(b * HW + hw) * C + c] = src[((b * C + c) * H + h) * W + w];
+            }
+          }
+        }
+      }
+      const t = new Tensor(out, [B, HW, C], this.requiresGrad, [this], (gout) => {
+        if (!this.requiresGrad) return;
+        if (!this.grad) this.grad = new Float32Array(this.numel);
+        for (let b = 0; b < B; b++) for (let c = 0; c < C; c++) for (let h = 0; h < H; h++) for (let w = 0; w < W; w++) {
+          const hw = h * W + w;
+          this.grad[((b * C + c) * H + h) * W + w] += gout[(b * HW + hw) * C + c];
+        }
+      });
+      return t;
+    }
+
+    /** BHWC [B,HW,C] -> NCHW [B,C,H,W] (inverse of nchwToBhwc). Pass H,W or shape array. */
+    bhwcToNchw(H, W, C) {
+      // overload: bhwcToNchw([B,C,H,W]) or bhwcToNchw(H,W) when B and C inferred
+      let outB, outC, outH, outW;
+      if (Array.isArray(H)) { [outB, outC, outH, outW] = H; }
+      else {
+        if (this.shape.length !== 3) throw new Error(`bhwcToNchw expects 3D BHWC, got ${this.shape}`);
+        const B = this.shape[0], HW = this.shape[1], Cb = this.shape[2];
+        if (H == null || W == null) throw new Error("bhwcToNchw requires H,W");
+        outB = B; outC = C != null ? C : Cb; outH = H; outW = W;
+        if (HW !== outH * outW) throw new Error(`bhwcToNchw HW mismatch ${HW} vs ${outH}*${outW}`);
+        if (Cb !== outC) throw new Error(`bhwcToNchw C mismatch ${Cb} vs ${outC}`);
+      }
+      const B = outB, Cc = outC, Hh = outH, Ww = outW;
+      const HW = Hh * Ww;
+      const out = new Float32Array(B * Cc * Hh * Ww);
+      const src = this.data;
+      for (let b = 0; b < B; b++) for (let c = 0; c < Cc; c++) for (let h = 0; h < Hh; h++) for (let w = 0; w < Ww; w++) {
+        const hw = h * Ww + w;
+        out[((b * Cc + c) * Hh + h) * Ww + w] = src[(b * HW + hw) * Cc + c];
+      }
+      const t = new Tensor(out, [B, Cc, Hh, Ww], this.requiresGrad, [this], (gout) => {
+        if (!this.requiresGrad) return;
+        if (!this.grad) this.grad = new Float32Array(this.numel);
+        for (let b = 0; b < B; b++) for (let c = 0; c < Cc; c++) for (let h = 0; h < Hh; h++) for (let w = 0; w < Ww; w++) {
+          const hw = h * Ww + w;
+          this.grad[(b * HW + hw) * Cc + c] += gout[((b * Cc + c) * Hh + h) * Ww + w];
+        }
+      });
+      return t;
+    }
+
     /**
      * Zero-pad. paddings: array of [before, after] per dim, length === ndim.
      */
@@ -2922,6 +2982,38 @@
     }
   }
 
+  /** Spatial self-attention over H×W positions (single-head, C channels). */
+  class SpatialAttention extends Module {
+    constructor(channels, { numGroups = 4, eps = 1e-5, requiresGrad = true } = {}) {
+      super();
+      this.channels = channels;
+      this.norm = new GroupNorm(Math.min(numGroups, channels), channels, { eps, requiresGrad });
+      this.qkv = new Linear(channels, channels * 3, { bias: false, requiresGrad });
+      this.proj = new Linear(channels, channels, { bias: false, requiresGrad });
+    }
+
+    forward(x) {
+      const [B, C, H, W] = x.shape;
+      const HW = H * W;
+      if (C !== this.channels) throw new Error(`SpatialAttention channels mismatch ${C} vs ${this.channels}`);
+      const h = this.norm.forward(x);
+      const bhwc = h.nchwToBhwc(); // [B,HW,C]
+      const flat = bhwc.reshape([B * HW, C]);
+      const qkvFlat = flat.matmul(this.qkv.weight); // [B*HW, 3C]
+      const qkv3d = qkvFlat.reshape([B, HW, 3 * C]);
+      const [q, k, v] = qkv3d.splitLast([C, C, C]); // each [B,HW,C]
+      const scale = 1 / Math.sqrt(C);
+      const scores = q.batchedMatmul(k.transpose3d()).scale(scale); // [B,HW,HW]
+      const attn = scores.softmax();
+      const out = attn.batchedMatmul(v); // [B,HW,C]
+      const outFlat = out.reshape([B * HW, C]);
+      const projFlat = outFlat.matmul(this.proj.weight); // [B*HW,C]
+      const proj3d = projFlat.reshape([B, HW, C]);
+      const projNchw = proj3d.bhwcToNchw(H, W);
+      return projNchw.add(x);
+    }
+  }
+
   class BatchNorm extends Module {
     constructor(sz, { eps = 1e-5, affine = true, momentum = 0.1 } = {}) {
       super();
@@ -3177,6 +3269,7 @@
     Conv2d, Conv1d, ConvTranspose2d, ConvTranspose1d, GroupNorm, BatchNorm, BatchNorm2d: BatchNorm, LSTMCell,
     SinusoidalTimestep,
     ResBlock,
+    SpatialAttention,
   };
   const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD, LAMB, LARS, Muon };
 

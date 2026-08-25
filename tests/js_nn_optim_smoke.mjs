@@ -194,6 +194,23 @@ rbY.grad = Float32Array.from(fixture.rb_gout);
   }
 }
 
+// SpatialAttention fwd + backward
+const sa = new tg.nn.SpatialAttention(4, { numGroups: 2 });
+sa.norm.weight.data.set(Float32Array.from(fixture.sa_gnw));
+sa.norm.bias.data.set(Float32Array.from(fixture.sa_gnb));
+sa.qkv.weight.data.set(Float32Array.from(fixture.sa_qkvw));
+sa.proj.weight.data.set(Float32Array.from(fixture.sa_projw));
+const saX = Tensor.fromArray(fixture.sa_x, fixture.sa_x_shape, true);
+const saY = sa.forward(saX);
+saY.grad = Float32Array.from(fixture.sa_gout);
+{
+  const topo = [];
+  const seen = new Set();
+  const build = (tt) => { if (seen.has(tt)) return; seen.add(tt); for (const q of tt._parents) build(q); topo.push(tt); };
+  build(saY);
+  for (let i = topo.length - 1; i >= 0; i--) { const tt = topo[i]; if (tt.grad === null || tt.grad === undefined) continue; tt._backward(tt.grad, tt._gradGPUBuf || tt._pendingGradBuf || null); }
+}
+
 const mp = Tensor.fromArray(fixture.muon_p, [4, 4], true);
 mp.grad = Float32Array.from(fixture.muon_g);
 const muon = tg.Muon([mp], { lr: 1e-3, warmupSteps: 1, gradClipNorm: 0 });
@@ -250,6 +267,12 @@ const report = {
   rb_grad_conv2w: maxAbs(rb.conv2.weight.grad, fixture.rb_conv2w_grad),
   rb_grad_mlpw: maxAbs(rb.timeMlp.weight.grad, fixture.rb_mlp_grad),
   rb_grad_skipw: maxAbs(rb.skip.weight.grad, fixture.rb_skipw_grad),
+  sa_fwd: maxAbs(saY.data, fixture.sa_y),
+  sa_grad_x: maxAbs(saX.grad.slice(), fixture.sa_x_grad),
+  sa_gnw: maxAbs(sa.norm.weight.grad, fixture.sa_gnw_grad),
+  sa_gnb: maxAbs(sa.norm.bias.grad, fixture.sa_gnb_grad),
+  sa_qkv: maxAbs(sa.qkv.weight.grad, fixture.sa_qkv_grad),
+  sa_proj: maxAbs(sa.proj.weight.grad, fixture.sa_proj_grad),
 };
 const outPath = fixturePath.replace(/\.json$/, "_js.json");
 fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
