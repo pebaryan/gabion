@@ -11,6 +11,7 @@
    *   nLayers — override layer count (coordinator: 0 layers, full embedding/norm/head)
    */
   function _buildModel(data, weights, opts = {}) {
+    opts = opts || {}; // buildModel passes null
     if (!data.config) throw new Error("not a gabion wire-format model");
     const c = data.config;
     const layerRange = opts.layerRange || null;
