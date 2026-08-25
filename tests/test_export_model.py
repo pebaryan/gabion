@@ -656,3 +656,96 @@ def test_export_gguf_lfm2(tmp_path):
     # tokenizer embedded
     assert out["vocab"] == {"a": 0, "b": 1} and out["merges"] == ["a b"]
     assert cfg["tokenizer"] == "lfm2:bpe"
+
+
+def test_export_gguf_qwen35(tmp_path):
+    """Synthetic qwen35 GGUF (GatedDeltaNet hybrid) -> wire: config, layout,
+    flat sizes, tied head, tokenizer. Mirrors the real Qwen3.5-4B pattern:
+    layers where (i+1) % 4 == 0 are full attention, the rest are linear."""
+    import numpy as np
+    from tools.export_model import f16_decode
+    D, H, KVH, HD, DFF, L, V = 32, 4, 2, 8, 64, 6, 16
+    DK, NK, DV, NV, KERN = 4, 2, 4, 4, 3  # head_k_dim, k heads, head_v_dim, v heads
+    KD, VD = DK * NK, DV * NV
+    CONV = KD * 2 + VD
+    rng = np.random.default_rng(11)
+    lt = ["linear", "linear", "linear", "full", "linear", "linear"]
+    tensors = {"token_embd.weight": rng.standard_normal((V, D)).astype(np.float32)}
+    for i in range(L):
+        tensors[f"blk.{i}.attn_norm.weight"] = rng.standard_normal(D).astype(np.float32)
+        tensors[f"blk.{i}.post_attention_norm.weight"] = rng.standard_normal(D).astype(np.float32)
+        tensors[f"blk.{i}.ffn_gate.weight"] = rng.standard_normal((DFF, D)).astype(np.float32)
+        tensors[f"blk.{i}.ffn_up.weight"] = rng.standard_normal((DFF, D)).astype(np.float32)
+        tensors[f"blk.{i}.ffn_down.weight"] = rng.standard_normal((D, DFF)).astype(np.float32)
+        if lt[i] == "full":
+            tensors[f"blk.{i}.attn_q.weight"] = rng.standard_normal((2 * H * HD, D)).astype(np.float32)
+            tensors[f"blk.{i}.attn_q_norm.weight"] = rng.standard_normal(HD).astype(np.float32)
+            tensors[f"blk.{i}.attn_k.weight"] = rng.standard_normal((KVH * HD, D)).astype(np.float32)
+            tensors[f"blk.{i}.attn_k_norm.weight"] = rng.standard_normal(HD).astype(np.float32)
+            tensors[f"blk.{i}.attn_v.weight"] = rng.standard_normal((KVH * HD, D)).astype(np.float32)
+            tensors[f"blk.{i}.attn_output.weight"] = rng.standard_normal((D, H * HD)).astype(np.float32)
+        else:
+            tensors[f"blk.{i}.attn_qkv.weight"] = rng.standard_normal((CONV, D)).astype(np.float32)
+            tensors[f"blk.{i}.attn_gate.weight"] = rng.standard_normal((VD, D)).astype(np.float32)
+            tensors[f"blk.{i}.ssm_a"] = rng.standard_normal(NV).astype(np.float32)
+            tensors[f"blk.{i}.ssm_alpha.weight"] = rng.standard_normal((NV, D)).astype(np.float32)
+            tensors[f"blk.{i}.ssm_beta.weight"] = rng.standard_normal((NV, D)).astype(np.float32)
+            tensors[f"blk.{i}.ssm_dt.bias"] = rng.standard_normal(NV).astype(np.float32)
+            tensors[f"blk.{i}.ssm_conv1d.weight"] = rng.standard_normal((CONV, KERN)).astype(np.float32)
+            tensors[f"blk.{i}.ssm_norm.weight"] = rng.standard_normal(DV).astype(np.float32)
+            tensors[f"blk.{i}.ssm_out.weight"] = rng.standard_normal((D, VD)).astype(np.float32)
+    meta = {
+        "general.architecture": "qwen35",
+        "qwen35.block_count": L,
+        "qwen35.embedding_length": D,
+        "qwen35.attention.head_count": H,
+        "qwen35.attention.head_count_kv": KVH,
+        "qwen35.attention.key_length": HD,
+        "qwen35.attention.value_length": HD,
+        "qwen35.feed_forward_length": DFF,
+        "qwen35.rope.freq_base": 1e7,
+        "qwen35.rope.dimension_count": 4,
+        "qwen35.context_length": 128,
+        "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
+        "qwen35.full_attention_interval": 4,
+        "qwen35.ssm.conv_kernel": KERN,
+        "qwen35.ssm.inner_size": VD,
+        "qwen35.ssm.state_size": DK,
+        "qwen35.ssm.time_step_rank": NV,
+        "qwen35.ssm.group_count": NK,
+        "tokenizer.ggml.tokens": ["a", "b"],
+        "tokenizer.ggml.merges": ["a b"],
+    }
+    path = tmp_path / "qwen35.gguf"
+    _write_gguf(path, meta, tensors)
+    out = export_gguf(path)
+    cfg = out["config"]
+    assert cfg["arch"] == "qwen35"
+    assert cfg["layer_types"] == lt
+    assert cfg["n_kv_heads"] == KVH and cfg["head_dim"] == HD
+    assert cfg["rope_dim"] == 4
+    s = cfg["ssm"]
+    assert s["conv_kernel"] == KERN and s["inner_size"] == VD
+    assert s["state_size"] == DK and s["dt_rank"] == NV and s["group_count"] == NK
+    assert s["q_dim"] == KD and s["v_dim"] == VD and s["conv_dim"] == CONV
+    assert cfg["tie_weights"] is True
+    # flat size: emb + 1 full layer + 5 linear layers + final norm (tied head)
+    full_n = D + 2 * H * HD * D + HD + KVH * HD * D + HD + KVH * HD * D + H * HD * D + 2 * D * DFF + DFF * D
+    lin_n = (D + CONV * D + VD * D + NV * (2 + 2 * D) + CONV * KERN + DV + VD * D
+             + D + 2 * D * DFF + DFF * D)
+    f16 = f16_decode(out["weights_b64"])
+    assert len(f16) == V * D + full_n + 5 * lin_n + D
+    f32 = np.array(f16, dtype=np.float16).astype(np.float32)
+    # linear layer 0: norm [D], qkv [D, CONV]
+    qkv_flat = f32[V * D + D: V * D + D + D * CONV]
+    assert np.allclose(qkv_flat.reshape(D, CONV), tensors["blk.0.attn_qkv.weight"].T, atol=1e-3)
+    # conv1d stored [CONV, KERN] as-is (no transpose)
+    off_conv = V * D + D + CONV * D + VD * D + NV * (2 + 2 * D)
+    cv_flat = f32[off_conv: off_conv + CONV * KERN]
+    assert np.allclose(cv_flat.reshape(CONV, KERN), tensors["blk.0.ssm_conv1d.weight"], atol=1e-3)
+    # full layer 3: after 3 linear layers: norm [D], then q [D, 2*H*HD]
+    off3 = V * D + 3 * lin_n + D
+    q_flat = f32[off3: off3 + D * 2 * H * HD]
+    assert np.allclose(q_flat.reshape(D, 2 * H * HD), tensors["blk.3.attn_q.weight"].T, atol=1e-3)
+    assert out["vocab"] == {"a": 0, "b": 1} and out["merges"] == ["a b"]
+    assert cfg["tokenizer"] == "qwen2:bpe"
