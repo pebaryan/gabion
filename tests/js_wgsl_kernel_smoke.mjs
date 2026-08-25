@@ -849,11 +849,99 @@ const report = {};
   report.kv_group_sum = maxAbs(groupK, groupRef);
 }
 
+// ---- Pad kernel (NCHW) vs CPU pad ----
+{
+  const N=2, C=4, H=4, W=4, pad_h_before=1, pad_h_after=1, pad_w_before=1, pad_w_after=1;
+  const H_out=H+pad_h_before+pad_h_after, W_out=W+pad_w_before+pad_w_after;
+  const x = new Float32Array(N*C*H*W);
+  for(let i=0;i<x.length;i++) x[i]= (i%7)-3;
+  const xt = Tensor.fromArray(x, [N,C,H,W], false);
+  const cpu = xt.pad([[0,0],[0,0],[pad_h_before,pad_h_after],[pad_w_before,pad_w_after]]).data;
+  const yK = new Float32Array(N*C*H_out*W_out).fill(0);
+  for(let n=0;n<N;n++) for(let c=0;c<C;c++) for(let h=0;h<H;h++) for(let w=0;w<W;w++){
+    const src_idx = ((n*C+c)*H+h)*W+w;
+    const h_out = h+pad_h_before, w_out=w+pad_w_before;
+    const dst_idx = ((n*C+c)*H_out+h_out)*W_out+w_out;
+    yK[dst_idx]= x[src_idx];
+  }
+  report.pad_fwd = maxAbs(yK, cpu);
+  // pad backward: grad = slice(gout)
+  const gout = new Float32Array(N*C*H_out*W_out);
+  for(let i=0;i<gout.length;i++) gout[i]= (i%5)-2;
+  const goutT = Tensor.fromArray(gout, [N,C,H_out,W_out], false);
+  // CPU backward via engine: create pad tensor then backward
+  const xt2 = Tensor.fromArray(x, [N,C,H,W], true);
+  const yt2 = xt2.pad([[0,0],[0,0],[pad_h_before,pad_h_after],[pad_w_before,pad_w_after]]);
+  yt2.grad = Float32Array.from(gout);
+  yt2._backward(yt2.grad);
+  const dxK = new Float32Array(N*C*H*W);
+  for(let n=0;n<N;n++) for(let c=0;c<C;c++) for(let h=0;h<H;h++) for(let w=0;w<W;w++){
+    const h_out=h+pad_h_before, w_out=w+pad_w_before;
+    const gout_idx = ((n*C+c)*H_out+h_out)*W_out+w_out;
+    const src_idx = ((n*C+c)*H+h)*W+w;
+    dxK[src_idx]= gout[gout_idx];
+  }
+  report.pad_bwd = maxAbs(dxK, xt2.grad);
+}
+
+// ---- Concat kernel (channel + width) vs CPU ----
+{
+  const N=2, C_a=3, C_b=2, H=4, W=4;
+  const a = new Float32Array(N*C_a*H*W), b = new Float32Array(N*C_b*H*W);
+  for(let i=0;i<a.length;i++) a[i]= (i%9)-4;
+  for(let i=0;i<b.length;i++) b[i]= (i%7)-3;
+  const at = Tensor.fromArray(a, [N,C_a,H,W], false);
+  const bt = Tensor.fromArray(b, [N,C_b,H,W], false);
+  const cpu = at.concat(bt, 1).data;
+  const outer=N, inner=H*W, c_total=C_a+C_b;
+  const yK = new Float32Array(N*c_total*H*W);
+  for(let r=0;r<outer;r++) for(let c=0;c<c_total;c++) for(let ii=0;ii<inner;ii++){
+    const dst_idx = r*c_total*inner + c*inner + ii;
+    if(c < C_a) yK[dst_idx]= a[r*C_a*inner + c*inner + ii];
+    else yK[dst_idx]= b[r*C_b*inner + (c-C_a)*inner + ii];
+  }
+  report.concat_fwd = maxAbs(yK, cpu);
+  // concat backward split
+  const gout = new Float32Array(N*c_total*H*W);
+  for(let i=0;i<gout.length;i++) gout[i]= (i%11)-5;
+  const at2 = Tensor.fromArray(a, [N,C_a,H,W], true);
+  const bt2 = Tensor.fromArray(b, [N,C_b,H,W], true);
+  const yt2 = at2.concat(bt2, 1);
+  yt2.grad = Float32Array.from(gout);
+  yt2._backward(yt2.grad);
+  const daK = new Float32Array(N*C_a*H*W), dbK = new Float32Array(N*C_b*H*W);
+  for(let r=0;r<outer;r++) for(let c=0;c<C_a;c++) for(let ii=0;ii<inner;ii++) daK[r*C_a*inner + c*inner + ii]= gout[r*c_total*inner + c*inner + ii];
+  for(let r=0;r<outer;r++) for(let c=0;c<C_b;c++) for(let ii=0;ii<inner;ii++) dbK[r*C_b*inner + c*inner + ii]= gout[r*c_total*inner + (c+C_a)*inner + ii];
+  report.concat_bwd_a = maxAbs(daK, at2.grad);
+  report.concat_bwd_b = maxAbs(dbK, bt2.grad);
+}
+
+// ---- Exp elementwise (op 7) vs CPU ----
+{
+  const len=64;
+  const x = new Float32Array(len);
+  for(let i=0;i<len;i++) x[i]= (i%10)/5 -1;
+  const xt = Tensor.fromArray(x, [len], false);
+  const cpu = xt.exp().data;
+  const yK = new Float32Array(len);
+  for(let i=0;i<len;i++) yK[i]= Math.exp(x[i]);
+  report.exp_fwd = maxAbs(yK, cpu);
+  const xt2 = Tensor.fromArray(x, [len], true);
+  const yt2 = xt2.exp();
+  const gout = new Float32Array(len).fill(1);
+  yt2.grad = gout;
+  yt2._backward(gout);
+  const dxK = new Float32Array(len);
+  for(let i=0;i<len;i++) dxK[i]= Math.exp(x[i]);
+  report.exp_bwd = maxAbs(dxK, xt2.grad);
+}
+
 const convChecks = [report.conv2d_fwd, report.conv2d_dx, report.conv2d_dw, report.conv2d_db, report.ct_fwd, report.ct_dx, report.ct_dw, report.ct_db];
 const normChecks = [report.bn_fwd, report.bn_dx, report.bn_dgamma, report.bn_dbeta, report.aff_fwd, report.aff_dx, report.aff_dw, report.aff_db];
 const lastChecks = [report.ln_bwd, report.afflast_fwd, report.afflast_dx, report.afflast_dw, report.afflast_db, report.lstm_h, report.lstm_c];
 const lstmBwdChecks = [report.lstm_dx, report.lstm_dh, report.lstm_dc, report.lstm_dwih, report.lstm_dwhh, report.lstm_dbih, report.lstm_dbhh];
 const kvChecks = [report.kv_scores, report.kv_out, report.kv_causal, report.kv_fullrow, report.gqa_kv_scores, report.gqa_kv_out, report.kv_group_sum];
-if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4)) || lastChecks.some((v) => !(v < 1e-4)) || lstmBwdChecks.some((v) => !(v < 1e-4)) || kvChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
+const newChecks = [report.pad_fwd, report.pad_bwd, report.concat_fwd, report.concat_bwd_a, report.concat_bwd_b, report.exp_fwd, report.exp_bwd];
+if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4)) || lastChecks.some((v) => !(v < 1e-4)) || lstmBwdChecks.some((v) => !(v < 1e-4)) || kvChecks.some((v) => !(v < 1e-4)) || newChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
 
 console.log(JSON.stringify(report, null, 2));

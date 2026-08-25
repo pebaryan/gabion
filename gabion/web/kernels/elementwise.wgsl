@@ -1,6 +1,7 @@
 // Fused elementwise operations on 1D buffer views.
 // op: 0=add(A,B), 1=mul(A,B), 2=silu(A), 3=scale(A, scalar), 4=sub(A,B), 5=addScalar(A, scalar)
 // op: 6=silu_backward(A=x, B=gout) → gout * sig(x) * (1 + x*(1-sig(x)))
+// op: 7=exp(A)
 
 struct Params {
   len: u32,
@@ -45,6 +46,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     case 6u: {  // silu_backward: A=x (original input), B=gout (upstream grad)
       let sig = 1.0 / (1.0 + exp(-a));
       result = B[i] * sig * (1.0 + a * (1.0 - sig));
+    }
+    case 7u: {  // exp
+      result = exp(a);
     }
     default: {
       result = a;

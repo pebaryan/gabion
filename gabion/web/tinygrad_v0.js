@@ -1281,6 +1281,37 @@
       if (paddings.length !== nd) throw new Error(`pad: expected ${nd} pairs, got ${paddings.length}`);
       const outShape = shape.map((s, i) => s + paddings[i][0] + paddings[i][1]);
       const outNumel = outShape.reduce((a, b) => a * b, 1);
+      const backend = gpu();
+      if (backend && this.onGPU && nd === 4) {
+        const N = shape[0], C = shape[1], H = shape[2], W = shape[3];
+        const H_out = outShape[2], W_out = outShape[3];
+        const pad_h_before = paddings[2][0], pad_w_before = paddings[3][0];
+        // require N/C pads are 0 for GPU fast path (tiny diffusion always 0)
+        if (paddings[0][0] === 0 && paddings[0][1] === 0 && paddings[1][0] === 0 && paddings[1][1] === 0) {
+          const outBuf = backend.pad(this.gpuBuffer, N, C, H, W, H_out, W_out, pad_h_before, pad_w_before);
+          const pads2 = paddings.map((pp) => [pp[0], pp[1]]);
+          const t2 = new Tensor(new Float32Array(outNumel), outShape, this.requiresGrad, [this], (gout, goutBuf) => {
+            if (!this.requiresGrad) return;
+            const be = gpu();
+            if (goutBuf && be) {
+              this._pendingGradBuf = be.padBwd(goutBuf, N, C, H, W, H_out, W_out, pad_h_before, pad_w_before);
+            } else {
+              if (!this.grad) this.grad = new Float32Array(this.data.length);
+              const inStride = []; let acc2 = 1; for (let i = nd - 1; i >= 0; i--) { inStride[i] = acc2; acc2 *= shape[i]; }
+              const gStride = []; acc2 = 1; for (let i = nd - 1; i >= 0; i--) { gStride[i] = acc2; acc2 *= outShape[i]; }
+              const coord2 = new Int32Array(nd);
+              for (let lin = 0; lin < this.numel; lin++) {
+                let rem = lin; let o = 0;
+                for (let d = 0; d < nd; d++) { coord2[d] = rem / inStride[d] | 0; rem -= coord2[d] * inStride[d]; o += (coord2[d] + pads2[d][0]) * gStride[d]; }
+                this.grad[lin] += gout[o];
+              }
+            }
+          });
+          t2.gpuBuffer = outBuf;
+          t2._dirty = "gpu";
+          return t2;
+        }
+      }
       const out = new Float32Array(outNumel);
       // in strides
       const inStride = [];
@@ -1340,6 +1371,31 @@
       for (let d = 0; d < ax; d++) rowsOuter *= this.shape[d];
       for (let d = ax + 1; d < nd; d++) inner *= this.shape[d];
       const axA = this.shape[ax], axB = other.shape[ax], axOut = axA + axB;
+      const backend = gpu();
+      if (backend && this.onGPU && other.onGPU) {
+        const outBuf = backend.concat(this.gpuBuffer, other.gpuBuffer, rowsOuter, axA, axB, inner);
+        const req2 = this.requiresGrad || other.requiresGrad;
+        const t2 = new Tensor(new Float32Array(nA + nB), outShape, req2, [this, other], () => {});
+        t2._backward = (gout, goutBuf) => {
+          const be = gpu();
+          if (goutBuf && be) {
+            if (this.requiresGrad) this._pendingGradBuf = be.concatBwd(goutBuf, rowsOuter, axA, axB, inner, true);
+            if (other.requiresGrad) other._pendingGradBuf = be.concatBwd(goutBuf, rowsOuter, axA, axB, inner, false);
+          } else {
+            if (this.requiresGrad) {
+              if (!this.grad) this.grad = new Float32Array(nA);
+              for (let r = 0; r < rowsOuter; r++) for (let i = 0; i < axA * inner; i++) this.grad[r * axA * inner + i] += gout[r * axOut * inner + i];
+            }
+            if (other.requiresGrad) {
+              if (!other.grad) other.grad = new Float32Array(nB);
+              for (let r = 0; r < rowsOuter; r++) for (let i = 0; i < axB * inner; i++) other.grad[r * axB * inner + i] += gout[r * axOut * inner + axA * inner + i];
+            }
+          }
+        };
+        t2.gpuBuffer = outBuf;
+        t2._dirty = "gpu";
+        return t2;
+      }
       const out = new Float32Array(nA + nB);
       // copy A rows then B rows per outer row
       for (let r = 0; r < rowsOuter; r++) {
@@ -1663,6 +1719,28 @@
      */
     exp() {
       const n = this.numel;
+      const backend = gpu();
+      if (backend && this.onGPU) {
+        const outBuf = backend.elementwise(this.gpuBuffer, this.gpuBuffer, n, 7);
+        const outDataForBwd = this.gpuBuffer; // not needed, we use outBuf for bwd
+        const t = new Tensor(new Float32Array(n), [...this.shape], this.requiresGrad, [this], (gout, goutBuf) => {
+          if (!this.requiresGrad) return;
+          const be = gpu();
+          if (goutBuf && be) {
+            // d/dx exp(x) = exp(x) => gout * exp(x) -> mul(goutBuf, outBuf)
+            const expBuf = t.gpuBuffer;
+            this._pendingGradBuf = be.elementwise(goutBuf, expBuf, n, 1);
+          } else {
+            if (!this.grad) this.grad = new Float32Array(this.data.length);
+            // need outData: read from t.data if dirty else compute
+            const outD = t.data;
+            for (let i = 0; i < n; i++) this.grad[i] += gout[i] * outD[i];
+          }
+        });
+        t.gpuBuffer = outBuf;
+        t._dirty = "gpu";
+        return t;
+      }
       const out = new Float32Array(n);
       for (let i = 0; i < n; i++) out[i] = Math.exp(this.data[i]);
       const outData = out;

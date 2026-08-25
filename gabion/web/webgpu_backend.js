@@ -354,6 +354,76 @@
       return outBuf;
     }
 
+    /** Zero-pad 4D NCHW: src [N,C,H,W] -> dst [N,C,H_out,W_out] with H/W pad before. */
+    pad(srcBuf, N, C, H, W, H_out, W_out, pad_h_before, pad_w_before) {
+      const pipeline = this.getPipeline("pad");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([N, C, H, W, H_out, W_out, pad_h_before, pad_w_before]));
+      const outBuf = this.createEmptyBuffer(N * C * H_out * W_out * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: srcBuf } },
+          { binding: 1, resource: { buffer: outBuf } },
+          { binding: 2, resource: { buffer: uniformBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(N * C * H_out * W_out / 64), 1, 1, uniformBuf);
+      return outBuf;
+    }
+
+    /** Concat backward: grad_a = slice(gout, 0,c_a) or grad_b = slice(gout, c_a,c_b) */
+    concatBwd(goutBuf, outer, c_a, c_b, inner, isA) {
+      const pipeline = this.getPipeline("concat_bwd");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([outer, c_a, c_b, inner, isA ? 1 : 0]));
+      const outSize = outer * (isA ? c_a : c_b) * inner * 4;
+      const outBuf = this.createEmptyBuffer(outSize);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: goutBuf } },
+          { binding: 1, resource: { buffer: outBuf } },
+          { binding: 2, resource: { buffer: uniformBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(outSize / 4 / 64), 1, 1, uniformBuf);
+      return outBuf;
+    }
+
+    /** Pad backward: grad = slice(gout, pad_before) */
+    padBwd(goutBuf, N, C, H, W, H_out, W_out, pad_h_before, pad_w_before) {
+      const pipeline = this.getPipeline("pad_bwd");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([N, C, H, W, H_out, W_out, pad_h_before, pad_w_before]));
+      const outBuf = this.createEmptyBuffer(N * C * H * W * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: goutBuf } },
+          { binding: 1, resource: { buffer: outBuf } },
+          { binding: 2, resource: { buffer: uniformBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(N * C * H * W / 64), 1, 1, uniformBuf);
+      return outBuf;
+    }
+
+    /** Concat along one axis: a [outer,c_a,inner], b [outer,c_b,inner] -> dst [outer,c_a+c_b,inner]. */
+    concat(aBuf, bBuf, outer, c_a, c_b, inner) {
+      const pipeline = this.getPipeline("concat");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([outer, c_a, c_b, inner]));
+      const outBuf = this.createEmptyBuffer(outer * (c_a + c_b) * inner * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: aBuf } },
+          { binding: 1, resource: { buffer: bBuf } },
+          { binding: 2, resource: { buffer: outBuf } },
+          { binding: 3, resource: { buffer: uniformBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(outer * (c_a + c_b) * inner / 64), 1, 1, uniformBuf);
+      return outBuf;
+    }
+
     /**
      * LayerNorm forward on a [rows, d] buffer.
      * weightBuf: [d] or null (hasWeight=0). biasBuf: [d] or null (hasBias=0).
