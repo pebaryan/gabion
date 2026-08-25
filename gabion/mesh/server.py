@@ -1313,7 +1313,7 @@ function surrogateTrain(weights, opts) {
 }
 
 async function loadWGSLShaders() {
-  const kernels = ["matmul", "elementwise", "reduce", "softmax", "rope", "batched_matmul", "fused_attention", "softmax_backward", "rope_backward", "batched_transpose", "rmsnorm_backward", "adam_update", "sgd_update", "cross_entropy_forward", "cross_entropy_backward", "embedding_forward", "silu_mul", "silu_mul_backward"];
+  const kernels = ["matmul", "elementwise", "reduce", "softmax", "rope", "batched_matmul", "fused_attention", "softmax_backward", "rope_backward", "batched_transpose", "rmsnorm_backward", "adam_update", "adamw_update", "sgd_update", "cross_entropy_forward", "cross_entropy_backward", "embedding_forward", "silu_mul", "silu_mul_backward", "layernorm", "dropout_fwd", "dropout_bwd"];
   for (const name of kernels) {
     try {
       const r = await fetch(`/assets/kernels/${name}.wgsl`, { cache: "no-store" });

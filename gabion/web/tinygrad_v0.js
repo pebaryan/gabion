@@ -469,6 +469,31 @@
       const shape = this.shape;
       const C = shape[shape.length - 1];
       const rows = this.numel / C;
+      const backend = gpu();
+      if (backend && this.onGPU) {
+        const outBuf = backend.layernorm(this.gpuBuffer, rows, C, eps);
+        const y = new Float32Array(this.numel);
+        const t = new Tensor(y, [...shape], this.requiresGrad, [this], (gout) => {
+          if (!this.requiresGrad) return;
+          if (!this.grad) this.grad = new Float32Array(this.numel);
+          for (let r = 0; r < rows; r++) {
+            const off = r * C;
+            let mean = 0, varr = 0;
+            for (let j = 0; j < C; j++) mean += this.data[off + j];
+            mean /= C;
+            for (let j = 0; j < C; j++) { const d = this.data[off + j] - mean; varr += d * d; }
+            const invStd = 1 / Math.sqrt(varr / C + eps);
+            let sumG = 0, dot = 0;
+            const yrow = new Float32Array(C);
+            for (let j = 0; j < C; j++) { yrow[j] = (this.data[off + j] - mean) * invStd; sumG += gout[off + j]; dot += gout[off + j] * yrow[j]; }
+            const meanG = sumG / C, meanGY = dot / C;
+            for (let j = 0; j < C; j++) this.grad[off + j] += invStd * (gout[off + j] - meanG - yrow[j] * meanGY);
+          }
+        });
+        t.gpuBuffer = outBuf;
+        t._dirty = "gpu";
+        return t;
+      }
       const y = new Float32Array(this.numel);
       const mu = new Float32Array(rows);
       const inv = new Float32Array(rows);
@@ -558,6 +583,25 @@
       if (!(p >= 0 && p <= 1)) throw new Error(`dropout p=${p} out of range`);
       if (!getTraining() || p === 0) return this;
       if (p === 1) return Tensor.zeros(this.shape, this.requiresGrad);
+      const backend = gpu();
+      if (backend && this.onGPU) {
+        const n = this.numel;
+        const seed = (Math.random() * 0xffffffff) >>> 0;
+        const outBuf = backend.dropoutFwd(this.gpuBuffer, n, p, seed);
+        const out = new Float32Array(n);
+        const t = new Tensor(out, [...this.shape], this.requiresGrad, [this], (gout) => {
+          if (!this.requiresGrad) return;
+          if (!this.grad) this.grad = new Float32Array(n);
+          const goutBuf = backend.createBufferFromData(gout);
+          const dxBuf = backend.dropoutBwd(goutBuf, n, p, seed);
+          this._pendingGradBuf = dxBuf;
+          goutBuf.destroy();
+        });
+        t.gpuBuffer = outBuf;
+        t._dirty = "gpu";
+        t._dropoutSeed = seed;
+        return t;
+      }
       const n = this.numel;
       const out = new Float32Array(n);
       const mask = new Float32Array(n);
@@ -2017,10 +2061,12 @@
         be.beginBatch();
         for (const p of this.params) {
           if (!p._gradGPUBuf) continue;
-          be.adamUpdate(p._gradGPUBuf, p._adamMBuf, p._adamVBuf, p.gpuBuffer,
-            p.numel, this.beta1, this.beta2, effLr, bc1, bc2, this.eps);
-          if (this.type === "adamw" && this.weightDecay > 0) {
-            be.elementwise(p.gpuBuffer, null, p.numel, 3, 1 - effLr * this.weightDecay);
+          if (this.type === "adamw") {
+            be.adamwUpdate(p._gradGPUBuf, p._adamMBuf, p._adamVBuf, p.gpuBuffer,
+              p.numel, this.beta1, this.beta2, effLr, bc1, bc2, this.eps, this.weightDecay);
+          } else {
+            be.adamUpdate(p._gradGPUBuf, p._adamMBuf, p._adamVBuf, p.gpuBuffer,
+              p.numel, this.beta1, this.beta2, effLr, bc1, bc2, this.eps);
           }
         }
         be.endBatch();

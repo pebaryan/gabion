@@ -355,6 +355,79 @@
     }
 
     /**
+     * LayerNorm forward on a [rows, d] buffer.
+     * weightBuf: [d] or null (hasWeight=0). biasBuf: [d] or null (hasBias=0).
+     * Returns GPUBuffer [rows * d].
+     */
+    layernorm(xBuf, rows, d, eps, weightBuf = null, biasBuf = null) {
+      const pipeline = this.getPipeline("layernorm");
+      const paramBuf = new ArrayBuffer(24);
+      new Uint32Array(paramBuf, 0, 4).set([rows, d, 0, 0]); // filled below
+      new Float32Array(paramBuf, 8, 1).set([eps]);
+      new Uint32Array(paramBuf, 12, 1).set([weightBuf ? 1 : 0]);
+      new Uint32Array(paramBuf, 16, 1).set([biasBuf ? 1 : 0]);
+      const uniformBuf = this.createUniformBuffer(new Uint8Array(paramBuf));
+      const outBuf = this.createEmptyBuffer(rows * d * 4);
+      const dummy = this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: weightBuf || dummy } },
+          { binding: 3, resource: { buffer: biasBuf || dummy } },
+          { binding: 4, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, rows, 1, 1, uniformBuf);
+      if (!weightBuf || !biasBuf) dummy.destroy();
+      return outBuf;
+    }
+
+    /**
+     * Inverted dropout forward. Hash-based mask (deterministic per seed).
+     * seed is an integer. Returns GPUBuffer [len].
+     */
+    dropoutFwd(xBuf, len, p, seed = 0) {
+      const pipeline = this.getPipeline("dropout_fwd");
+      const paramBuf = new ArrayBuffer(16);
+      new Uint32Array(paramBuf, 0, 2).set([len, seed >>> 0]);
+      new Float32Array(paramBuf, 8, 2).set([p, 0]);
+      const uniformBuf = this.createUniformBuffer(new Uint8Array(paramBuf));
+      const outBuf = this.createEmptyBuffer(len * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(len / 256), 1, 1, uniformBuf);
+      return outBuf;
+    }
+
+    /** Inverted dropout backward with the same hash mask as dropoutFwd. */
+    dropoutBwd(goutBuf, len, p, seed = 0) {
+      const pipeline = this.getPipeline("dropout_bwd");
+      const paramBuf = new ArrayBuffer(16);
+      new Uint32Array(paramBuf, 0, 2).set([len, seed >>> 0]);
+      new Float32Array(paramBuf, 8, 2).set([p, 0]);
+      const uniformBuf = this.createUniformBuffer(new Uint8Array(paramBuf));
+      const outBuf = this.createEmptyBuffer(len * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: goutBuf } },
+          { binding: 2, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(len / 256), 1, 1, uniformBuf);
+      return outBuf;
+    }
+
+    /**
      * Dispatch row-wise reduction.
      * op: 0=sum, 1=max, 2=sumSquares
      * Input: [rows, cols] buffer, Output: [rows] buffer.
@@ -596,6 +669,26 @@
       new Uint32Array(ab, 0, 1).set([len]);
       // offset 4: _pad (leave as 0)
       new Float32Array(ab, 8, 6).set([beta1, beta2, effLr, bc1, bc2, eps]);
+      const uniformBuf = this.createUniformBuffer(new Uint8Array(ab));
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: gradBuf } },
+          { binding: 2, resource: { buffer: mBuf } },
+          { binding: 3, resource: { buffer: vBuf } },
+          { binding: 4, resource: { buffer: paramBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(len / 256), 1, 1, uniformBuf);
+    }
+
+    adamwUpdate(gradBuf, mBuf, vBuf, paramBuf, len, beta1, beta2, effLr, bc1, bc2, eps, wd) {
+      const pipeline = this.getPipeline("adamw_update");
+      const ab = new ArrayBuffer(36);
+      new Uint32Array(ab, 0, 1).set([len]);
+      // offset 4: _pad (leave as 0)
+      new Float32Array(ab, 8, 7).set([beta1, beta2, effLr, bc1, bc2, eps, wd]);
       const uniformBuf = this.createUniformBuffer(new Uint8Array(ab));
       const bindGroup = this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
