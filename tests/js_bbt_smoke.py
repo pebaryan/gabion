@@ -11,6 +11,11 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = Path(__file__).resolve().parent / "_js_bbt_fixture.json"
+for _p in (str(ROOT), str(ROOT / "gabion")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from tools.export_model import f16_base64  # noqa: E402
 
 
 def _flatten(params) -> list[float]:
@@ -59,6 +64,7 @@ def build_fixture() -> dict:
         "batch_size": int(x_np.shape[0]),
         "ternarize": True,
         "weights": [float(v) for v in weights],
+        "weights_b64": f16_base64(np.asarray(weights, dtype=np.float32)),
         "x_flat": x_np.reshape(-1).astype(int).tolist(),
         "y_flat": y_np.reshape(-1).astype(int).tolist(),
         "sequences": sequences,
@@ -90,19 +96,23 @@ def main() -> int:
     loss_ok = report["loss_abs"] < 1e-4
     train_ok = report["finite"] and report["train_updated_len"] == len(fixture["weights"])
     decode_ok = report["decode_max_abs"] < 1e-3
+    wire_ok = report["wire_max_abs"] < 1e-2  # f16 rounding on weights
+    loader_ok = report["loader_ok"] and report["loader_weight_max_abs"] < 1e-2
     print(
         "verdict "
         f"logits={'PASS' if logit_ok else 'FAIL'} "
         f"loss={'PASS' if loss_ok else 'FAIL'} "
         f"train={'PASS' if train_ok else 'FAIL'} "
-        f"decode={'PASS' if decode_ok else 'FAIL'}"
+        f"decode={'PASS' if decode_ok else 'FAIL'} "
+        f"wire={'PASS' if wire_ok else 'FAIL'} "
+        f"loader={'PASS' if loader_ok else 'FAIL'}"
     )
     if not math.isfinite(report["js_loss"]):
         return 1
     if not train_ok:
         return 1
     # Numeric mismatch is reported but still a useful smoke if JS ran.
-    return 0 if (logit_ok and loss_ok and train_ok and decode_ok) else 2
+    return 0 if (logit_ok and loss_ok and train_ok and decode_ok and wire_ok and loader_ok) else 2
 
 
 if __name__ == "__main__":

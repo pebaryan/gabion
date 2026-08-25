@@ -23,8 +23,10 @@ const sandbox = {
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
+// fetch shim: gabionLoader.loadBBTModel fetches the wire JSON
+sandbox.fetch = async (url) => ({ ok: true, json: async () => fixture });
 vm.createContext(sandbox);
-for (const rel of ["gabion/web/tinygrad_v0.js", "gabion/web/bbt_forward.js"]) {
+for (const rel of ["gabion/web/tinygrad_v0.js", "gabion/web/bbt_forward.js", "gabion/web/tokenizer.js", "gabion/web/model_loader.js"]) {
   const src = fs.readFileSync(path.join(root, rel), "utf8");
   vm.runInContext(src, sandbox, { filename: rel });
 }
@@ -55,8 +57,27 @@ const B = fixture.batch_size;
 const T = cfg.seq_len;
 const xFlat = Int32Array.from(fixture.x_flat);
 const yFlat = Int32Array.from(fixture.y_flat);
+
+// Cross-language wire codec check: Python f16 base64 -> JS decode must match
+// the flat weights fixture (this is the model_loader.js contract).
+const wireWeights = tg.f16Base64ToWeights(fixture.weights_b64);
+let wireMaxAbs = 0;
+for (let i = 0; i < wireWeights.length; i++) {
+  wireMaxAbs = Math.max(wireMaxAbs, Math.abs(wireWeights[i] - fixture.weights[i]));
+}
+
 const logits = await model.forward(xFlat, B, T, !!fixture.ternarize);
 const loss = await tg.Tensor.crossEntropy(logits, yFlat);
+
+// End-to-end loader: gabionLoader.loadBBTModel(wire JSON) must produce a model
+// with identical weights/params (f16 codec + loadFlatWeights + tokenizer attach).
+const loaded = await sandbox.gabionLoader.loadBBTModel(fixturePath);
+const loadedOk = loaded.paramCount() === model.paramCount() && !!loaded.tokenize;
+let loadedWeightsMax = 0;
+{
+  const a = loaded.tokEmb.weight.data, b = model.tokEmb.weight.data;
+  for (let i = 0; i < a.length; i++) loadedWeightsMax = Math.max(loadedWeightsMax, Math.abs(a[i] - b[i]));
+}
 
 const jsLogits = Array.from(logits.data);
 const jsLoss = Number(loss.data[0]);
@@ -120,6 +141,9 @@ const report = {
   logits_max_abs: maxAbs,
   logits_mean_abs: meanAbs,
   decode_max_abs: decodeMax,
+  wire_max_abs: wireMaxAbs,
+  loader_ok: loadedOk,
+  loader_weight_max_abs: loadedWeightsMax,
   train_mode: trained.mode || null,
   train_loss: Number(trained.loss),
   train_updated_len: updatedLen,
