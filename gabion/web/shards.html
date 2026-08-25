@@ -50,11 +50,11 @@
 <div id="stats"></div>
 <pre id="resultJson" hidden>{}</pre>
 
-<script src="/gabion/web/tinygrad_v0.js?v=19"></script>
-<script src="/gabion/web/webgpu_backend.js?v=19"></script>
-<script src="/gabion/web/tokenizer.js?v=19"></script>
-<script src="/gabion/web/bbt_forward.js?v=19"></script>
-<script src="/gabion/web/model_loader.js?v=19"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=20"></script>
+<script src="/gabion/web/webgpu_backend.js?v=20"></script>
+<script src="/gabion/web/tokenizer.js?v=20"></script>
+<script src="/gabion/web/bbt_forward.js?v=20"></script>
+<script src="/gabion/web/model_loader.js?v=20"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -210,7 +210,12 @@ async function generate() {
 
     let prompt = $("prompt").value;
     if ($("chat").checked && coord.chatTemplate) {
-      prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+      // The LFM2.5 template begins with the BOS token; the hardcoded im-wrap
+      // mirrors its system/user/assistant rendering.
+      const bos = (coord.tokenizer && coord.tokenizer.vocab
+                   && coord.tokenizer.vocab["<|startoftext|>"] !== undefined)
+        ? "<|startoftext|>" : "";
+      prompt = bos + "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
              + "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
     }
     const ids = coord.tokenize(prompt);
