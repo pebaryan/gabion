@@ -59,6 +59,34 @@ def build_fixture() -> dict:
     y_np = np.array(y.numpy(), dtype=np.int32)
     logits_np = np.array(logits.numpy(), dtype=np.float64)
     sequences = x_np.tolist()
+
+    # Second model: GQA (4 query heads, 2 KV heads) — parity for grouped attention.
+    gqa_cfg = {
+        "vocab_size": 32,
+        "d_model": 16,
+        "n_heads": 4,
+        "n_kv_heads": 2,
+        "n_layers": 1,
+        "seq_len": 8,
+        "d_ff": 32,
+        "tie_weights": True,
+        "act_quant": True,
+    }
+    gqa = BBTTransformerAdapter(
+        input_dim=gqa_cfg["vocab_size"],
+        d_model=gqa_cfg["d_model"],
+        n_heads=gqa_cfg["n_heads"],
+        n_kv_heads=gqa_cfg["n_kv_heads"],
+        n_layers=gqa_cfg["n_layers"],
+        seq_len=gqa_cfg["seq_len"],
+        d_ff=gqa_cfg["d_ff"],
+        act_quant=gqa_cfg["act_quant"],
+        tie_weights=gqa_cfg["tie_weights"],
+        use_wikitext=False,
+    )
+    gqa_params = gqa.init_params(seed=13)
+    gqa_logits = gqa.forward(gqa_params, x, ternarize=False)
+    gqa_weights = _flatten(gqa_params)
     return {
         "config": cfg,
         "batch_size": int(x_np.shape[0]),
@@ -70,6 +98,11 @@ def build_fixture() -> dict:
         "sequences": sequences,
         "logits_flat": logits_np.reshape(-1).astype(float).tolist(),
         "loss": float(loss.item()),
+        "gqa": {
+            "config": gqa_cfg,
+            "weights": [float(v) for v in gqa_weights],
+            "logits_flat": np.array(gqa_logits.numpy(), dtype=np.float64).reshape(-1).astype(float).tolist(),
+        },
     }
 
 
@@ -98,6 +131,8 @@ def main() -> int:
     decode_ok = report["decode_max_abs"] < 1e-3
     wire_ok = report["wire_max_abs"] < 1e-2  # f16 rounding on weights
     loader_ok = report["loader_ok"] and report["loader_weight_max_abs"] < 1e-2
+    gqa_ok = report["gqa_max_abs"] < 1e-3
+    gqa_bwd_ok = report["gqa_bwd_grads"] and report["gqa_bwd_rel_err"] < 2e-2
     print(
         "verdict "
         f"logits={'PASS' if logit_ok else 'FAIL'} "
@@ -105,14 +140,16 @@ def main() -> int:
         f"train={'PASS' if train_ok else 'FAIL'} "
         f"decode={'PASS' if decode_ok else 'FAIL'} "
         f"wire={'PASS' if wire_ok else 'FAIL'} "
-        f"loader={'PASS' if loader_ok else 'FAIL'}"
+        f"loader={'PASS' if loader_ok else 'FAIL'} "
+        f"gqa={'PASS' if gqa_ok else 'FAIL'} "
+        f"gqa_bwd={'PASS' if gqa_bwd_ok else 'FAIL'}"
     )
     if not math.isfinite(report["js_loss"]):
         return 1
     if not train_ok:
         return 1
     # Numeric mismatch is reported but still a useful smoke if JS ran.
-    return 0 if (logit_ok and loss_ok and train_ok and decode_ok and wire_ok and loader_ok) else 2
+    return 0 if (logit_ok and loss_ok and train_ok and decode_ok and wire_ok and loader_ok and gqa_ok and gqa_bwd_ok) else 2
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ const model = new tg.BBTTransformer({
   vocabSize: cfg.vocab_size,
   dModel: cfg.d_model,
   nHeads: cfg.n_heads,
+  kvHeads: cfg.n_kv_heads || cfg.n_heads,
   nLayers: cfg.n_layers,
   seqLen: cfg.seq_len,
   dFF: cfg.d_ff,
@@ -68,6 +69,69 @@ for (let i = 0; i < wireWeights.length; i++) {
 
 const logits = await model.forward(xFlat, B, T, !!fixture.ternarize);
 const loss = await tg.Tensor.crossEntropy(logits, yFlat);
+
+// GQA parity: 4 query heads, 2 KV heads. JS must reproduce the Python adapter
+// forward exactly (grouped k/v projections + contiguous h//group expansion).
+// ternarize=true matches Python's default act_quant path (STE bitlinear), same
+// convention as the main model check.
+const gqaCfg = fixture.gqa.config;
+const gqaModel = new tg.BBTTransformer({
+  vocabSize: gqaCfg.vocab_size,
+  dModel: gqaCfg.d_model,
+  nHeads: gqaCfg.n_heads,
+  kvHeads: gqaCfg.n_kv_heads,
+  nLayers: gqaCfg.n_layers,
+  seqLen: gqaCfg.seq_len,
+  dFF: gqaCfg.d_ff,
+  tieWeights: gqaCfg.tie_weights,
+  actQuant: gqaCfg.act_quant,
+});
+{
+  const w = Float32Array.from(fixture.gqa.weights);
+  const consumed = gqaModel.loadFlatWeights(w, false);
+  if (consumed !== w.length) throw new Error(`gqa weight cursor ${consumed} != ${w.length}`);
+}
+const gqaLogits = await gqaModel.forward(xFlat, B, T, true);
+const gqaRef = fixture.gqa.logits_flat;
+let gqaMaxAbs = 0;
+for (let i = 0; i < gqaLogits.data.length; i++) {
+  gqaMaxAbs = Math.max(gqaMaxAbs, Math.abs(gqaLogits.data[i] - gqaRef[i]));
+}
+
+// GQA backward: finite-difference check on a k-weight element validates the
+// group-sum expansion backward (ternarize=false = continuous plain matmuls).
+let gqaBwd = null;
+{
+  const mod = gqaModel;
+  const params = mod.parameters();
+  const lossOf = async () => {
+    const lg = await mod.forward(xFlat, B, T, false);
+    return Number((await tg.Tensor.crossEntropy(lg, yFlat)).data[0]);
+  };
+  // autograd grad
+  for (const p of params) p.grad = null;
+  {
+    const lg = await mod.forward(xFlat, B, T, false);
+    const loss = await tg.Tensor.crossEntropy(lg, yFlat);
+    loss.backward();
+  }
+  const kw = mod.layers[0].k.weight, vw = mod.layers[0].v.weight, qw = mod.layers[0].q.weight;
+  const idx = 7; // arbitrary element of the grouped k projection
+  const auto = kw.grad ? kw.grad[idx] : NaN;
+  // finite difference
+  const eps = 1e-3;
+  const orig = kw.data[idx];
+  kw.data[idx] = orig + eps;
+  const lp = await lossOf();
+  kw.data[idx] = orig - eps;
+  const lm = await lossOf();
+  kw.data[idx] = orig;
+  const fd = (lp - lm) / (2 * eps);
+  const relErr = Math.abs(fd - auto) / (1 + Math.abs(fd));
+  const gradsPresent = !!kw.grad && !!vw.grad && !!qw.grad &&
+    kw.grad.some((v) => v !== 0) && vw.grad.some((v) => v !== 0) && qw.grad.some((v) => v !== 0);
+  gqaBwd = { relErr, gradsPresent, auto, fd };
+}
 
 // End-to-end loader: gabionLoader.loadBBTModel(wire JSON) must produce a model
 // with identical weights/params (f16 codec + loadFlatWeights + tokenizer attach).
@@ -144,6 +208,9 @@ const report = {
   wire_max_abs: wireMaxAbs,
   loader_ok: loadedOk,
   loader_weight_max_abs: loadedWeightsMax,
+  gqa_max_abs: gqaMaxAbs,
+  gqa_bwd_rel_err: gqaBwd.relErr,
+  gqa_bwd_grads: gqaBwd.gradsPresent,
   train_mode: trained.mode || null,
   train_loss: Number(trained.loss),
   train_updated_len: updatedLen,

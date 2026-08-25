@@ -932,12 +932,13 @@
       return dwhhBuf;
     }
 
-    /** Pack the KV-attention Params struct (BH, L, headDim u32 + scale f32 + causal/pos), 24 bytes. */
+    /** Pack the KV-attention Params struct (BH, L, headDim, kvH, H u32 + scale f32 + causal/pos), 32 bytes. */
     _kvUniform(P) {
-      const ab = new ArrayBuffer(24);
+      const ab = new ArrayBuffer(32);
       new Uint32Array(ab, 0, 3).set([P.BH, P.L, P.headDim]);
       new Float32Array(ab, 12, 1).set([P.scale]);
       new Uint32Array(ab, 16, 2).set([P.causal, P.pos]);
+      new Uint32Array(ab, 24, 2).set([P.kvH ?? P.BH, P.H ?? P.BH]);
       return new Uint8Array(ab);
     }
 
@@ -984,8 +985,28 @@
     }
 
     /**
+     * GQA backward: group-sum attention grads. input [BH*T*headDim] -> out [B*kvH*T*headDim].
+     */
+    kvGroupSum(inputBuf, B, H, kvH, T, headDim) {
+      const pipeline = this.getPipeline("kv_group_sum");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([B, H, kvH, T, headDim]));
+      const outBuf = this.createEmptyBuffer(B * kvH * T * headDim * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: inputBuf } },
+          { binding: 2, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(B * kvH * T * headDim / 256), 1, 1, uniformBuf);
+      return outBuf;
+    }
+
+    /**
      * KV-cache attention over a single query position (decode step / prefix attend).
-     * Q: [BH*headDim], KCache/VCache: [BH*L*headDim]. Returns outBuf [BH*headDim].
+     * Q: [BH*headDim], KCache/VCache: [BH*L*headDim] (or [B*kvH*L*headDim] with GQA,
+     * mapped via P.kvH/P.H). Returns outBuf [BH*headDim].
      */
     kvAttention(qBuf, kCacheBuf, vCacheBuf, P) {
       const scoresBuf = this.kvAttentionScores(qBuf, kCacheBuf, P);

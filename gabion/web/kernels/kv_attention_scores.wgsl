@@ -5,6 +5,7 @@
 
 struct Params {
   BH: u32, L: u32, headDim: u32, scale: f32, causal: u32, pos: u32,
+  kvH: u32, H: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -27,8 +28,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     return;
   }
 
+  // GQA: query head bh attends to KV head (bh * kvH) / H.
+  let kv = (bh * params.kvH) / params.H;
   let qBase = bh * headDim;
-  let kBase = (bh * L + j) * headDim;
+  let kBase = (kv * L + j) * headDim;
   var dot: f32 = 0.0;
   for (var d = 0u; d < headDim; d++) {
     dot += Q[qBase + d] * KCache[kBase + d];

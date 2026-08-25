@@ -226,9 +226,10 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
     D = int(meta["llama.embedding_length"])
     heads = int(meta["llama.attention.head_count"])
     kv_heads = int(meta.get("llama.attention.head_count_kv", heads))
-    if kv_heads != heads:
+    if kv_heads > heads:
         raise NotImplementedError(
-            f"GQA not supported yet: head_count={heads} != head_count_kv={kv_heads}")
+            f"head_count_kv={kv_heads} > head_count={heads}: more KV heads than query heads is not supported")
+    kvD = kv_heads * (D // heads)
     d_ff = int(meta.get("llama.feed_forward_length", 4 * D))
     rope_base = float(meta.get("llama.rope.freq_base", 10000.0))
     ctx = int(meta.get("llama.context_length", 2048))
@@ -252,8 +253,8 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
     tensors = [tok]
     for i in range(L):
         q = as_2d(get(f"blk.{i}.attn_q.weight"), (D, D))
-        k = as_2d(get(f"blk.{i}.attn_k.weight"), (D, D))
-        v = as_2d(get(f"blk.{i}.attn_v.weight"), (D, D))
+        k = as_2d(get(f"blk.{i}.attn_k.weight"), (D, kvD))
+        v = as_2d(get(f"blk.{i}.attn_v.weight"), (D, kvD))
         o = as_2d(get(f"blk.{i}.attn_output.weight"), (D, D))
         n1 = get(f"blk.{i}.attn_norm.weight").reshape(-1)
         gate = as_2d(get(f"blk.{i}.ffn_gate.weight"), (D, d_ff))
@@ -268,7 +269,8 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
     if not tie:
         print("[info] GGUF has output.weight; using tied embedding anyway (set tie_weights=true)")
     cfg = config or {
-        "vocab_size": n_vocab, "d_model": D, "n_heads": heads, "n_layers": L,
+        "vocab_size": n_vocab, "d_model": D, "n_heads": heads,
+        "n_kv_heads": kv_heads, "n_layers": L,
         "seq_len": min(ctx, 4096), "d_ff": d_ff, "tie_weights": True,
         "act_quant": True, "rope_base": rope_base,
     }
@@ -303,6 +305,7 @@ def main() -> int:
     src.add_argument("--from-gguf", type=Path, metavar="PATH")
     ap.add_argument("--d-model", type=int, default=64)
     ap.add_argument("--n-heads", type=int, default=4)
+    ap.add_argument("--n-kv-heads", type=int, default=None)
     ap.add_argument("--n-layers", type=int, default=2)
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--d-ff", type=int, default=None)
@@ -318,7 +321,9 @@ def main() -> int:
     else:
         cfg = {
             "vocab_size": args.vocab_size, "d_model": args.d_model,
-            "n_heads": args.n_heads, "n_layers": args.n_layers,
+            "n_heads": args.n_heads,
+            "n_kv_heads": args.n_kv_heads or args.n_heads,
+            "n_layers": args.n_layers,
             "seq_len": args.seq_len,
             "d_ff": args.d_ff or (args.d_model * 4),
             "tie_weights": not args.no_tie, "act_quant": True,

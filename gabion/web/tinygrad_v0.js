@@ -2896,7 +2896,9 @@
     const BH = q.shape[0];
     const headDim = q.shape[1];
     const L = kCache.shape[1];
-    const P = { BH, L, headDim, scale: 1.0 / Math.sqrt(headDim), causal: opts.causal ? 1 : 0, pos: opts.pos || 0 };
+    const kvH = opts.kvH ?? BH; // MHA by default
+    const H = opts.H ?? BH;
+    const P = { BH, L, headDim, scale: 1.0 / Math.sqrt(headDim), causal: opts.causal ? 1 : 0, pos: opts.pos || 0, kvH, H };
     const outBuf = backend.kvAttention(q.gpuBuffer, kCache.gpuBuffer, vCache.gpuBuffer, P);
     return new Tensor(new Float32Array(BH * headDim), [BH, headDim], q.requiresGrad, [], () => {}, outBuf, "gpu");
   }

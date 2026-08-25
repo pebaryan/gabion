@@ -15,7 +15,8 @@
     const c = data.config;
     const model = new window.tinygradV0.BBTTransformer({
       vocabSize: c.vocab_size, dModel: c.d_model, nHeads: c.n_heads,
-      nLayers: c.n_layers, seqLen: c.seq_len, dFF: c.d_ff,
+      kvHeads: c.n_kv_heads || c.n_heads, nLayers: c.n_layers,
+      seqLen: c.seq_len, dFF: c.d_ff,
       tieWeights: c.tie_weights, actQuant: c.act_quant, ropeBase: c.rope_base,
     });
     const consumed = model.loadFlatWeights(weights, false);

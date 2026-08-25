@@ -8,11 +8,11 @@
 
   /** Single transformer block: pre-norm attention + pre-norm FFN with residuals. */
   class TransformerBlock extends nn.Module {
-    constructor(D, H, dFF) {
+    constructor(D, H, kvD, dFF) {
       super();
       this.q = new nn.Linear(D, D);
-      this.k = new nn.Linear(D, D);
-      this.v = new nn.Linear(D, D);
+      this.k = new nn.Linear(D, kvD);
+      this.v = new nn.Linear(D, kvD);
       this.o = new nn.Linear(D, D);
       this.norm1 = new nn.RMSNorm(D);
       this.gateUp = new nn.Linear(D, 2 * dFF);
@@ -27,6 +27,7 @@
      * @param {number} config.vocabSize  - default 256
      * @param {number} config.dModel    - default 64
      * @param {number} config.nHeads    - default 4
+     * @param {number} config.kvHeads   - default nHeads (MHA); GQA when fewer
      * @param {number} config.nLayers   - default 2
      * @param {number} config.seqLen    - default 32
      * @param {number} config.dFF       - default dModel*4
@@ -38,12 +39,14 @@
       this.V = config.vocabSize || 256;
       this.D = config.dModel || 64;
       this.H = config.nHeads || 4;
+      this.kvH = config.kvHeads || config.nHeads || 4;
       this.L = config.nLayers || 2;
       this.T = config.seqLen || 32;
       this.dFF = config.dFF || (this.D * 4);
       this.tieWeights = config.tieWeights !== false;
       this.ropeBase = config.ropeBase || 10000.0;
       this.headDim = this.D / this.H;
+      this.kvD = this.kvH * this.headDim;
       this.eps = 1e-6;
       this.actQuant = config.actQuant !== false; // default true
 
@@ -51,7 +54,7 @@
       this.tokEmb = new nn.Embedding(this.V, this.D);
       this.layers = [];
       for (let l = 0; l < this.L; l++) {
-        this.layers.push(new TransformerBlock(this.D, this.H, this.dFF));
+        this.layers.push(new TransformerBlock(this.D, this.H, this.kvD, this.dFF));
       }
       this.normF = new nn.RMSNorm(this.D);
       if (!this.tieWeights) {
@@ -278,10 +281,13 @@
       if (k.onGPU) await k.toCPU();
       if (v.onGPU) await v.toCPU();
 
-      // Reshape to [B*H, T, headDim] (CPU — data reordering)
+      // Reshape to [B*H, T, headDim] (CPU — data reordering); k/v are grouped
+      // when GQA (kvH < H) and expanded to full query-head count for the kernels.
       q = this._reshapeForHeads(q, B, T, H, headDim);
-      k = this._reshapeForHeads(k, B, T, H, headDim);
-      v = this._reshapeForHeads(v, B, T, H, headDim);
+      k = this._reshapeForHeads(k, B, T, this.kvH, headDim);
+      v = this._reshapeForHeads(v, B, T, this.kvH, headDim);
+      k = this._expandKV(k, B, T);
+      v = this._expandKV(v, B, T);
 
       // GPU-accelerated attention core (RoPE + scores + softmax + weighted sum)
       // Forward outputs are kept on GPU for the backward pass.
@@ -450,6 +456,51 @@
               for (let d = 0; d < headDim; d++) {
                 x.grad[dstOff + d] += gout[srcOff + d];
               }
+            }
+          }
+        }
+      });
+    }
+
+    /**
+     * GQA: expand a KV-head tensor [B*kvH, T, headDim] to full query-head count
+     * [B*H, T, headDim] by repeating each KV head `group` times in query-head
+     * order (query head h of batch b attends to KV head h//group).
+     * MHA (kvH === H) is a no-op returning x unchanged. The backward node
+     * group-sums the incoming grad back to [B*kvH, T, headDim] (CPU loop or
+     * the kv_group_sum kernel when the grad arrives as a GPU buffer).
+     */
+    _expandKV(x, B, T) {
+      const kvH = this.kvH, H = this.H, headDim = this.headDim;
+      if (kvH === H) return x;
+      const group = H / kvH;
+      const TD = T * headDim;
+      const out = new Float32Array(B * H * TD);
+      const src = x.data;
+      // Query head h = kvh*group + g attends KV head kvh (h//group, contiguous
+      // grouping — matches the Python adapter and the kv_attention kernels).
+      for (let b = 0; b < B; b++) {
+        for (let kvh = 0; kvh < kvH; kvh++) {
+          for (let g = 0; g < group; g++) {
+            out.set(src.subarray((b * kvH + kvh) * TD, (b * kvH + kvh + 1) * TD),
+              (b * H + kvh * group + g) * TD);
+          }
+        }
+      }
+      const backend = window.WebGPUBackend && WebGPUBackend.instance;
+      return new Tensor(out, [B * H, T, headDim], x.requiresGrad, [x], (gout, goutBuf) => {
+        if (!x.requiresGrad) return;
+        if (goutBuf && backend) {
+          x._pendingGradBuf = backend.kvGroupSum(goutBuf, B, H, kvH, T, headDim);
+          return;
+        }
+        if (!x.grad) x.grad = new Float32Array(x.data.length);
+        for (let b = 0; b < B; b++) {
+          for (let kvh = 0; kvh < kvH; kvh++) {
+            const dstOff = (b * kvH + kvh) * TD;
+            for (let g = 0; g < group; g++) {
+              const srcOff = (b * H + g * kvH + kvh) * TD;
+              for (let i = 0; i < TD; i++) x.grad[dstOff + i] += gout[srcOff + i];
             }
           }
         }
@@ -724,14 +775,14 @@
     initKVCache(maxLen = null) {
       const backend = window.WebGPUBackend && WebGPUBackend.instance;
       const len = maxLen || this.T;
-      const H = this.H;
+      const kvH = this.kvH;
       const headDim = this.headDim;
       const kCaches = [], vCaches = [];
       for (let l = 0; l < this.L; l++) {
-        const kT = new Tensor(new Float32Array(H * len * headDim), [H, len, headDim], false, [], () => {},
-          backend ? backend.createEmptyBuffer(H * len * headDim * 4) : null, backend ? "gpu" : "cpu");
-        const vT = new Tensor(new Float32Array(H * len * headDim), [H, len, headDim], false, [], () => {},
-          backend ? backend.createEmptyBuffer(H * len * headDim * 4) : null, backend ? "gpu" : "cpu");
+        const kT = new Tensor(new Float32Array(kvH * len * headDim), [kvH, len, headDim], false, [], () => {},
+          backend ? backend.createEmptyBuffer(kvH * len * headDim * 4) : null, backend ? "gpu" : "cpu");
+        const vT = new Tensor(new Float32Array(kvH * len * headDim), [kvH, len, headDim], false, [], () => {},
+          backend ? backend.createEmptyBuffer(kvH * len * headDim * 4) : null, backend ? "gpu" : "cpu");
         kCaches.push(kT);
         vCaches.push(vT);
       }
@@ -748,7 +799,7 @@
      * interchangeable and the fallback doubles as a reference.
      */
     async decodeStep(tokenId, state, ternarize = false) {
-      const D = this.D, H = this.H, V = this.V, headDim = this.headDim, BH = H;
+      const D = this.D, H = this.H, V = this.V, headDim = this.headDim, BH = H, kvH = this.kvH;
       const backend = window.WebGPUBackend && WebGPUBackend.instance;
       const pos = state.pos;
       if (pos >= state.maxLen) throw new Error(`KV cache full (maxLen=${state.maxLen})`);
@@ -788,25 +839,26 @@
         if (k.onGPU) await k.toCPU();
         if (v.onGPU) await v.toCPU();
 
-        // Heads + RoPE at the absolute position
+        // Heads + RoPE at the absolute position (k/v have kvH heads under GQA)
         q = this._reshapeForHeads(q, 1, 1, H, headDim);
-        k = this._reshapeForHeads(k, 1, 1, H, headDim);
-        v = this._reshapeForHeads(v, 1, 1, H, headDim);
+        k = this._reshapeForHeads(k, 1, 1, kvH, headDim);
+        v = this._reshapeForHeads(v, 1, 1, kvH, headDim);
         q = this._applyRoPE(q, BH, 1, headDim);
-        k = this._applyRoPE(k, BH, 1, headDim);
+        k = this._applyRoPE(k, kvH, 1, headDim);
 
-        // Append k/v into the cache at position pos ([H, maxLen, headDim] layout)
+        // Append k/v into the cache at position pos ([kvH, maxLen, headDim] layout)
         const kCache = state.kCaches[l], vCache = state.vCaches[l];
-        for (let bh = 0; bh < BH; bh++) {
-          backend.writeBufferAt(kCache.gpuBuffer, k.data.subarray(bh * headDim, (bh + 1) * headDim), (bh * state.maxLen + pos) * headDim);
-          backend.writeBufferAt(vCache.gpuBuffer, v.data.subarray(bh * headDim, (bh + 1) * headDim), (bh * state.maxLen + pos) * headDim);
+        for (let kv = 0; kv < kvH; kv++) {
+          backend.writeBufferAt(kCache.gpuBuffer, k.data.subarray(kv * headDim, (kv + 1) * headDim), (kv * state.maxLen + pos) * headDim);
+          backend.writeBufferAt(vCache.gpuBuffer, v.data.subarray(kv * headDim, (kv + 1) * headDim), (kv * state.maxLen + pos) * headDim);
         }
 
-        // Attend over the prefix (0..pos) via the KV-cache kernels
+        // Attend over the prefix (0..pos) via the KV-cache kernels (GQA: query
+        // head bh attends to cache row (bh * kvH) / H — mapped inside the kernels)
         const qT = Tensor.fromArray(q.data, [BH, headDim], false).toGPU();
-        const kView = kCache.reshape([BH, pos + 1, headDim]);
-        const vView = vCache.reshape([BH, pos + 1, headDim]);
-        const y = kvAttention(qT, kView, vView, { causal: false });
+        const kView = kCache.reshape([kvH, pos + 1, headDim]);
+        const vView = vCache.reshape([kvH, pos + 1, headDim]);
+        const y = kvAttention(qT, kView, vView, { causal: false, kvH, H });
         const yData = await y.toCPU();
 
         // Reshape back, output projection, residual

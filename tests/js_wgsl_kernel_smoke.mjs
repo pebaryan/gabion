@@ -682,23 +682,27 @@ const report = {};
     }
   }
 
-  // WGSL kv_attention_scores + kv_attention_apply transpiled (no causal)
+  // WGSL kv_attention_scores + kv_attention_apply transpiled (no causal).
+  // MHA case: kvH = H = BH, so kv = (bh * kvH) / H = bh (identical to before).
+  const kvH0 = BH, H0 = BH;
   const scoresK = new Float32Array(BH * L), outK = new Float32Array(BH * headDim);
   for (let idx = 0; idx < BH * L; idx++) {
     const bh = (idx / L) | 0, j = idx % L;
+    const kv = ((bh * kvH0) / H0) | 0;
     let dot = 0;
-    for (let d = 0; d < headDim; d++) dot += q[bh * headDim + d] * kc[(bh * L + j) * headDim + d];
+    for (let d = 0; d < headDim; d++) dot += q[bh * headDim + d] * kc[(kv * L + j) * headDim + d];
     scoresK[idx] = dot * scale;
   }
   for (let idx = 0; idx < BH * headDim; idx++) {
     const bh = (idx / headDim) | 0, d = idx % headDim;
+    const kv = ((bh * kvH0) / H0) | 0;
     let m = -Infinity;
     for (let j = 0; j < L; j++) m = Math.max(m, scoresK[bh * L + j]);
     let sumE = 0, acc = 0;
     for (let j = 0; j < L; j++) {
       const e = Math.exp(scoresK[bh * L + j] - m);
       sumE += e;
-      acc += e * vc[(bh * L + j) * headDim + d];
+      acc += e * vc[(kv * L + j) * headDim + d];
     }
     outK[idx] = acc / Math.max(sumE, 1e-12);
   }
@@ -765,11 +769,91 @@ const report = {};
   report.kv_fullrow = maxAbs(causalFull, outFullRow);
 }
 
+// ---- GQA (grouped query attention): grouped KV cache + group-sum backward ----
+{
+  const rng = (() => { let s = 271828; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
+  const B = 2, H = 4, kvH = 2, T = 5, headDim = 4;
+  const BH = B * H, BKV = B * kvH, scale = 1 / Math.sqrt(headDim);
+  const q = new Float32Array(BH * headDim), kc = new Float32Array(BKV * T * headDim), vc = new Float32Array(BKV * T * headDim);
+  for (let i = 0; i < q.length; i++) q[i] = rng() * 2 - 1;
+  for (let i = 0; i < kc.length; i++) kc[i] = rng() * 2 - 1;
+  for (let i = 0; i < vc.length; i++) vc[i] = rng() * 2 - 1;
+
+  // Reference: query head h attends to KV head (b*kvH + h//group)
+  const scoresRef = new Float32Array(BH * T), outRef = new Float32Array(BH * headDim);
+  for (let bh = 0; bh < BH; bh++) {
+    const kv = ((bh * kvH) / H) | 0;
+    for (let j = 0; j < T; j++) {
+      let dot = 0;
+      for (let d = 0; d < headDim; d++) dot += q[bh * headDim + d] * kc[(kv * T + j) * headDim + d];
+      scoresRef[bh * T + j] = dot * scale;
+    }
+    let m = -Infinity;
+    for (let j = 0; j < T; j++) m = Math.max(m, scoresRef[bh * T + j]);
+    const p = new Float32Array(T); let sumE = 0;
+    for (let j = 0; j < T; j++) { p[j] = Math.exp(scoresRef[bh * T + j] - m); sumE += p[j]; }
+    for (let d = 0; d < headDim; d++) {
+      let acc = 0;
+      for (let j = 0; j < T; j++) acc += p[j] / sumE * vc[(kv * T + j) * headDim + d];
+      outRef[bh * headDim + d] = acc;
+    }
+  }
+
+  // Transpiled WGSL with the GQA kvidx mapping (kvH=2, H=4)
+  const scoresK = new Float32Array(BH * T), outK = new Float32Array(BH * headDim);
+  for (let idx = 0; idx < BH * T; idx++) {
+    const bh = (idx / T) | 0, j = idx % T;
+    const kv = ((bh * kvH) / H) | 0;
+    let dot = 0;
+    for (let d = 0; d < headDim; d++) dot += q[bh * headDim + d] * kc[(kv * T + j) * headDim + d];
+    scoresK[idx] = dot * scale;
+  }
+  for (let idx = 0; idx < BH * headDim; idx++) {
+    const bh = (idx / headDim) | 0, d = idx % headDim;
+    const kv = ((bh * kvH) / H) | 0;
+    let m = -Infinity;
+    for (let j = 0; j < T; j++) m = Math.max(m, scoresK[bh * T + j]);
+    let sumE = 0, acc = 0;
+    for (let j = 0; j < T; j++) {
+      const e = Math.exp(scoresK[bh * T + j] - m);
+      sumE += e;
+      acc += e * vc[(kv * T + j) * headDim + d];
+    }
+    outK[idx] = acc / Math.max(sumE, 1e-12);
+  }
+  report.gqa_kv_scores = maxAbs(scoresK, scoresRef);
+  report.gqa_kv_out = maxAbs(outK, outRef);
+
+  // Group-sum kernel: [BH*T*headDim] -> [B*kvH*T*headDim]
+  const gradIn = new Float32Array(BH * T * headDim), groupRef = new Float32Array(BKV * T * headDim);
+  for (let i = 0; i < gradIn.length; i++) gradIn[i] = rng() * 2 - 1;
+  const group = H / kvH, TD = T * headDim;
+  for (let b = 0; b < B; b++) {
+    for (let kv = 0; kv < kvH; kv++) {
+      const dst = (b * kvH + kv) * TD;
+      for (let g = 0; g < group; g++) {
+        const src = (b * H + kv * group + g) * TD;
+        for (let i = 0; i < TD; i++) groupRef[dst + i] += gradIn[src + i];
+      }
+    }
+  }
+  const groupK = new Float32Array(BKV * TD);
+  for (let idx = 0; idx < BKV * TD; idx++) {
+    const bkv = (idx / TD) | 0, rest = idx % TD;
+    const b = (bkv / kvH) | 0, g0 = (bkv % kvH) * group;
+    const base = (b * H + g0) * TD + rest;
+    let acc = 0;
+    for (let g = 0; g < group; g++) acc += gradIn[base + g * TD];
+    groupK[idx] = acc;
+  }
+  report.kv_group_sum = maxAbs(groupK, groupRef);
+}
+
 const convChecks = [report.conv2d_fwd, report.conv2d_dx, report.conv2d_dw, report.conv2d_db, report.ct_fwd, report.ct_dx, report.ct_dw, report.ct_db];
 const normChecks = [report.bn_fwd, report.bn_dx, report.bn_dgamma, report.bn_dbeta, report.aff_fwd, report.aff_dx, report.aff_dw, report.aff_db];
 const lastChecks = [report.ln_bwd, report.afflast_fwd, report.afflast_dx, report.afflast_dw, report.afflast_db, report.lstm_h, report.lstm_c];
 const lstmBwdChecks = [report.lstm_dx, report.lstm_dh, report.lstm_dc, report.lstm_dwih, report.lstm_dwhh, report.lstm_dbih, report.lstm_dbhh];
-const kvChecks = [report.kv_scores, report.kv_out, report.kv_causal, report.kv_fullrow];
+const kvChecks = [report.kv_scores, report.kv_out, report.kv_causal, report.kv_fullrow, report.gqa_kv_scores, report.gqa_kv_out, report.kv_group_sum];
 if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4)) || lastChecks.some((v) => !(v < 1e-4)) || lstmBwdChecks.some((v) => !(v < 1e-4)) || kvChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
 
 console.log(JSON.stringify(report, null, 2));

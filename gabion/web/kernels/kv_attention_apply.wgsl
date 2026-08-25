@@ -7,6 +7,7 @@
 
 struct Params {
   BH: u32, L: u32, headDim: u32, scale: f32, causal: u32, pos: u32,
+  kvH: u32, H: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -34,7 +35,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   // Pass 2: sum(exp) and weighted sum of V
   var sumE: f32 = 0.0;
   var acc: f32 = 0.0;
-  let vBase = (bh * L) * headDim;
+  // GQA: query head bh attends to KV head (bh * kvH) / H.
+  let kv = (bh * params.kvH) / params.H;
+  let vBase = (kv * L) * headDim;
   for (var j = 0u; j < L; j++) {
     let e = exp(scores[sBase + j] - m);
     sumE += e;

@@ -25,6 +25,7 @@ class BBTTransformerAdapter:
         input_dim: int = 256,  # kept for backward compatibility; treated as vocab size
         d_model: int = 64,
         n_heads: int = 4,
+        n_kv_heads: int | None = None,
         n_layers: int = 2,
         seq_len: int = 32,
         d_ff: int | None = None,
@@ -56,7 +57,10 @@ class BBTTransformerAdapter:
         self._cached_shard_sizes: list[int] | None = None
 
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.n_kv_heads = n_kv_heads or n_heads
+        assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         self.head_dim = d_model // n_heads
+        self.kv_d = self.n_kv_heads * self.head_dim
         assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
 
         # Keep adapter initialization backend-agnostic. tinygrad tensors are created lazily in forward.
@@ -78,8 +82,8 @@ class BBTTransformerAdapter:
 
         for _ in range(self.n_layers):
             q_w = Tensor.uniform(self.d_model, self.d_model, low=-xavier, high=xavier)
-            k_w = Tensor.uniform(self.d_model, self.d_model, low=-xavier, high=xavier)
-            v_w = Tensor.uniform(self.d_model, self.d_model, low=-xavier, high=xavier)
+            k_w = Tensor.uniform(self.d_model, self.kv_d, low=-xavier, high=xavier)
+            v_w = Tensor.uniform(self.d_model, self.kv_d, low=-xavier, high=xavier)
             o_w = Tensor.uniform(self.d_model, self.d_model, low=-xavier, high=xavier)
             n1_w = Tensor.ones(self.d_model)
             gate_up_w = Tensor.uniform(self.d_model, 2 * self.d_ff, low=-xavier, high=xavier)
@@ -333,22 +337,28 @@ class BBTTransformerAdapter:
         v = self._bitlinear(x, v_w, quantized_weights=quantized_weights)
 
         q = q.reshape(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)  # [B,H,T,D]
-        k = k.reshape(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)  # [B,KVH,T,D]
+        v = v.reshape(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         q = self._apply_rope(q)
         k = self._apply_rope(k)
 
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B,H,T,T]
+        # GQA: each group of query heads attends to one KV head (broadcast).
+        group = self.n_heads // self.n_kv_heads
+        q = q.reshape(bsz, self.n_kv_heads, group, seq_len, self.head_dim)  # [B,KVH,G,T,D]
+        k = k.reshape(bsz, self.n_kv_heads, 1, seq_len, self.head_dim)
+        v = v.reshape(bsz, self.n_kv_heads, 1, seq_len, self.head_dim)
+
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B,KVH,G,T,T]
 
         # Causal mask: forbid attending to future positions.
-        mask = Tensor.ones(seq_len, seq_len).triu(1).reshape(1, 1, seq_len, seq_len)
+        mask = Tensor.ones(seq_len, seq_len).triu(1).reshape(1, 1, 1, seq_len, seq_len)
         scores = scores.masked_fill(mask == 1, float("-inf"))
 
         attn = scores.softmax(axis=-1)
-        y = attn @ v
+        y = attn @ v  # [B,KVH,G,T,D]
 
-        y = y.transpose(1, 2).reshape(bsz, seq_len, self.d_model)
+        y = y.reshape(bsz, self.n_heads, seq_len, self.head_dim).transpose(1, 2).reshape(bsz, seq_len, self.d_model)
         return self._bitlinear(y, o_w, quantized_weights=quantized_weights)
 
     def _apply_rope(self, x: "Tensor") -> "Tensor":

@@ -209,7 +209,8 @@ def test_gguf_parse_and_export(tmp_path):
     assert np.max(np.abs(gu[:, dFF:] - tensors["blk.0.ffn_up.weight"])) < 1e-2
 
 
-def test_gguf_gqa_rejected(tmp_path):
+def test_gguf_gqa_export(tmp_path):
+    """GQA GGUF (4 query heads, 1 KV head) exports with grouped k/v tensors."""
     meta = {
         "general.architecture": "llama",
         "llama.block_count": 1,
@@ -221,11 +222,65 @@ def test_gguf_gqa_rejected(tmp_path):
         "llama.vocab_size": 17,
     }
     rng = np.random.default_rng(1)
-    tensors = {"token_embd.weight": rng.normal(0, 0.1, (17, 8)).astype(np.float32)}
+    D, kvD = 8, 2  # head_dim = 2, kv_heads=1
+    tensors = {
+        "token_embd.weight": rng.normal(0, 0.1, (17, D)).astype(np.float32),
+        "blk.0.attn_q.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
+        "blk.0.attn_k.weight": rng.normal(0, 0.1, (D, kvD)).astype(np.float32),
+        "blk.0.attn_v.weight": rng.normal(0, 0.1, (D, kvD)).astype(np.float32),
+        "blk.0.attn_output.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
+        "blk.0.attn_norm.weight": rng.normal(0, 0.1, (D,)).astype(np.float32),
+        "blk.0.ffn_gate.weight": rng.normal(0, 0.1, (D, 32)).astype(np.float32),
+        "blk.0.ffn_up.weight": rng.normal(0, 0.1, (D, 32)).astype(np.float32),
+        "blk.0.ffn_norm.weight": rng.normal(0, 0.1, (D,)).astype(np.float32),
+        "blk.0.ffn_down.weight": rng.normal(0, 0.1, (32, D)).astype(np.float32),
+        "output_norm.weight": rng.normal(0, 0.1, (D,)).astype(np.float32),
+    }
     gguf = tmp_path / "gqa.gguf"
     _write_gguf(gguf, meta, tensors)
-    with pytest.raises(NotImplementedError, match="GQA"):
-        export_gguf(gguf)
+    out = export_gguf(gguf)
+    assert out["config"]["n_heads"] == 4
+    assert out["config"]["n_kv_heads"] == 1
+    flat = f16_decode(out["weights_b64"])
+    n_tok = 17 * D
+    # q,o [D,D]; k,v [D,kvD]; norms 2*D; gate_up 2*D*32; down 32*D
+    per_layer = 2 * D * D + 2 * D * kvD + 2 * D + 2 * D * 32 + 32 * D
+    assert len(flat) == n_tok + per_layer + D
+    k = flat[n_tok + D * D:n_tok + D * D + D * kvD].reshape(D, kvD)
+    assert np.allclose(k, tensors["blk.0.attn_k.weight"], atol=1e-2)
+    # gate_up holds gate then up (after q,k,v,o,n1)
+    gu_off = n_tok + 2 * D * D + 2 * D * kvD + D
+    gu = flat[gu_off:gu_off + 2 * D * 32].reshape(D, 2 * 32)
+    assert np.allclose(gu[:, :32], tensors["blk.0.ffn_gate.weight"], atol=1e-2)
+    assert np.allclose(gu[:, 32:], tensors["blk.0.ffn_up.weight"], atol=1e-2)
+
+
+def test_export_tinygrad_gqa(tmp_path):
+    """tinygrad npz with grouped KV heads exports to the expected kvD layout."""
+    from gabion.user_models.bbt_transformer import BBTTransformerAdapter
+
+    cfg = {"vocab_size": 32, "d_model": 16, "n_heads": 4, "n_kv_heads": 2,
+           "n_layers": 1, "seq_len": 8, "d_ff": 32, "tie_weights": True,
+           "act_quant": True}
+    adapter = BBTTransformerAdapter(input_dim=cfg["vocab_size"], d_model=cfg["d_model"],
+                                    n_heads=cfg["n_heads"], n_kv_heads=cfg["n_kv_heads"],
+                                    n_layers=cfg["n_layers"], seq_len=cfg["seq_len"],
+                                    d_ff=cfg["d_ff"], act_quant=cfg["act_quant"],
+                                    tie_weights=cfg["tie_weights"], use_wikitext=False)
+    params = adapter.init_params(seed=5)
+    from gabion.pebble.adapters import flatten_tensors
+
+    names = ["tok_emb"] + [f"layer0.{p}" for p in ("q", "k", "v", "o", "norm1", "gate_up", "norm2", "down")] + ["norm_f"]
+    np.savez(tmp_path / "m.npz", **dict(zip(names, [np.asarray(p.numpy()) for p in params])))
+    out = export_tinygrad(tmp_path / "m.npz", cfg)
+    flat = f16_decode(out["weights_b64"])
+    D, kvD = 16, 8
+    assert out["config"]["n_kv_heads"] == 2
+    n_tok = 32 * D
+    k = flat[n_tok + D * D:n_tok + D * D + D * kvD].reshape(D, kvD)
+    assert np.allclose(k, np.asarray(params[2].numpy()), atol=1e-2)  # layer0.k
+    v = flat[n_tok + D * D + D * kvD:n_tok + D * D + 2 * D * kvD].reshape(D, kvD)
+    assert np.allclose(v, np.asarray(params[3].numpy()), atol=1e-2)  # layer0.v
 
 
 def test_export_cli(tmp_path, monkeypatch):
