@@ -739,6 +739,97 @@
       return dwBuf;
     }
 
+    /** LayerNorm backward. x/gout: [rows*d]. Recomputes stats in-kernel. Returns dxBuf [rows*d]. */
+    layernormBackward(xBuf, goutBuf, rows, d, eps) {
+      const pipeline = this.getPipeline("layernorm_backward");
+      const paramBuf = new ArrayBuffer(16);
+      new Uint32Array(paramBuf, 0, 2).set([rows, d]);
+      new Float32Array(paramBuf, 8, 1).set([eps]);
+      const uniformBuf = this.createUniformBuffer(new Uint8Array(paramBuf));
+      const dxBuf = this.createEmptyBuffer(rows * d * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: goutBuf } },
+          { binding: 3, resource: { buffer: dxBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, rows, 1, 1, uniformBuf);
+      return dxBuf;
+    }
+
+    /** Last-dim affine (nn.LayerNorm tail). x: [rows*C], w/b: [C]. Returns outBuf. */
+    affineLast(xBuf, wBuf, bBuf, P) {
+      const pipeline = this.getPipeline("affine_last");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.rows, P.C, P.hasBias, 0]));
+      const outBuf = this.createEmptyBuffer(P.rows * P.C * 4);
+      const dummy = this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: wBuf } },
+          { binding: 3, resource: { buffer: bBuf || dummy } },
+          { binding: 4, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.rows * P.C / 256), 1, 1, uniformBuf);
+      if (!bBuf) dummy.destroy();
+      return outBuf;
+    }
+
+    /** Last-dim affine weight gradient. Returns dwBuf [C]. */
+    affineLastBwdDw(xBuf, goutBuf, P) {
+      const pipeline = this.getPipeline("affine_last_bwd_dw");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.rows, P.C, 0, 0]));
+      const dwBuf = this.createEmptyBuffer(P.C * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: goutBuf } },
+          { binding: 3, resource: { buffer: dwBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.C / 256), 1, 1, uniformBuf);
+      return dwBuf;
+    }
+
+    /**
+     * Single-step LSTM cell forward (gate order i,f,g,o).
+     * x: [B*I], h/c: [B*H], wih: [4H*I], whh: [4H*H], bIh/bHh: [4H] or null.
+     * Returns { hOutBuf, cOutBuf }, both [B*H].
+     */
+    lstmCell(xBuf, hBuf, cBuf, wihBuf, whhBuf, bIhBuf, bHhBuf, P) {
+      const pipeline = this.getPipeline("lstm_cell");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.B, P.H, P.inputSize, P.hasBias]));
+      const hOutBuf = this.createEmptyBuffer(P.B * P.H * 4);
+      const cOutBuf = this.createEmptyBuffer(P.B * P.H * 4);
+      const dummy = this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: hBuf } },
+          { binding: 3, resource: { buffer: cBuf } },
+          { binding: 4, resource: { buffer: wihBuf } },
+          { binding: 5, resource: { buffer: whhBuf } },
+          { binding: 6, resource: { buffer: bIhBuf || dummy } },
+          { binding: 7, resource: { buffer: bHhBuf || dummy } },
+          { binding: 8, resource: { buffer: hOutBuf } },
+          { binding: 9, resource: { buffer: cOutBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.B * P.H / 256), 1, 1, uniformBuf);
+      if (!bIhBuf || !bHhBuf) dummy.destroy();
+      return { hOutBuf, cOutBuf };
+    }
+
     /**
      * Dispatch row-wise reduction.
      * op: 0=sum, 1=max, 2=sumSquares

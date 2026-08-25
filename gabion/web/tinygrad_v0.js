@@ -473,8 +473,13 @@
       if (backend && this.onGPU) {
         const outBuf = backend.layernorm(this.gpuBuffer, rows, C, eps);
         const y = new Float32Array(this.numel);
-        const t = new Tensor(y, [...shape], this.requiresGrad, [this], (gout) => {
+        const t = new Tensor(y, [...shape], this.requiresGrad, [this], (gout, goutBuf) => {
           if (!this.requiresGrad) return;
+          const be = gpu();
+          if (goutBuf && be && this.onGPU) {
+            this._pendingGradBuf = be.layernormBackward(this.gpuBuffer, goutBuf, rows, C, eps);
+            return;
+          }
           if (!this.grad) this.grad = new Float32Array(this.numel);
           for (let r = 0; r < rows; r++) {
             const off = r * C;
@@ -553,7 +558,8 @@
       }
       const req = this.requiresGrad || weight.requiresGrad || !!(bias && bias.requiresGrad);
       const parents = bias ? [this, weight, bias] : [this, weight];
-      return new Tensor(out, [...this.shape], req, parents, (gout) => {
+      const P = { rows, C, hasBias: bias ? 1 : 0 };
+      const cpuBackward = (gout) => {
         if (this.requiresGrad) {
           if (!this.grad) this.grad = new Float32Array(n);
           for (let r = 0; r < rows; r++) {
@@ -575,7 +581,25 @@
             for (let j = 0; j < C; j++) bias.grad[j] += gout[off + j];
           }
         }
-      });
+      };
+      const backend = gpu();
+      if (backend && this.onGPU && weight.onGPU && (!bias || bias.onGPU)) {
+        const outBuf = backend.affineLast(this.gpuBuffer, weight.gpuBuffer, bias ? bias.gpuBuffer : null, P);
+        return new Tensor(new Float32Array(n), [...this.shape], req, parents, (gout, goutBuf) => {
+          if (goutBuf && backend) {
+            if (this.requiresGrad) this._pendingGradBuf = backend.elementwise(goutBuf, weight.gpuBuffer, n, 1);
+            if (weight.requiresGrad) weight._pendingGradBuf = backend.affineLastBwdDw(this.gpuBuffer, goutBuf, P);
+            if (bias && bias.requiresGrad) {
+              // reuse conv_bwd_db: db[c] = sum over rows of gout[r*C+c] (N=rows, Cout=C, Ho=Wo=1)
+              const dbP = { N: rows, Cin: 1, H: 1, W: 1, Cout: C, Ho: 1, Wo: 1, kH: 1, kW: 1, groups: 1, cinPerG: 1, coutPerG: C, sH: 1, sW: 1, dH: 1, dW: 1, pH: 0, pW: 0, hasBias: 1 };
+              bias._pendingGradBuf = backend.convBwdDb(goutBuf, dbP);
+            }
+          } else {
+            cpuBackward(gout);
+          }
+        }, outBuf, "gpu");
+      }
+      return new Tensor(out, [...this.shape], req, parents, cpuBackward);
     }
 
     /** Dropout. Active only when tinygradV0.training is true. */
@@ -2787,6 +2811,22 @@
       const H = this.hiddenSize;
       const h = hc ? hc[0] : Tensor.zeros([B, H], false);
       const c = hc ? hc[1] : Tensor.zeros([B, H], false);
+      const backend = gpu();
+      if (backend && x.onGPU && h.onGPU && c.onGPU && this.weightIh.onGPU && this.weightHh.onGPU &&
+          (!this.biasIh || this.biasIh.onGPU) && (!this.biasHh || this.biasHh.onGPU)) {
+        const P = { B, H, inputSize: this.inputSize, hasBias: this.biasIh ? 1 : 0 };
+        const { hOutBuf, cOutBuf } = backend.lstmCell(
+          x.gpuBuffer, h.gpuBuffer, c.gpuBuffer,
+          this.weightIh.gpuBuffer, this.weightHh.gpuBuffer,
+          this.biasIh ? this.biasIh.gpuBuffer : null, this.biasHh ? this.biasHh.gpuBuffer : null, P);
+        const req = x.requiresGrad || h.requiresGrad || c.requiresGrad || this.weightIh.requiresGrad || this.weightHh.requiresGrad ||
+          !!(this.biasIh && this.biasIh.requiresGrad) || !!(this.biasHh && this.biasHh.requiresGrad);
+        const hT = new Tensor(new Float32Array(B * H), [B, H], req, [x, h, c, this.weightIh, this.weightHh], () => {
+          throw new Error("lstm_cell GPU backward not implemented");
+        }, hOutBuf, "gpu");
+        const cT = new Tensor(new Float32Array(B * H), [B, H], req, [], () => {}, cOutBuf, "gpu");
+        return [hT, cT];
+      }
       const gi = x.matmul(this.weightIh.transpose2d());
       const gh = h.matmul(this.weightHh.transpose2d());
       let gates = gi.add(gh);

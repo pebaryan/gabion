@@ -411,8 +411,140 @@ const report = {};
   report.aff_db = maxAbs(dbK, bt.grad);
 }
 
+// ---- LayerNorm backward ----
+{
+  const rng = (() => { let s = 31415; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
+  const rows = 5, d = 16, eps = 1e-5;
+  const x = new Float32Array(rows * d), gout = new Float32Array(rows * d);
+  for (let i = 0; i < x.length; i++) x[i] = (rng() * 2 - 1) * 2;
+  for (let i = 0; i < gout.length; i++) gout[i] = rng() * 2 - 1;
+
+  // CPU reference via the engine op
+  const xt = Tensor.fromArray(x, [rows, d], true);
+  const yt = xt.layerNorm(eps);
+  yt.grad = Float32Array.from(gout);
+  yt._backward(yt.grad);
+
+  // WGSL layernorm_backward transpiled
+  const dxK = new Float32Array(rows * d);
+  for (let r = 0; r < rows; r++) {
+    const base = r * d;
+    let mean = 0;
+    for (let j = 0; j < d; j++) mean += x[base + j];
+    mean /= d;
+    let varr = 0;
+    for (let j = 0; j < d; j++) { const v = x[base + j] - mean; varr += v * v; }
+    const inv = 1 / Math.sqrt(varr / d + eps);
+    let sumG = 0, dot = 0;
+    const yrow = new Float32Array(d);
+    for (let j = 0; j < d; j++) { yrow[j] = (x[base + j] - mean) * inv; sumG += gout[base + j]; dot += gout[base + j] * yrow[j]; }
+    const meanG = sumG / d, meanGY = dot / d;
+    for (let j = 0; j < d; j++) dxK[base + j] = inv * (gout[base + j] - meanG - yrow[j] * meanGY);
+  }
+  report.ln_bwd = maxAbs(dxK, xt.grad);
+}
+
+// ---- Affine last (nn.LayerNorm tail) fwd + bwd ----
+{
+  const rng = (() => { let s = 16180; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
+  const rows = 6, C = 4;
+  const x = new Float32Array(rows * C), gout = new Float32Array(rows * C);
+  const wArr = new Float32Array(C), bArr = new Float32Array(C);
+  for (let i = 0; i < x.length; i++) x[i] = rng() * 2 - 1;
+  for (let i = 0; i < gout.length; i++) gout[i] = rng() * 2 - 1;
+  for (let c = 0; c < C; c++) { wArr[c] = 0.5 + rng() * 0.5; bArr[c] = (rng() * 2 - 1) * 0.1; }
+
+  const xt = Tensor.fromArray(x, [rows, C], true);
+  const wt = Tensor.fromArray(wArr, [C], true);
+  const bt = Tensor.fromArray(bArr, [C], true);
+  const at = xt.affineLast(wt, bt);
+  const cpuY = Float32Array.from(at.data);
+  at.grad = Float32Array.from(gout);
+  at._backward(at.grad);
+
+  // WGSL affine_last + affine_last_bwd_dw transpiled
+  const yK = new Float32Array(rows * C);
+  const dxK = new Float32Array(rows * C);
+  const dwK = new Float32Array(C);
+  const dbK = new Float32Array(C);
+  for (let idx = 0; idx < rows * C; idx++) {
+    const j = idx % C;
+    yK[idx] = x[idx] * wArr[j] + bArr[j];
+    dxK[idx] = gout[idx] * wArr[j];
+  }
+  for (let c = 0; c < C; c++) {
+    for (let r = 0; r < rows; r++) {
+      const off = r * C + c;
+      dwK[c] += gout[off] * x[off];
+      dbK[c] += gout[off];
+    }
+  }
+  report.afflast_fwd = maxAbs(yK, cpuY);
+  report.afflast_dx = maxAbs(dxK, xt.grad);
+  report.afflast_dw = maxAbs(dwK, wt.grad);
+  report.afflast_db = maxAbs(dbK, bt.grad);
+}
+
+// ---- LSTM cell forward (gate order i,f,g,o) ----
+{
+  const rng = (() => { let s = 27182; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
+  const B = 2, I = 3, H = 4;
+  const x = new Float32Array(B * I), h0 = new Float32Array(B * H), c0 = new Float32Array(B * H);
+  const wih = new Float32Array(4 * H * I), whh = new Float32Array(4 * H * H);
+  const bIh = new Float32Array(4 * H), bHh = new Float32Array(4 * H);
+  for (let i = 0; i < x.length; i++) x[i] = rng() * 2 - 1;
+  for (let i = 0; i < h0.length; i++) h0[i] = rng() * 2 - 1;
+  for (let i = 0; i < c0.length; i++) c0[i] = rng() * 2 - 1;
+  for (let i = 0; i < wih.length; i++) wih[i] = (rng() * 2 - 1) * 0.5;
+  for (let i = 0; i < whh.length; i++) whh[i] = (rng() * 2 - 1) * 0.5;
+  for (let i = 0; i < bIh.length; i++) bIh[i] = (rng() * 2 - 1) * 0.1;
+  for (let i = 0; i < bHh.length; i++) bHh[i] = (rng() * 2 - 1) * 0.1;
+
+  // CPU reference via the engine module
+  const cell = new tg.nn.LSTMCell(I, H, { bias: true });
+  cell.weightIh.data.set(wih);
+  cell.weightHh.data.set(whh);
+  cell.biasIh.data.set(bIh);
+  cell.biasHh.data.set(bHh);
+  const [hT, cT] = cell.forward(
+    Tensor.fromArray(x, [B, I], false),
+    [Tensor.fromArray(h0, [B, H], false), Tensor.fromArray(c0, [B, H], false)],
+  );
+  const cpuH = Float32Array.from(hT.data), cpuC = Float32Array.from(cT.data);
+
+  // WGSL lstm_cell transpiled
+  const sig = (v) => 1 / (1 + Math.exp(-v));
+  const hK = new Float32Array(B * H), cK = new Float32Array(B * H);
+  for (let idx = 0; idx < B * H; idx++) {
+    const n = (idx / H) | 0, j = idx % H;
+    let s0 = bIh[j] + bHh[j], s1 = bIh[H + j] + bHh[H + j], s2 = bIh[2 * H + j] + bHh[2 * H + j], s3 = bIh[3 * H + j] + bHh[3 * H + j];
+    const xB = n * I, hB = n * H;
+    for (let k = 0; k < I; k++) {
+      const xv = x[xB + k];
+      s0 += xv * wih[j * I + k];
+      s1 += xv * wih[(H + j) * I + k];
+      s2 += xv * wih[(2 * H + j) * I + k];
+      s3 += xv * wih[(3 * H + j) * I + k];
+    }
+    for (let k = 0; k < H; k++) {
+      const hv = h0[hB + k];
+      s0 += hv * whh[j * H + k];
+      s1 += hv * whh[(H + j) * H + k];
+      s2 += hv * whh[(2 * H + j) * H + k];
+      s3 += hv * whh[(3 * H + j) * H + k];
+    }
+    const i = sig(s0), f = sig(s1), g = Math.tanh(s2), o = sig(s3);
+    const cnew = f * c0[idx] + i * g;
+    cK[idx] = cnew;
+    hK[idx] = o * Math.tanh(cnew);
+  }
+  report.lstm_h = maxAbs(hK, cpuH);
+  report.lstm_c = maxAbs(cK, cpuC);
+}
+
 const convChecks = [report.conv2d_fwd, report.conv2d_dx, report.conv2d_dw, report.conv2d_db, report.ct_fwd, report.ct_dx, report.ct_dw, report.ct_db];
 const normChecks = [report.bn_fwd, report.bn_dx, report.bn_dgamma, report.bn_dbeta, report.aff_fwd, report.aff_dx, report.aff_dw, report.aff_db];
-if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
+const lastChecks = [report.ln_bwd, report.afflast_fwd, report.afflast_dx, report.afflast_dw, report.afflast_db, report.lstm_h, report.lstm_c];
+if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4)) || lastChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
 
 console.log(JSON.stringify(report, null, 2));

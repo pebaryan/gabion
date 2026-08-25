@@ -1313,7 +1313,7 @@ function surrogateTrain(weights, opts) {
 }
 
 async function loadWGSLShaders() {
-  const kernels = ["matmul", "elementwise", "reduce", "softmax", "rope", "batched_matmul", "fused_attention", "softmax_backward", "rope_backward", "batched_transpose", "rmsnorm_backward", "adam_update", "adamw_update", "sgd_update", "cross_entropy_forward", "cross_entropy_backward", "embedding_forward", "silu_mul", "silu_mul_backward", "layernorm", "dropout_fwd", "dropout_bwd", "conv2d_fwd", "conv2d_bwd_dx", "conv2d_bwd_dw", "conv_bwd_db", "convtranspose2d_fwd", "convtranspose2d_bwd_dx", "convtranspose2d_bwd_dw", "batchnorm_stats", "batchnorm_fwd", "batchnorm_bwd_stats", "batchnorm_bwd_dx", "affine_channel", "affine_channel_bwd_dw"];
+  const kernels = ["matmul", "elementwise", "reduce", "softmax", "rope", "batched_matmul", "fused_attention", "softmax_backward", "rope_backward", "batched_transpose", "rmsnorm_backward", "adam_update", "adamw_update", "sgd_update", "cross_entropy_forward", "cross_entropy_backward", "embedding_forward", "silu_mul", "silu_mul_backward", "layernorm", "layernorm_backward", "dropout_fwd", "dropout_bwd", "conv2d_fwd", "conv2d_bwd_dx", "conv2d_bwd_dw", "conv_bwd_db", "convtranspose2d_fwd", "convtranspose2d_bwd_dx", "convtranspose2d_bwd_dw", "batchnorm_stats", "batchnorm_fwd", "batchnorm_bwd_stats", "batchnorm_bwd_dx", "affine_channel", "affine_channel_bwd_dw", "affine_last", "affine_last_bwd_dw", "lstm_cell"];
   for (const name of kernels) {
     try {
       const r = await fetch(`/assets/kernels/${name}.wgsl`, { cache: "no-store" });
