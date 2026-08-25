@@ -211,3 +211,4 @@ __marimo__/
 .qwen/
 artifacts/
 tests/_js_bbt_fixture*.json
+tests/_js_nn_optim_fixture*.json
