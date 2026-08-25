@@ -61,6 +61,21 @@ const loss = await tg.Tensor.crossEntropy(logits, yFlat);
 const jsLogits = Array.from(logits.data);
 const jsLoss = Number(loss.data[0]);
 const pyLogits = fixture.logits_flat;
+
+// Decode check: CPU-fallback decodeStep must reproduce forward logits row-by-row
+// (row pos predicts token pos+1 while attending the prefix 0..pos — identical to
+// the KV-cache GPU path's semantics, which can't run in Node without WebGPU).
+const outT = T - 1;
+const st = model.initKVCache();
+let decodeMax = 0;
+for (let pos = 0; pos < outT; pos++) {
+  const step = await model.decodeStep(xFlat[0 * T + pos], st, !!fixture.ternarize);
+  const refBase = (0 * outT + pos) * cfg.vocab_size;
+  for (let i = 0; i < step.logits.length; i++) {
+    decodeMax = Math.max(decodeMax, Math.abs(step.logits[i] - logits.data[refBase + i]));
+  }
+}
+
 if (jsLogits.length !== pyLogits.length) {
   throw new Error(`logit length js=${jsLogits.length} py=${pyLogits.length}`);
 }
@@ -104,6 +119,7 @@ const report = {
   loss_abs: lossAbs,
   logits_max_abs: maxAbs,
   logits_mean_abs: meanAbs,
+  decode_max_abs: decodeMax,
   train_mode: trained.mode || null,
   train_loss: Number(trained.loss),
   train_updated_len: updatedLen,

@@ -89,18 +89,20 @@ def main() -> int:
     logit_ok = report["logits_max_abs"] < 1e-3
     loss_ok = report["loss_abs"] < 1e-4
     train_ok = report["finite"] and report["train_updated_len"] == len(fixture["weights"])
+    decode_ok = report["decode_max_abs"] < 1e-3
     print(
         "verdict "
         f"logits={'PASS' if logit_ok else 'FAIL'} "
         f"loss={'PASS' if loss_ok else 'FAIL'} "
-        f"train={'PASS' if train_ok else 'FAIL'}"
+        f"train={'PASS' if train_ok else 'FAIL'} "
+        f"decode={'PASS' if decode_ok else 'FAIL'}"
     )
     if not math.isfinite(report["js_loss"]):
         return 1
     if not train_ok:
         return 1
     # Numeric mismatch is reported but still a useful smoke if JS ran.
-    return 0 if (logit_ok and loss_ok and train_ok) else 2
+    return 0 if (logit_ok and loss_ok and train_ok and decode_ok) else 2
 
 
 if __name__ == "__main__":

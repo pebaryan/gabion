@@ -4,7 +4,7 @@
 (function () {
   "use strict";
 
-  const { Tensor, Optimizer, nn } = window.tinygradV0;
+  const { Tensor, Optimizer, nn, kvAttention } = window.tinygradV0;
 
   /** Single transformer block: pre-norm attention + pre-norm FFN with residuals. */
   class TransformerBlock extends nn.Module {
@@ -714,6 +714,173 @@
         : activated.matmul(downW);
       if (out2d.onGPU) await out2d.toCPU();
       return out2d.reshape([B, T, D]);
+    }
+
+    /**
+     * Allocate a KV-cache state for autoregressive decode.
+     * Cache tensors are [H, maxLen, headDim]; on GPU when a backend is present.
+     * Returns { kCaches, vCaches, pos, maxLen }.
+     */
+    initKVCache(maxLen = null) {
+      const backend = window.WebGPUBackend && WebGPUBackend.instance;
+      const len = maxLen || this.T;
+      const H = this.H;
+      const headDim = this.headDim;
+      const kCaches = [], vCaches = [];
+      for (let l = 0; l < this.L; l++) {
+        const kT = new Tensor(new Float32Array(H * len * headDim), [H, len, headDim], false, [], () => {},
+          backend ? backend.createEmptyBuffer(H * len * headDim * 4) : null, backend ? "gpu" : "cpu");
+        const vT = new Tensor(new Float32Array(H * len * headDim), [H, len, headDim], false, [], () => {},
+          backend ? backend.createEmptyBuffer(H * len * headDim * 4) : null, backend ? "gpu" : "cpu");
+        kCaches.push(kT);
+        vCaches.push(vT);
+      }
+      return { kCaches, vCaches, pos: 0, maxLen: len };
+    }
+
+    /**
+     * Autoregressive decode of one token (predicts the token AFTER tokenId given the
+     * cached prefix). tokenId: number, state: from initKVCache().
+     * Returns { logits: Float32Array[V], state }.
+     * GPU path: RoPE at absolute position, k/v appended to the cache, attention via
+     * the KV-cache kernels (O(L) per step). CPU fallback: re-runs the prefix forward
+     * and takes the last predicted row — identical semantics, so the two paths are
+     * interchangeable and the fallback doubles as a reference.
+     */
+    async decodeStep(tokenId, state, ternarize = false) {
+      const D = this.D, H = this.H, V = this.V, headDim = this.headDim, BH = H;
+      const backend = window.WebGPUBackend && WebGPUBackend.instance;
+      const pos = state.pos;
+      if (pos >= state.maxLen) throw new Error(`KV cache full (maxLen=${state.maxLen})`);
+
+      // CPU fallback: prefix forward, last predicted row (exact reference semantics)
+      if (!backend) {
+        if (!state._prefix) state._prefix = [];
+        state._prefix.push(tokenId);
+        const T = pos + 2;
+        const logits = await this.forward(new Int32Array(state._prefix), 1, T, ternarize);
+        const row = logits.data.subarray((T - 2) * V, (T - 1) * V);
+        state.pos = pos + 1;
+        return { logits: Float32Array.from(row), state };
+      }
+
+      // --- GPU KV-cache path ---
+      this._ensureRopeGPU();
+      let x = this.tokEmb.forward(new Int32Array([tokenId]), 1, 1);
+      if (x.onGPU) await x.toCPU();
+
+      for (let l = 0; l < this.L; l++) {
+        const bl = this.layers[l];
+        // Pre-norm + q/k/v projections
+        let h = bl.norm1.forward(x);
+        const h2d = h.reshape([1, D]);
+        let q, k, v;
+        if (ternarize) {
+          q = this._bitlinear(h2d, bl.q.weight);
+          k = this._bitlinear(h2d, bl.k.weight);
+          v = this._bitlinear(h2d, bl.v.weight);
+        } else {
+          q = h2d.matmul(bl.q.weight);
+          k = h2d.matmul(bl.k.weight);
+          v = h2d.matmul(bl.v.weight);
+        }
+        if (q.onGPU) await q.toCPU();
+        if (k.onGPU) await k.toCPU();
+        if (v.onGPU) await v.toCPU();
+
+        // Heads + RoPE at the absolute position
+        q = this._reshapeForHeads(q, 1, 1, H, headDim);
+        k = this._reshapeForHeads(k, 1, 1, H, headDim);
+        v = this._reshapeForHeads(v, 1, 1, H, headDim);
+        q = this._applyRoPE(q, BH, 1, headDim);
+        k = this._applyRoPE(k, BH, 1, headDim);
+
+        // Append k/v into the cache at position pos ([H, maxLen, headDim] layout)
+        const kCache = state.kCaches[l], vCache = state.vCaches[l];
+        for (let bh = 0; bh < BH; bh++) {
+          backend.writeBufferAt(kCache.gpuBuffer, k.data.subarray(bh * headDim, (bh + 1) * headDim), (bh * state.maxLen + pos) * headDim);
+          backend.writeBufferAt(vCache.gpuBuffer, v.data.subarray(bh * headDim, (bh + 1) * headDim), (bh * state.maxLen + pos) * headDim);
+        }
+
+        // Attend over the prefix (0..pos) via the KV-cache kernels
+        const qT = Tensor.fromArray(q.data, [BH, headDim], false).toGPU();
+        const kView = kCache.reshape([BH, pos + 1, headDim]);
+        const vView = vCache.reshape([BH, pos + 1, headDim]);
+        const y = kvAttention(qT, kView, vView, { causal: false });
+        const yData = await y.toCPU();
+
+        // Reshape back, output projection, residual
+        const y3 = this._reshapeFromHeads(Tensor.fromArray(yData, [BH, 1, headDim], false), 1, 1, H, headDim);
+        const o = (ternarize ? this._bitlinear(y3.reshape([1, D]), bl.o.weight) : y3.reshape([1, D]).matmul(bl.o.weight)).reshape([1, 1, D]);
+        if (o.onGPU) await o.toCPU();
+        x = x.add(o);
+
+        // FFN + residual
+        let h2 = bl.norm2.forward(x);
+        h2 = await this._swiGLU(h2, 1, 1, bl.gateUp.weight, bl.down.weight, ternarize);
+        if (h2.onGPU) await h2.toCPU();
+        x = x.add(h2);
+      }
+
+      // Final norm + LM head
+      x = this.normF.forward(x);
+      const x2d = x.reshape([1, D]);
+      const logitsW = this.tieWeights ? this.tokEmb.weight.transpose2d() : this.lmHead.weight;
+      const logitsT = x2d.matmul(logitsW);
+      if (logitsT.onGPU) await logitsT.toCPU();
+      state.pos = pos + 1;
+      return { logits: Float32Array.from(logitsT.data), state };
+    }
+
+    /** Sample from logits with temperature + optional top-k (argmax when temperature <= 0). */
+    _sample(logits, temperature = 1.0, topK = 0) {
+      const n = logits.length;
+      if (temperature <= 0 || n <= 1) {
+        let best = 0;
+        for (let i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
+        return best;
+      }
+      const scaled = new Float32Array(n);
+      const invT = 1.0 / temperature;
+      let maxV = -Infinity;
+      for (let i = 0; i < n; i++) { scaled[i] = logits[i] * invT; if (scaled[i] > maxV) maxV = scaled[i]; }
+      if (topK > 0 && topK < n) {
+        const idx = Array.from({ length: n }, (_, i) => i).sort((a, b) => scaled[b] - scaled[a]);
+        const cutoff = scaled[idx[topK - 1]];
+        for (let i = 0; i < n; i++) if (scaled[i] < cutoff) scaled[i] = -Infinity;
+      }
+      let sumE = 0;
+      for (let i = 0; i < n; i++) sumE += Math.exp(scaled[i] - maxV);
+      let r = Math.random() * sumE;
+      for (let i = 0; i < n; i++) {
+        r -= Math.exp(scaled[i] - maxV);
+        if (r <= 0) return i;
+      }
+      return n - 1;
+    }
+
+    /**
+     * Autoregressive generation from a prompt.
+     * opts: { temperature=1.0, topK=0, maxNewTokens=64, maxLen, ternarize=false, state, onToken }
+     * Returns { tokens: number[], logits: Float32Array[], state }.
+     */
+    async decode(tokenIds, opts = {}) {
+      const maxNew = opts.maxNewTokens != null ? opts.maxNewTokens : 64;
+      const temperature = opts.temperature != null ? opts.temperature : 1.0;
+      const topK = opts.topK || 0;
+      const ternarize = !!opts.ternarize;
+      const state = opts.state || this.initKVCache(opts.maxLen);
+      const tokens = [...tokenIds];
+      const logitsList = [];
+      for (let i = 0; i < maxNew; i++) {
+        if (state.pos >= state.maxLen) break; // context full
+        const { logits, state: st } = await this.decodeStep(tokens[tokens.length - 1], state, ternarize);
+        const next = this._sample(logits, temperature, topK);
+        tokens.push(next);
+        logitsList.push(logits);
+        if (opts.onToken) opts.onToken(next, logits, tokens);
+      }
+      return { tokens, logits: logitsList, state };
     }
   }
 

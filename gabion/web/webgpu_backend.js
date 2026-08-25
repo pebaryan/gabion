@@ -1027,6 +1027,11 @@
       this.device.queue.writeBuffer(gpuBuf, 0, data);
     }
 
+    /** Upload Float32Array data into an existing GPU buffer at a float offset. */
+    writeBufferAt(gpuBuf, data, floatOffset) {
+      this.device.queue.writeBuffer(gpuBuf, floatOffset * 4, data);
+    }
+
     /**
      * Row-wise softmax with optional causal mask.
      * Input: [rows, cols] buffer. Output: [rows, cols] buffer.
