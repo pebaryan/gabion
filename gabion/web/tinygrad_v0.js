@@ -28,6 +28,7 @@
       this._backward = backward || (() => {});
       this.gpuBuffer = gpuBuffer;
       this._dirty = _dirty;
+      this._isView = false; // true if gpuBuffer is shared (don't destroy on releaseGPU)
     }
 
     get numel() {
@@ -80,12 +81,13 @@
       return !!this.gpuBuffer && this._dirty === "gpu";
     }
 
-    /** Release GPU buffer. */
+    /** Release GPU buffer. Views (shared buffers) are detached without destroying. */
     releaseGPU() {
       if (this.gpuBuffer) {
-        this.gpuBuffer.destroy();
+        if (!this._isView) this.gpuBuffer.destroy();
         this.gpuBuffer = null;
       }
+      this._isView = false;
       this._dirty = "cpu";
     }
 
@@ -220,9 +222,39 @@
     add(other) {
       const n = this.numel;
       if (other.numel !== n) throw new Error(`add shape mismatch: ${this.shape} vs ${other.shape}`);
+      const req = this.requiresGrad || other.requiresGrad;
+
+      const backend = gpu();
+      if (backend) {
+        if (this.onGPU && !other.onGPU) other.toGPU();
+        else if (!this.onGPU && other.onGPU) this.toGPU();
+
+        if (this.onGPU && other.onGPU) {
+          const outBuf = backend.elementwise(this.gpuBuffer, other.gpuBuffer, n, 0);
+          const t = new Tensor(new Float32Array(n), [...this.shape], req, [this, other], (gout, goutBuf) => {
+            // Gradient of add passes through unchanged to both parents
+            if (goutBuf) {
+              if (this.requiresGrad) this._pendingGradBuf = goutBuf;
+              if (other.requiresGrad) other._pendingGradBuf = goutBuf;
+            } else {
+              if (this.requiresGrad) {
+                if (!this.grad) this.grad = new Float32Array(n);
+                for (let i = 0; i < n; i++) this.grad[i] += gout[i];
+              }
+              if (other.requiresGrad) {
+                if (!other.grad) other.grad = new Float32Array(n);
+                for (let i = 0; i < n; i++) other.grad[i] += gout[i];
+              }
+            }
+          });
+          t.gpuBuffer = outBuf;
+          t._dirty = "gpu";
+          return t;
+        }
+      }
+
       const out = new Float32Array(n);
       for (let i = 0; i < n; i++) out[i] = this.data[i] + other.data[i];
-      const req = this.requiresGrad || other.requiresGrad;
       return new Tensor(out, [...this.shape], req, [this, other], (gout) => {
         if (this.requiresGrad) {
           if (!this.grad) this.grad = new Float32Array(n);
@@ -434,9 +466,25 @@
       });
     }
 
-    /** Scale by scalar. */
+    /** Scale by scalar. Auto-dispatches to GPU. */
     scale(s) {
       const n = this.numel;
+      const backend = gpu();
+      if (backend && this.onGPU) {
+        const outBuf = backend.elementwise(this.gpuBuffer, this.gpuBuffer, n, 3, s);
+        const out = new Tensor(new Float32Array(n), [...this.shape], this.requiresGrad, [this], (gout, goutBuf) => {
+          if (!this.requiresGrad) return;
+          if (goutBuf && backend) {
+            this._pendingGradBuf = backend.elementwise(goutBuf, goutBuf, n, 3, s);
+          } else {
+            if (!this.grad) this.grad = new Float32Array(n);
+            for (let i = 0; i < n; i++) this.grad[i] += gout[i] * s;
+          }
+        });
+        out.gpuBuffer = outBuf;
+        out._dirty = "gpu";
+        return out;
+      }
       const out = new Float32Array(n);
       for (let i = 0; i < n; i++) out[i] = this.data[i] * s;
       return new Tensor(out, [...this.shape], this.requiresGrad, [this], (gout) => {
@@ -446,25 +494,60 @@
       });
     }
 
-    /** Reshape (view, no copy). Product of dims must match numel. */
+    /** Reshape (view, no copy). Product of dims must match numel. Propagates GPU buffer. */
     reshape(newShape) {
       const n = newShape.reduce((a, b) => a * b, 1);
       if (n !== this.numel) throw new Error(`reshape: ${this.shape} -> ${newShape} size mismatch`);
-      const origShape = this.shape;
-      return new Tensor(this.data, newShape, this.requiresGrad, [this], (gout) => {
+      const t = new Tensor(this.data, newShape, this.requiresGrad, [this], (gout, goutBuf) => {
         if (!this.requiresGrad) return;
-        if (!this.grad) this.grad = new Float32Array(this.data.length);
-        for (let i = 0; i < n; i++) this.grad[i] += gout[i];
+        if (goutBuf) {
+          this._pendingGradBuf = goutBuf;
+        } else {
+          if (!this.grad) this.grad = new Float32Array(this.data.length);
+          for (let i = 0; i < n; i++) this.grad[i] += gout[i];
+        }
       });
+      // Propagate GPU buffer as a view (shared memory, different logical shape)
+      if (this.gpuBuffer) {
+        t.gpuBuffer = this.gpuBuffer;
+        t._dirty = this._dirty;
+        t._isView = true;
+      }
+      return t;
     }
 
-    /** Softmax along last axis. Input shape [..., C]. */
+    /** Softmax along last axis. Input shape [..., C]. Auto-dispatches to GPU. */
     softmax() {
       const shape = this.shape;
       const C = shape[shape.length - 1];
       const rows = this.numel / C;
-      const out = new Float32Array(this.numel);
 
+      const backend = gpu();
+      if (backend && this.onGPU) {
+        const outBuf = backend.softmax(this.gpuBuffer, rows, C);
+        const t = new Tensor(new Float32Array(this.numel), [...shape], this.requiresGrad, [this], (gout, goutBuf) => {
+          if (!this.requiresGrad) return;
+          const be = gpu();
+          if (goutBuf && be && t.gpuBuffer) {
+            // softmaxBackward: d = attn * (dout - dot(dout, attn)), scale=1.0
+            this._pendingGradBuf = be.softmaxBackward(t.gpuBuffer, goutBuf, rows, C, 1.0);
+          } else {
+            if (!this.grad) this.grad = new Float32Array(this.data.length);
+            const outData = t.data;
+            for (let r = 0; r < rows; r++) {
+              const off = r * C;
+              let dot = 0;
+              for (let j = 0; j < C; j++) dot += gout[off + j] * outData[off + j];
+              for (let j = 0; j < C; j++) this.grad[off + j] += outData[off + j] * (gout[off + j] - dot);
+            }
+          }
+        });
+        t.gpuBuffer = outBuf;
+        t._dirty = "gpu";
+        return t;
+      }
+
+      const out = new Float32Array(this.numel);
       for (let r = 0; r < rows; r++) {
         const off = r * C;
         let mx = -Infinity;
@@ -474,7 +557,6 @@
         const inv = 1.0 / Math.max(s, 1e-12);
         for (let j = 0; j < C; j++) out[off + j] *= inv;
       }
-
       const outData = out;
       return new Tensor(out, [...shape], this.requiresGrad, [this], (gout) => {
         if (!this.requiresGrad) return;
@@ -483,9 +565,7 @@
           const off = r * C;
           let dot = 0;
           for (let j = 0; j < C; j++) dot += gout[off + j] * outData[off + j];
-          for (let j = 0; j < C; j++) {
-            this.grad[off + j] += outData[off + j] * (gout[off + j] - dot);
-          }
+          for (let j = 0; j < C; j++) this.grad[off + j] += outData[off + j] * (gout[off + j] - dot);
         }
       });
     }
@@ -572,62 +652,83 @@
       const [b2, k2, n] = other.shape;
       if (b1 !== b2) throw new Error(`batchedMatmul batch mismatch: ${b1} vs ${b2}`);
       if (k1 !== k2) throw new Error(`batchedMatmul inner dim mismatch: ${k1} vs ${k2}`);
-
       const B = b1;
-      const out = new Float32Array(B * m * n);
+      const req = this.requiresGrad || other.requiresGrad;
+
+      const backend = gpu();
+      if (backend) {
+        if (this.onGPU && !other.onGPU) other.toGPU();
+        else if (!this.onGPU && other.onGPU) this.toGPU();
+
+        if (this.onGPU && other.onGPU) {
+          const outBuf = backend.batchedMatmul(this.gpuBuffer, other.gpuBuffer, B, m, k1, n);
+          const aBuf = this.gpuBuffer;
+          const bBuf = other.gpuBuffer;
+          const t = new Tensor(new Float32Array(B * m * n), [B, m, n], req, [this, other], (gout, goutBuf) => {
+            const be = gpu();
+            if (goutBuf && be && aBuf && bBuf) {
+              // dA[b] = gout[b] @ B[b]^T
+              if (this.requiresGrad) {
+                this._pendingGradBuf = be.batchedMatmul(goutBuf, bBuf, B, m, n, k1, true);
+              }
+              // dB[b] = A[b]^T @ gout[b]
+              if (other.requiresGrad) {
+                other._pendingGradBuf = be.batchedMatmul(aBuf, goutBuf, B, k1, m, n, true);
+              }
+            } else {
+              this._batchedMatmulCPUBackward(other, gout, B, m, k1, n);
+            }
+          });
+          t.gpuBuffer = outBuf;
+          t._dirty = "gpu";
+          return t;
+        }
+      }
+
       const aData = this.data;
       const bData = other.data;
-
+      const out = new Float32Array(B * m * n);
       for (let b = 0; b < B; b++) {
-        const aOff = b * m * k1;
-        const bOff = b * k2 * n;
-        const oOff = b * m * n;
+        const aOff = b * m * k1, bOff = b * k2 * n, oOff = b * m * n;
         for (let i = 0; i < m; i++) {
           for (let j = 0; j < n; j++) {
             let s = 0.0;
-            for (let k = 0; k < k1; k++) {
-              s += aData[aOff + i * k1 + k] * bData[bOff + k * n + j];
-            }
+            for (let k = 0; k < k1; k++) s += aData[aOff + i * k1 + k] * bData[bOff + k * n + j];
             out[oOff + i * n + j] = s;
           }
         }
       }
-
-      const req = this.requiresGrad || other.requiresGrad;
       return new Tensor(out, [B, m, n], req, [this, other], (gout) => {
-        // dA[b] = gout[b] @ B[b]^T
-        if (this.requiresGrad) {
-          if (!this.grad) this.grad = new Float32Array(this.data.length);
-          for (let b = 0; b < B; b++) {
-            const gOff = b * m * n;
-            const bOff = b * k2 * n;
-            const aOff = b * m * k1;
-            for (let i = 0; i < m; i++) {
-              for (let k = 0; k < k1; k++) {
-                let s = 0.0;
-                for (let j = 0; j < n; j++) s += gout[gOff + i * n + j] * bData[bOff + k * n + j];
-                this.grad[aOff + i * k1 + k] += s;
-              }
-            }
-          }
-        }
-        // dB[b] = A[b]^T @ gout[b]
-        if (other.requiresGrad) {
-          if (!other.grad) other.grad = new Float32Array(other.data.length);
-          for (let b = 0; b < B; b++) {
-            const aOff = b * m * k1;
-            const gOff = b * m * n;
-            const bOff = b * k2 * n;
-            for (let k = 0; k < k1; k++) {
-              for (let j = 0; j < n; j++) {
-                let s = 0.0;
-                for (let i = 0; i < m; i++) s += aData[aOff + i * k1 + k] * gout[gOff + i * n + j];
-                other.grad[bOff + k * n + j] += s;
-              }
-            }
-          }
-        }
+        this._batchedMatmulCPUBackward(other, gout, B, m, k1, n);
       });
+    }
+
+    _batchedMatmulCPUBackward(other, gout, B, m, k, n) {
+      const aData = this.data, bData = other.data;
+      if (this.requiresGrad) {
+        if (!this.grad) this.grad = new Float32Array(this.data.length);
+        for (let b = 0; b < B; b++) {
+          const gOff = b * m * n, bOff = b * k * n, aOff = b * m * k;
+          for (let i = 0; i < m; i++)
+            for (let kk = 0; kk < k; kk++) {
+              let s = 0.0;
+              for (let j = 0; j < n; j++) s += gout[gOff + i * n + j] * bData[bOff + kk * n + j];
+              this.grad[aOff + i * k + kk] += s;
+            }
+        }
+      }
+      if (other.requiresGrad) {
+        if (!other.grad) other.grad = new Float32Array(other.data.length);
+        for (let b = 0; b < B; b++) {
+          const aOff = b * m * k, gOff = b * m * n, bOff = b * k * n;
+          for (let kk = 0; kk < k; kk++)
+            for (let j = 0; j < n; j++) {
+              let s = 0.0;
+              for (let i = 0; i < m; i++) s += aData[aOff + i * k + kk] * gout[gOff + i * n + j];
+              other.grad[bOff + kk * n + j] += s;
+            }
+        }
+      }
     }
 
     /**
@@ -636,25 +737,45 @@
     transpose3d() {
       if (this.shape.length !== 3) throw new Error(`transpose3d requires 3D, got ${this.shape}`);
       const [B, m, n] = this.shape;
+
+      const backend = gpu();
+      if (backend && this.onGPU) {
+        const outBuf = backend.batchedTranspose(this.gpuBuffer, B, m, n);
+        const t = new Tensor(new Float32Array(B * m * n), [B, n, m], this.requiresGrad, [this], (gout, goutBuf) => {
+          if (!this.requiresGrad) return;
+          const be = gpu();
+          if (goutBuf && be) {
+            this._pendingGradBuf = be.batchedTranspose(goutBuf, B, n, m);
+          } else {
+            if (!this.grad) this.grad = new Float32Array(this.data.length);
+            for (let b = 0; b < B; b++) {
+              const off = b * n * m;
+              for (let i = 0; i < m; i++)
+                for (let j = 0; j < n; j++)
+                  this.grad[b * m * n + i * n + j] += gout[off + j * m + i];
+            }
+          }
+        });
+        t.gpuBuffer = outBuf;
+        t._dirty = "gpu";
+        return t;
+      }
+
       const out = new Float32Array(B * m * n);
       for (let b = 0; b < B; b++) {
         const off = b * m * n;
-        for (let i = 0; i < m; i++) {
-          for (let j = 0; j < n; j++) {
+        for (let i = 0; i < m; i++)
+          for (let j = 0; j < n; j++)
             out[b * n * m + j * m + i] = this.data[off + i * n + j];
-          }
-        }
       }
       return new Tensor(out, [B, n, m], this.requiresGrad, [this], (gout) => {
         if (!this.requiresGrad) return;
         if (!this.grad) this.grad = new Float32Array(this.data.length);
         for (let b = 0; b < B; b++) {
           const off = b * n * m;
-          for (let i = 0; i < m; i++) {
-            for (let j = 0; j < n; j++) {
+          for (let i = 0; i < m; i++)
+            for (let j = 0; j < n; j++)
               this.grad[b * m * n + i * n + j] += gout[off + j * m + i];
-            }
-          }
         }
       });
     }
@@ -748,6 +869,15 @@
       t.gpuBuffer = outBuf;
       t._dirty = "gpu";
       return t;
+    }
+
+    /** Unified embedding lookup — auto-dispatches to GPU or CPU. */
+    static embedding(emb, idxFlat, B, T) {
+      const backend = gpu();
+      if (backend && emb.onGPU) {
+        return Tensor.embeddingLookup2DGPU(emb, idxFlat, B, T);
+      }
+      return Tensor.embeddingLookup2D(emb, idxFlat, B, T);
     }
 
     transpose2d() {
@@ -899,6 +1029,26 @@
           }
         }
       }
+    }
+
+    /**
+     * Unified cross-entropy loss — auto-dispatches to GPU or CPU.
+     * logits: Tensor [N, V], targets: Int32Array [N]. Returns scalar loss Tensor.
+     */
+    static async crossEntropy(logits, targets) {
+      const backend = gpu();
+      if (backend && logits.onGPU) {
+        return crossEntropyGPU(logits, targets);
+      }
+      return crossEntropy(logits, targets);
+    }
+
+    /**
+     * Unified RMS normalization — auto-dispatches (backward uses GPU when available).
+     * x: Tensor, w: Tensor or number (eps), eps: number.
+     */
+    static rmsNorm(x, epsOrW = 1e-6, eps = 1e-6) {
+      return rmsNorm(x, epsOrW, eps);
     }
   }
 
@@ -1138,210 +1288,6 @@
     );
   }
 
-  function sampleBatch(vocabSize, batchSize, seed) {
-    const x = new Int32Array(batchSize);
-    const y = new Int32Array(batchSize);
-    let s = seed >>> 0;
-    function rnd() {
-      s = (Math.imul(1664525, s) + 1013904223) >>> 0;
-      return s;
-    }
-    for (let i = 0; i < batchSize; i++) {
-      const t = rnd() % vocabSize;
-      x[i] = t;
-      y[i] = (t + 1) % vocabSize;
-    }
-    return { x, y };
-  }
-
-  // --- Sync CPU training (original path, kept as fallback) ---
-  function trainLocalV0(weights, opts) {
-    const V = opts.vocabSize || 256;
-    const D = opts.dModel || 64;
-    const embBlock = V * D;
-
-    const lr = Math.max(1e-7, opts.lr || 5e-4);
-    const epochs = Math.max(1, opts.epochs || 1);
-    const batchSize = Math.max(8, opts.batchSize || 64);
-    let seed = opts.seed >>> 0;
-
-    let lastLoss = 0.0;
-    let samples = 0;
-
-    if (weights.length >= embBlock) {
-      const eView = weights.subarray(0, embBlock);
-      const E = Tensor.fromArray(eView, [V, D], true);
-
-      for (let e = 0; e < epochs; e++) {
-        let batch = null;
-        if (opts.batch && opts.batch.x && opts.batch.y) {
-          const bx = opts.batch.x;
-          const by = opts.batch.y;
-          if (bx.length === by.length && bx.length > 0) batch = { x: bx, y: by };
-        }
-        if (!batch) batch = sampleBatch(V, batchSize, seed ^ (e * 2654435761));
-        const bsz = batch.x.length;
-
-        E.grad = null;
-        const h = embeddingLookup(E, batch.x);
-        const hn = rmsNorm(h, 1e-6);
-        const logits = hn.matmul(E.transpose2d());
-        const loss = crossEntropy(logits, batch.y);
-        loss.backward();
-
-        const g = E.grad || new Float32Array(embBlock);
-        for (let i = 0; i < embBlock; i++) E.data[i] -= lr * g[i];
-        E.markCPUDirty();
-
-        lastLoss = loss.data[0];
-        samples += bsz;
-      }
-
-      const out = new Float32Array(weights.length);
-      out.set(weights);
-      out.set(E.data, 0);
-      return {
-        updated: out,
-        loss: Number(lastLoss),
-        sampleCount: samples,
-        mode: "v0-bbt-embed",
-      };
-    }
-
-    const block = V * V;
-    if (weights.length < block) {
-      return { updated: weights, loss: 0.0, sampleCount: 0, mode: "v0-skipped" };
-    }
-    const wView = weights.subarray(0, block);
-    const W = Tensor.fromArray(wView, [V, V], true);
-    for (let e = 0; e < epochs; e++) {
-      let batch = null;
-      if (opts.batch && opts.batch.x && opts.batch.y) {
-        const bx = opts.batch.x;
-        const by = opts.batch.y;
-        if (bx.length === by.length && bx.length > 0) batch = { x: bx, y: by };
-      }
-      if (!batch) batch = sampleBatch(V, batchSize, seed ^ (e * 2654435761));
-      const bsz = batch.x.length;
-      const X = Tensor.zeros([bsz, V], false);
-      for (let i = 0; i < bsz; i++) X.data[i * V + batch.x[i]] = 1.0;
-      W.grad = null;
-      const logits = X.matmul(W);
-      const loss = crossEntropy(logits, batch.y);
-      loss.backward();
-      const g = W.grad || new Float32Array(block);
-      for (let i = 0; i < block; i++) W.data[i] -= lr * g[i];
-      W.markCPUDirty();
-      lastLoss = loss.data[0];
-      samples += bsz;
-    }
-    const out = new Float32Array(weights.length);
-    out.set(weights);
-    out.set(W.data, 0);
-    return { updated: out, loss: Number(lastLoss), sampleCount: samples, mode: "v0-autograd-bigram" };
-  }
-
-  // --- Async GPU-accelerated training ---
-  async function debugAssertGPUHead(tensor, label = "tensor", count = 8, tol = 1e-4) {
-    const backend = gpu();
-    if (!backend || !tensor || !tensor.gpuBuffer) return true;
-    const n = Math.max(1, Math.min(count, tensor.numel));
-    const gpuHead = await backend.readBuffer(tensor.gpuBuffer, n);
-    for (let i = 0; i < n; i++) {
-      const a = tensor.data[i];
-      const b = gpuHead[i];
-      if (Math.abs(a - b) > tol) {
-        throw new Error(`${label} gpu-sync mismatch at ${i}: cpu=${a} gpu=${b}`);
-      }
-    }
-    return true;
-  }
-
-  async function trainLocalV0Async(weights, opts) {
-    const backend = gpu();
-    if (!backend) {
-      // No GPU: fall back to CPU path
-      return trainLocalV0(weights, opts);
-    }
-
-    const V = opts.vocabSize || 256;
-    const D = opts.dModel || 64;
-    const embBlock = V * D;
-
-    if (weights.length < embBlock) {
-      // Too few weights for embedding path — use CPU
-      return trainLocalV0(weights, opts);
-    }
-
-    const lr = Math.max(1e-7, opts.lr || 5e-4);
-    const epochs = Math.max(1, opts.epochs || 1);
-    const batchSize = Math.max(8, opts.batchSize || 64);
-    let seed = opts.seed >>> 0;
-
-    let lastLoss = 0.0;
-    let samples = 0;
-
-    const eView = weights.subarray(0, embBlock);
-    const E = Tensor.fromArray(eView, [V, D], true);
-    E.toGPU();  // Upload embedding to GPU
-    if (opts.debugSync) await debugAssertGPUHead(E, "E:init");
-
-    for (let e = 0; e < epochs; e++) {
-      let batch = null;
-      if (opts.batch && opts.batch.x && opts.batch.y) {
-        const bx = opts.batch.x;
-        const by = opts.batch.y;
-        if (bx.length === by.length && bx.length > 0) batch = { x: bx, y: by };
-      }
-      if (!batch) batch = sampleBatch(V, batchSize, seed ^ (e * 2654435761));
-      const bsz = batch.x.length;
-
-      E.grad = null;
-
-      // Forward: embedding lookup (CPU scatter) -> GPU matmul for projection
-      const h = embeddingLookup(E, batch.x);
-      const hn = rmsNorm(h, 1e-6);
-      const Et = E.transpose2d();
-      const logits = hn.matmul(Et);
-
-      // Cross-entropy needs CPU logits
-      if (logits.onGPU) await logits.toCPU();
-      const loss = crossEntropy(logits, batch.y);
-
-      // Backward (CPU path for now — GPU backward is wired but we resolve on CPU)
-      loss.backward();
-
-      // Resolve any pending GPU grad buffers
-      await loss.resolveGrads();
-
-      const g = E.grad || new Float32Array(embBlock);
-      for (let i = 0; i < embBlock; i++) E.data[i] -= lr * g[i];
-      E.markCPUDirty();
-
-      // Re-upload updated embedding for next epoch
-      if (e < epochs - 1) {
-        E.toGPU();
-        if (opts.debugSync) await debugAssertGPUHead(E, `E:epoch${e + 1}`);
-      }
-
-      lastLoss = loss.data[0];
-      samples += bsz;
-    }
-
-    // Clean up GPU buffers
-    E.releaseGPU();
-
-    const out = new Float32Array(weights.length);
-    out.set(weights);
-    out.set(E.data, 0);
-    return {
-      updated: out,
-      loss: Number(lastLoss),
-      sampleCount: samples,
-      mode: "v0-bbt-embed-webgpu",
-    };
-  }
-
   // --- f16 ↔ f32 conversion utilities ---
 
   /**
@@ -1480,16 +1426,341 @@
     return out;
   }
 
+  /**
+   * Optimizer — encapsulates Adam/SGD with GPU/CPU auto-dispatch.
+   * Handles gradient resolution, clipping, and parameter updates.
+   */
+  class Optimizer {
+    constructor(params, opts = {}) {
+      this.params = params;
+      this.lr = opts.lr || 5e-4;
+      this.type = opts.optimizer || "adam";
+      this.beta1 = opts.beta1 || 0.9;
+      this.beta2 = opts.beta2 || 0.999;
+      this.eps = 1e-8;
+      this.maxNorm = opts.gradClipNorm != null ? opts.gradClipNorm : 1.0;
+      this.warmupSteps = Math.max(1, opts.warmupSteps || 10);
+      this._step = window._adamStep || 0;
+      this._backend = gpu();
+      this._useGPU = !!this._backend;
+      this._initState();
+    }
+
+    _initState() {
+      if (this._useGPU && this.type === "adam") {
+        const be = this._backend;
+        for (const p of this.params) {
+          const bytes = p.numel * 4;
+          p._adamMBuf = be.createEmptyBuffer(bytes);
+          p._adamVBuf = be.createEmptyBuffer(bytes);
+          be.writeBuffer(p._adamMBuf, new Float32Array(p.numel));
+          be.writeBuffer(p._adamVBuf, new Float32Array(p.numel));
+        }
+      }
+    }
+
+    /** Resolve gradients (GPU or CPU) and apply gradient clipping. */
+    async resolveAndClip(loss) {
+      const be = this._backend;
+      if (this._useGPU && be) {
+        await loss.resolveGradsGPU();
+        if (this.maxNorm > 0) {
+          be.beginBatch();
+          const normBufs = this.params.map(p =>
+            p._gradGPUBuf ? be.reduce(p._gradGPUBuf, 1, p.numel, 2) : null
+          );
+          be.endBatch();
+          const normSqs = await Promise.all(
+            normBufs.map(buf => buf
+              ? be.readBuffer(buf, 1).then(d => { be.releaseBuffer(buf); return d[0]; })
+              : Promise.resolve(0)
+            )
+          );
+          const totalNorm = Math.sqrt(normSqs.reduce((a, b) => a + b, 0));
+          if (totalNorm > this.maxNorm) {
+            const clipScale = this.maxNorm / totalNorm;
+            be.beginBatch();
+            const scaledBufs = this.params.map(p => {
+              if (!p._gradGPUBuf) return null;
+              return be.elementwise(p._gradGPUBuf, null, p.numel, 3, clipScale);
+            });
+            be.endBatch();
+            this.params.forEach((p, i) => {
+              if (scaledBufs[i]) {
+                be.releaseBuffer(p._gradGPUBuf);
+                p._gradGPUBuf = scaledBufs[i];
+              }
+            });
+          }
+        }
+      } else {
+        await loss.resolveGrads();
+        if (this.maxNorm > 0) {
+          let totalNormSq = 0;
+          for (const p of this.params) {
+            if (p.grad) for (let i = 0; i < p.grad.length; i++) totalNormSq += p.grad[i] * p.grad[i];
+          }
+          const totalNorm = Math.sqrt(totalNormSq);
+          if (totalNorm > this.maxNorm) {
+            const clipScale = this.maxNorm / totalNorm;
+            for (const p of this.params) {
+              if (p.grad) for (let i = 0; i < p.grad.length; i++) p.grad[i] *= clipScale;
+            }
+          }
+        }
+      }
+    }
+
+    /** Perform one optimizer step (Adam or SGD, GPU or CPU). */
+    async step() {
+      this._step++;
+      window._adamStep = this._step;
+      const s = this._step;
+      const effLr = s <= this.warmupSteps ? this.lr * (s / this.warmupSteps) : this.lr;
+      const bc1 = 1 - Math.pow(this.beta1, s);
+      const bc2 = 1 - Math.pow(this.beta2, s);
+      const be = this._backend;
+
+      if (this._useGPU && be) {
+        be.beginBatch();
+        if (this.type === "adam") {
+          for (const p of this.params) {
+            if (!p._gradGPUBuf) continue;
+            be.adamUpdate(p._gradGPUBuf, p._adamMBuf, p._adamVBuf, p.gpuBuffer,
+              p.numel, this.beta1, this.beta2, effLr, bc1, bc2, this.eps);
+          }
+        } else {
+          for (const p of this.params) {
+            if (!p._gradGPUBuf) continue;
+            be.sgdUpdate(p._gradGPUBuf, p.gpuBuffer, p.numel, this.lr);
+          }
+        }
+        be.endBatch();
+        // Release grad buffers
+        for (const p of this.params) {
+          if (p._gradGPUBuf) { be.releaseBuffer(p._gradGPUBuf); p._gradGPUBuf = null; }
+        }
+      } else {
+        // CPU path
+        if (this.type === "adam") {
+          for (const p of this.params) {
+            if (!p.grad) continue;
+            if (!p._adam_m) p._adam_m = new Float32Array(p.data.length);
+            if (!p._adam_v) p._adam_v = new Float32Array(p.data.length);
+            const m = p._adam_m, v = p._adam_v, g = p.grad;
+            for (let i = 0; i < p.data.length; i++) {
+              m[i] = this.beta1 * m[i] + (1 - this.beta1) * g[i];
+              v[i] = this.beta2 * v[i] + (1 - this.beta2) * g[i] * g[i];
+              p.data[i] -= effLr * (m[i] / bc1) / (Math.sqrt(v[i] / bc2) + this.eps);
+            }
+            if (typeof p.markCPUDirty === "function") p.markCPUDirty();
+          }
+        } else {
+          for (const p of this.params) {
+            if (p.grad) {
+              for (let i = 0; i < p.data.length; i++) p.data[i] -= this.lr * p.grad[i];
+              if (typeof p.markCPUDirty === "function") p.markCPUDirty();
+            }
+          }
+        }
+        // Re-upload to GPU for next epoch
+        for (const p of this.params) {
+          if (p.gpuBuffer) p.toGPU();
+        }
+      }
+    }
+
+    /** Release optimizer state (GPU m/v buffers, CPU arrays). */
+    release() {
+      const be = this._backend;
+      for (const p of this.params) {
+        if (p._adamMBuf && be) { be.releaseBuffer(p._adamMBuf); p._adamMBuf = null; }
+        if (p._adamVBuf && be) { be.releaseBuffer(p._adamVBuf); p._adamVBuf = null; }
+        if (p._gradGPUBuf && be) { be.releaseBuffer(p._gradGPUBuf); p._gradGPUBuf = null; }
+        p._adam_m = null;
+        p._adam_v = null;
+      }
+    }
+  }
+
+  // --- Module system (tinygrad-style nn) ---
+
+  class Module {
+    /** Recursively collect all Tensor parameters with requiresGrad. */
+    parameters() {
+      const params = [];
+      const seen = new Set();
+      const collect = (obj) => {
+        if (seen.has(obj)) return;
+        seen.add(obj);
+        if (obj instanceof Tensor) {
+          if (obj.requiresGrad) params.push(obj);
+          return;
+        }
+        if (obj instanceof Module) {
+          for (const key of Object.keys(obj)) {
+            const val = obj[key];
+            if (val instanceof Tensor && val.requiresGrad) {
+              params.push(val);
+            } else if (val instanceof Module) {
+              collect(val);
+            } else if (Array.isArray(val)) {
+              for (const item of val) collect(item);
+            }
+          }
+        }
+      };
+      collect(this);
+      return params;
+    }
+
+    /** Return named parameter dict: { "layers.0.weight": Tensor, ... } */
+    stateDict(prefix = "") {
+      const dict = {};
+      for (const key of Object.keys(this)) {
+        const val = this[key];
+        const name = prefix ? `${prefix}.${key}` : key;
+        if (val instanceof Tensor && val.requiresGrad) {
+          dict[name] = val;
+        } else if (val instanceof Module) {
+          Object.assign(dict, val.stateDict(name));
+        } else if (Array.isArray(val)) {
+          for (let i = 0; i < val.length; i++) {
+            const item = val[i];
+            if (item instanceof Tensor && item.requiresGrad) {
+              dict[`${name}.${i}`] = item;
+            } else if (item instanceof Module) {
+              Object.assign(dict, item.stateDict(`${name}.${i}`));
+            }
+          }
+        }
+      }
+      return dict;
+    }
+
+    /** Load parameters from a named dict (matching keys from stateDict). */
+    loadStateDict(dict) {
+      const myDict = this.stateDict();
+      for (const [key, tensor] of Object.entries(myDict)) {
+        if (dict[key]) {
+          const src = dict[key];
+          const srcData = src instanceof Tensor ? src.data : src;
+          tensor.data.set(srcData);
+          tensor.markCPUDirty();
+        }
+      }
+    }
+
+    /** Load from a flat weight array (order must match parameters()). */
+    loadFlatWeights(flatWeights) {
+      const params = this.parameters();
+      let cursor = 0;
+      for (const p of params) {
+        const size = p.numel;
+        p.data.set(flatWeights.subarray(cursor, cursor + size));
+        p.markCPUDirty();
+        cursor += size;
+      }
+      return cursor;
+    }
+
+    /** Serialize all parameters to a flat Float32Array. */
+    toFlatWeights() {
+      const params = this.parameters();
+      let total = 0;
+      for (const p of params) total += p.numel;
+      const out = new Float32Array(total);
+      let cursor = 0;
+      for (const p of params) {
+        out.set(p.data, cursor);
+        cursor += p.numel;
+      }
+      return out;
+    }
+
+    /** Upload all parameters to GPU. */
+    toGPU() {
+      for (const p of this.parameters()) p.toGPU();
+      return this;
+    }
+
+    /** Release all GPU buffers. */
+    releaseGPU() {
+      for (const p of this.parameters()) p.releaseGPU();
+    }
+
+    /** Read all parameters back to CPU. */
+    async toCPU() {
+      await Promise.all(this.parameters().map(p => p.toCPU()));
+      return this;
+    }
+
+    /** Total parameter count. */
+    paramCount() {
+      let n = 0;
+      for (const p of this.parameters()) n += p.numel;
+      return n;
+    }
+  }
+
+  /** Linear layer: y = x @ weight (no bias by default). */
+  class Linear extends Module {
+    constructor(inFeatures, outFeatures, { bias = false, requiresGrad = true } = {}) {
+      super();
+      this.inFeatures = inFeatures;
+      this.outFeatures = outFeatures;
+      this.weight = new Tensor(new Float32Array(inFeatures * outFeatures), [inFeatures, outFeatures], requiresGrad);
+      if (bias) {
+        this.bias = new Tensor(new Float32Array(outFeatures), [outFeatures], requiresGrad);
+      }
+    }
+
+    forward(x) {
+      let out = x.matmul(this.weight);
+      if (this.bias) out = out.add(this.bias);
+      return out;
+    }
+  }
+
+  /** Embedding layer: lookup rows from weight table. */
+  class Embedding extends Module {
+    constructor(numEmbeddings, embeddingDim, { requiresGrad = true } = {}) {
+      super();
+      this.numEmbeddings = numEmbeddings;
+      this.embeddingDim = embeddingDim;
+      this.weight = new Tensor(new Float32Array(numEmbeddings * embeddingDim), [numEmbeddings, embeddingDim], requiresGrad);
+    }
+
+    forward(idxFlat, B, T) {
+      return Tensor.embedding(this.weight, idxFlat, B, T);
+    }
+  }
+
+  /** RMSNorm layer: normalize last dim, scale by learnable weight. */
+  class RMSNorm extends Module {
+    constructor(dim, { eps = 1e-6, requiresGrad = true } = {}) {
+      super();
+      this.dim = dim;
+      this.eps = eps;
+      this.weight = Tensor.fromArray(new Float32Array(dim).fill(1.0), [dim], requiresGrad);
+    }
+
+    forward(x) {
+      return Tensor.rmsNorm(x, this.weight, this.eps);
+    }
+  }
+
+  const nn = { Module, Linear, Embedding, RMSNorm };
+
   window.tinygradV0 = {
     Tensor,
+    Optimizer,
+    Module,
+    nn,
     crossEntropy,
     crossEntropyGPU,
     embeddingLookup,
     rmsNorm,
-    sampleBatch,
-    trainLocalV0,
-    trainLocalV0Async,
-    debugAssertGPUHead,
     f32ToF16,
     f16ToF32,
     weightsToF16Base64,

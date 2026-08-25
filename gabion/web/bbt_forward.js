@@ -4,14 +4,24 @@
 (function () {
   "use strict";
 
-  const { Tensor, crossEntropy, rmsNorm } = window.tinygradV0;
+  const { Tensor, Optimizer, nn } = window.tinygradV0;
 
-  /** Check if WebGPU backend is available. */
-  function gpu() {
-    return window.WebGPUBackend && WebGPUBackend.instance;
+  /** Single transformer block: pre-norm attention + pre-norm FFN with residuals. */
+  class TransformerBlock extends nn.Module {
+    constructor(D, H, dFF) {
+      super();
+      this.q = new nn.Linear(D, D);
+      this.k = new nn.Linear(D, D);
+      this.v = new nn.Linear(D, D);
+      this.o = new nn.Linear(D, D);
+      this.norm1 = new nn.RMSNorm(D);
+      this.gateUp = new nn.Linear(D, 2 * dFF);
+      this.norm2 = new nn.RMSNorm(D);
+      this.down = new nn.Linear(dFF, D);
+    }
   }
 
-  class BBTTransformer {
+  class BBTTransformer extends nn.Module {
     /**
      * @param {object} config
      * @param {number} config.vocabSize  - default 256
@@ -24,6 +34,7 @@
      * @param {number} config.ropeBase  - default 10000
      */
     constructor(config = {}) {
+      super();
       this.V = config.vocabSize || 256;
       this.D = config.dModel || 64;
       this.H = config.nHeads || 4;
@@ -35,6 +46,17 @@
       this.headDim = this.D / this.H;
       this.eps = 1e-6;
       this.actQuant = config.actQuant !== false; // default true
+
+      // nn layers
+      this.tokEmb = new nn.Embedding(this.V, this.D);
+      this.layers = [];
+      for (let l = 0; l < this.L; l++) {
+        this.layers.push(new TransformerBlock(this.D, this.H, this.dFF));
+      }
+      this.normF = new nn.RMSNorm(this.D);
+      if (!this.tieWeights) {
+        this.lmHead = new nn.Linear(this.D, this.V);
+      }
 
       // Precompute RoPE inverse frequencies: [headDim/2]
       const halfDim = this.headDim / 2;
@@ -51,7 +73,6 @@
           const freq = t * this._invFreq[i];
           const c = Math.cos(freq);
           const s = Math.sin(freq);
-          // Duplicate: [cos(f0), cos(f1), ..., cos(f0), cos(f1), ...]
           this._cosTable[t * this.headDim + i] = c;
           this._cosTable[t * this.headDim + halfDim + i] = c;
           this._sinTable[t * this.headDim + i] = s;
@@ -59,14 +80,14 @@
         }
       }
 
-      // GPU buffers for RoPE tables (lazy-initialized)
+      // GPU buffers for RoPE tables (lazy-initialized, non-parameter)
       this._ropeCosBuf = null;
       this._ropeSinBuf = null;
     }
 
     /** Upload RoPE cos/sin tables to GPU (once). */
     _ensureRopeGPU() {
-      const backend = gpu();
+      const backend = window.WebGPUBackend && WebGPUBackend.instance;
       if (!backend) return false;
       if (!this._ropeCosBuf) {
         this._ropeCosBuf = backend.createBufferFromData(this._cosTable);
@@ -75,122 +96,101 @@
       return true;
     }
 
-    /** Release GPU RoPE buffers. */
+    /** Release GPU buffers (parameters + RoPE tables). */
     releaseGPU() {
+      super.releaseGPU();
       if (this._ropeCosBuf) { this._ropeCosBuf.destroy(); this._ropeCosBuf = null; }
       if (this._ropeSinBuf) { this._ropeSinBuf.destroy(); this._ropeSinBuf = null; }
     }
 
     /**
-     * Deserialize flat weight array into param Tensors.
-     * Layout matches Python BBTTransformerAdapter.init_params.
-     *
-     * Returns array of Tensor objects with requiresGrad=true.
+     * Load from flat weight array (server format).
+     * Layout: tok_emb, [per-layer: q,k,v,o, n1, gate_up, n2, down], norm_f, [lm_head]
+     * Compatible with Python BBTTransformerAdapter.init_params ordering.
      */
-    deserializeParams(flatWeights, uploadToGPU = false) {
-      const params = [];
+    loadFlatWeights(flatWeights, uploadToGPU = false) {
       let cursor = 0;
-
-      const take = (shape, gpuUpload = false) => {
-        const size = shape.reduce((a, b) => a * b, 1);
-        const data = flatWeights.subarray(cursor, cursor + size);
+      const take = (tensor, gpuUpload = false) => {
+        const size = tensor.numel;
+        tensor.data.set(flatWeights.subarray(cursor, cursor + size));
+        tensor.markCPUDirty();
+        if (gpuUpload) tensor.toGPU();
         cursor += size;
-        const t = Tensor.fromArray(data, shape, true);
-        if (gpuUpload) t.toGPU();
-        return t;
       };
 
-      // tok_emb [V, D] — uploaded to GPU (used in final projection matmul)
-      params.push(take([this.V, this.D], uploadToGPU));
-
-      // Per layer: q_w, k_w, v_w, o_w [D,D], n1_w [D], gate_up_w [D, 2*dFF], n2_w [D], down_w [dFF, D]
+      take(this.tokEmb.weight, uploadToGPU);
       for (let l = 0; l < this.L; l++) {
-        params.push(take([this.D, this.D], uploadToGPU));       // q_w — GPU
-        params.push(take([this.D, this.D], uploadToGPU));       // k_w — GPU
-        params.push(take([this.D, this.D], uploadToGPU));       // v_w — GPU
-        params.push(take([this.D, this.D], uploadToGPU));       // o_w — GPU
-        params.push(take([this.D]));                            // n1_w — CPU (1D, used in rmsNorm)
-        params.push(take([this.D, 2 * this.dFF], uploadToGPU)); // gate_up_w — GPU
-        params.push(take([this.D]));                            // n2_w — CPU (1D)
-        params.push(take([this.dFF, this.D], uploadToGPU));     // down_w — GPU
+        const bl = this.layers[l];
+        take(bl.q.weight, uploadToGPU);
+        take(bl.k.weight, uploadToGPU);
+        take(bl.v.weight, uploadToGPU);
+        take(bl.o.weight, uploadToGPU);
+        take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
+        take(bl.gateUp.weight, uploadToGPU);
+        take(bl.norm2.weight);          // CPU (1D)
+        take(bl.down.weight, uploadToGPU);
       }
-
-      // norm_f_w [D] — CPU (1D)
-      params.push(take([this.D]));
-
-      // Optional lm_head_w [D, V] — GPU
+      take(this.normF.weight);
       if (!this.tieWeights) {
-        params.push(take([this.D, this.V], uploadToGPU));
+        take(this.lmHead.weight, uploadToGPU);
       }
-
-      return params;
+      return cursor;
     }
 
-    /**
-     * Serialize param Tensors back to flat Float32Array.
-     */
-    serializeParams(params) {
-      let totalSize = 0;
-      for (const p of params) totalSize += p.numel;
-      const out = new Float32Array(totalSize);
-      let cursor = 0;
-      for (const p of params) {
-        out.set(p.data, cursor);
-        cursor += p.numel;
+    /** Serialize all parameters back to flat Float32Array (server format). */
+    toFlatWeights() {
+      const parts = [];
+      parts.push(this.tokEmb.weight.data);
+      for (let l = 0; l < this.L; l++) {
+        const bl = this.layers[l];
+        parts.push(bl.q.weight.data);
+        parts.push(bl.k.weight.data);
+        parts.push(bl.v.weight.data);
+        parts.push(bl.o.weight.data);
+        parts.push(bl.norm1.weight.data);
+        parts.push(bl.gateUp.weight.data);
+        parts.push(bl.norm2.weight.data);
+        parts.push(bl.down.weight.data);
       }
+      parts.push(this.normF.weight.data);
+      if (!this.tieWeights) parts.push(this.lmHead.weight.data);
+
+      let total = 0;
+      for (const p of parts) total += p.length;
+      const out = new Float32Array(total);
+      let cursor = 0;
+      for (const p of parts) { out.set(p, cursor); cursor += p.length; }
       return out;
     }
 
     /**
-     * Forward pass: x [B, T] token ids → logits [B, T-1, V].
-     * @param {Tensor[]} params - from deserializeParams
+     * Forward pass: x [B, T] token ids -> logits [B, T-1, V].
      * @param {Int32Array} xFlat - flattened [B*T] token indices
      * @param {number} B - batch size
      * @param {number} T - sequence length
      */
-    async forward(params, xFlat, B, T, ternarize = false) {
-      let idx = 0;
-      const tokEmb = params[idx++];
-
-      // Embedding lookup: [B*T] -> [B, T, D]
-      const hasGPUBackend = !!(window.WebGPUBackend && WebGPUBackend.instance);
-      let x = hasGPUBackend
-        ? Tensor.embeddingLookup2DGPU(tokEmb, xFlat, B, T)
-        : Tensor.embeddingLookup2D(tokEmb, xFlat, B, T);
+    async forward(xFlat, B, T, ternarize = false) {
+      // Embedding lookup: [B*T] -> [B, T, D] (auto-dispatches to GPU or CPU)
+      let x = this.tokEmb.forward(xFlat, B, T);
 
       // Transformer blocks
       for (let l = 0; l < this.L; l++) {
-        const qW = params[idx++];
-        const kW = params[idx++];
-        const vW = params[idx++];
-        const oW = params[idx++];
-        const n1W = params[idx++];
-        const gateUpW = params[idx++];
-        const n2W = params[idx++];
-        const downW = params[idx++];
-        x = await this._block(x, B, T, qW, kW, vW, oW, n1W, gateUpW, n2W, downW, ternarize);
+        const bl = this.layers[l];
+        x = await this._block(x, B, T, bl, ternarize);
       }
 
-      // Final norm (CPU op — ensure x is on CPU)
+      // Final norm (rmsNorm forward is CPU, auto-readbacks if needed)
       if (x.onGPU) await x.toCPU();
-      const normFW = params[idx++];
-      x = rmsNorm(x, normFW, this.eps);
+      x = this.normF.forward(x);
 
       // LM head projection: [B, T, D] @ [D, V] -> [B, T, V]
-      let lmWeight;
-      if (this.tieWeights) {
-        lmWeight = tokEmb;  // [V, D] -> need transpose
-      } else {
-        lmWeight = params[idx++];
-      }
-
       // Reshape x to [B*T, D], matmul with [D, V] (GPU-accelerated), reshape to [B, T, V]
       const xFlat2d = x.reshape([B * T, this.D]);
       let logitsW;
       if (this.tieWeights) {
-        logitsW = lmWeight.transpose2d();  // [V,D] -> [D,V]
+        logitsW = this.tokEmb.weight.transpose2d();  // [V,D] -> [D,V]
       } else {
-        logitsW = lmWeight;  // already [D, V]
+        logitsW = this.lmHead.weight;  // already [D, V]
       }
       const logitsFlat = xFlat2d.matmul(logitsW);  // [B*T, V] — may be on GPU
       // Readback logits for CPU cross-entropy
@@ -229,20 +229,20 @@
 
     /**
      * Transformer block: pre-norm attention + pre-norm FFN with residuals.
-     * x: [B, T, D]
+     * x: [B, T, D], bl: TransformerBlock
      */
-    async _block(x, B, T, qW, kW, vW, oW, n1W, gateUpW, n2W, downW, ternarize = false) {
-      // Pre-norm (CPU) + attention (GPU matmuls + CPU ops) + residual
-      if (x.onGPU) await x.toCPU();
-      let h = rmsNorm(x, n1W, this.eps);
-      h = await this._causalSelfAttention(h, B, T, qW, kW, vW, oW, ternarize);
+    async _block(x, B, T, bl, ternarize = false) {
+      // Pre-norm + attention + residual
+      if (x.onGPU) await x.toCPU(); // rmsNorm forward is CPU
+      let h = bl.norm1.forward(x);
+      h = await this._causalSelfAttention(h, B, T, bl.q.weight, bl.k.weight, bl.v.weight, bl.o.weight, ternarize);
       if (h.onGPU) await h.toCPU();
       x = x.add(h);
 
-      // Pre-norm (CPU) + FFN (GPU matmuls + CPU ops) + residual
-      if (x.onGPU) await x.toCPU();
-      h = rmsNorm(x, n2W, this.eps);
-      h = await this._swiGLU(h, B, T, gateUpW, downW, ternarize);
+      // Pre-norm + FFN + residual
+      if (x.onGPU) await x.toCPU(); // rmsNorm forward is CPU
+      h = bl.norm2.forward(x);
+      h = await this._swiGLU(h, B, T, bl.gateUp.weight, bl.down.weight, ternarize);
       if (h.onGPU) await h.toCPU();
       x = x.add(h);
 
@@ -258,7 +258,7 @@
       const H = this.H;
       const headDim = this.headDim;
       const BH = B * H;
-      const backend = gpu();
+      const backend = window.WebGPUBackend && WebGPUBackend.instance;
 
       // Project: [B*T, D] @ [D, D] -> [B*T, D]
       const x2d = x.reshape([B * T, D]);
@@ -717,6 +717,190 @@
     }
   }
 
+  // --- Utility functions for v0 training (BBT-specific) ---
+
+  const { crossEntropy, embeddingLookup, rmsNorm } = window.tinygradV0;
+
+  function gpu() {
+    return window.WebGPUBackend && WebGPUBackend.instance;
+  }
+
+  function sampleBatch(vocabSize, batchSize, seed) {
+    const x = new Int32Array(batchSize);
+    const y = new Int32Array(batchSize);
+    let s = seed >>> 0;
+    function rnd() {
+      s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+      return s;
+    }
+    for (let i = 0; i < batchSize; i++) {
+      const t = rnd() % vocabSize;
+      x[i] = t;
+      y[i] = (t + 1) % vocabSize;
+    }
+    return { x, y };
+  }
+
+  function trainLocalV0(weights, opts) {
+    const V = opts.vocabSize || 256;
+    const D = opts.dModel || 64;
+    const embBlock = V * D;
+
+    const lr = Math.max(1e-7, opts.lr || 5e-4);
+    const epochs = Math.max(1, opts.epochs || 1);
+    const batchSize = Math.max(8, opts.batchSize || 64);
+    let seed = opts.seed >>> 0;
+
+    let lastLoss = 0.0;
+    let samples = 0;
+
+    if (weights.length >= embBlock) {
+      const eView = weights.subarray(0, embBlock);
+      const E = Tensor.fromArray(eView, [V, D], true);
+
+      for (let e = 0; e < epochs; e++) {
+        let batch = null;
+        if (opts.batch && opts.batch.x && opts.batch.y) {
+          const bx = opts.batch.x;
+          const by = opts.batch.y;
+          if (bx.length === by.length && bx.length > 0) batch = { x: bx, y: by };
+        }
+        if (!batch) batch = sampleBatch(V, batchSize, seed ^ (e * 2654435761));
+        const bsz = batch.x.length;
+
+        E.grad = null;
+        const h = embeddingLookup(E, batch.x);
+        const hn = rmsNorm(h, 1e-6);
+        const logits = hn.matmul(E.transpose2d());
+        const loss = crossEntropy(logits, batch.y);
+        loss.backward();
+
+        const g = E.grad || new Float32Array(embBlock);
+        for (let i = 0; i < embBlock; i++) E.data[i] -= lr * g[i];
+        E.markCPUDirty();
+
+        lastLoss = loss.data[0];
+        samples += bsz;
+      }
+
+      const out = new Float32Array(weights.length);
+      out.set(weights);
+      out.set(E.data, 0);
+      return { updated: out, loss: Number(lastLoss), sampleCount: samples, mode: "v0-bbt-embed" };
+    }
+
+    const block = V * V;
+    if (weights.length < block) {
+      return { updated: weights, loss: 0.0, sampleCount: 0, mode: "v0-skipped" };
+    }
+    const wView = weights.subarray(0, block);
+    const W = Tensor.fromArray(wView, [V, V], true);
+    for (let e = 0; e < epochs; e++) {
+      let batch = null;
+      if (opts.batch && opts.batch.x && opts.batch.y) {
+        const bx = opts.batch.x;
+        const by = opts.batch.y;
+        if (bx.length === by.length && bx.length > 0) batch = { x: bx, y: by };
+      }
+      if (!batch) batch = sampleBatch(V, batchSize, seed ^ (e * 2654435761));
+      const bsz = batch.x.length;
+      const X = Tensor.zeros([bsz, V], false);
+      for (let i = 0; i < bsz; i++) X.data[i * V + batch.x[i]] = 1.0;
+      W.grad = null;
+      const logits = X.matmul(W);
+      const loss = crossEntropy(logits, batch.y);
+      loss.backward();
+      const g = W.grad || new Float32Array(block);
+      for (let i = 0; i < block; i++) W.data[i] -= lr * g[i];
+      W.markCPUDirty();
+      lastLoss = loss.data[0];
+      samples += bsz;
+    }
+    const out = new Float32Array(weights.length);
+    out.set(weights);
+    out.set(W.data, 0);
+    return { updated: out, loss: Number(lastLoss), sampleCount: samples, mode: "v0-autograd-bigram" };
+  }
+
+  async function debugAssertGPUHead(tensor, label = "tensor", count = 8, tol = 1e-4) {
+    const backend = gpu();
+    if (!backend || !tensor || !tensor.gpuBuffer) return true;
+    const n = Math.max(1, Math.min(count, tensor.numel));
+    const gpuHead = await backend.readBuffer(tensor.gpuBuffer, n);
+    for (let i = 0; i < n; i++) {
+      const a = tensor.data[i];
+      const b = gpuHead[i];
+      if (Math.abs(a - b) > tol) {
+        throw new Error(`${label} gpu-sync mismatch at ${i}: cpu=${a} gpu=${b}`);
+      }
+    }
+    return true;
+  }
+
+  async function trainLocalV0Async(weights, opts) {
+    const backend = gpu();
+    if (!backend) return trainLocalV0(weights, opts);
+
+    const V = opts.vocabSize || 256;
+    const D = opts.dModel || 64;
+    const embBlock = V * D;
+
+    if (weights.length < embBlock) return trainLocalV0(weights, opts);
+
+    const lr = Math.max(1e-7, opts.lr || 5e-4);
+    const epochs = Math.max(1, opts.epochs || 1);
+    const batchSize = Math.max(8, opts.batchSize || 64);
+    let seed = opts.seed >>> 0;
+
+    let lastLoss = 0.0;
+    let samples = 0;
+
+    const eView = weights.subarray(0, embBlock);
+    const E = Tensor.fromArray(eView, [V, D], true);
+    E.toGPU();
+    if (opts.debugSync) await debugAssertGPUHead(E, "E:init");
+
+    for (let e = 0; e < epochs; e++) {
+      let batch = null;
+      if (opts.batch && opts.batch.x && opts.batch.y) {
+        const bx = opts.batch.x;
+        const by = opts.batch.y;
+        if (bx.length === by.length && bx.length > 0) batch = { x: bx, y: by };
+      }
+      if (!batch) batch = sampleBatch(V, batchSize, seed ^ (e * 2654435761));
+      const bsz = batch.x.length;
+
+      E.grad = null;
+      const h = embeddingLookup(E, batch.x);
+      const hn = rmsNorm(h, 1e-6);
+      const Et = E.transpose2d();
+      const logits = hn.matmul(Et);
+
+      if (logits.onGPU) await logits.toCPU();
+      const loss = crossEntropy(logits, batch.y);
+      loss.backward();
+      await loss.resolveGrads();
+
+      const g = E.grad || new Float32Array(embBlock);
+      for (let i = 0; i < embBlock; i++) E.data[i] -= lr * g[i];
+      E.markCPUDirty();
+
+      if (e < epochs - 1) {
+        E.toGPU();
+        if (opts.debugSync) await debugAssertGPUHead(E, `E:epoch${e + 1}`);
+      }
+
+      lastLoss = loss.data[0];
+      samples += bsz;
+    }
+
+    E.releaseGPU();
+    const out = new Float32Array(weights.length);
+    out.set(weights);
+    out.set(E.data, 0);
+    return { updated: out, loss: Number(lastLoss), sampleCount: samples, mode: "v0-bbt-embed-webgpu" };
+  }
+
   /**
    * Full BBT transformer training function.
    * Called from browser worker's handleRoundStart.
@@ -744,14 +928,15 @@
     });
 
     // Check if weights match expected size
-    const expectedSize = model._expectedParamCount();
+    const expectedSize = model.paramCount();
     if (weights.length < expectedSize) {
       // Weights don't match full transformer — fall back to v0
-      return window.tinygradV0.trainLocalV0(weights, opts);
+      return trainLocalV0(weights, opts);
     }
 
     const hasGPU = !!(window.WebGPUBackend && WebGPUBackend.instance);
-    const params = model.deserializeParams(weights, hasGPU);
+    model.loadFlatWeights(weights, hasGPU);
+    const params = model.parameters();
 
     const lr = Math.max(1e-7, opts.lr || 5e-4);
     const epochs = Math.max(1, opts.epochs || 1);
@@ -762,17 +947,13 @@
     let samples = 0;
     const backend = hasGPU ? WebGPUBackend.instance : null;
 
-    // Allocate GPU Adam state buffers (zero-initialized, persist across epochs)
-    const useAdam = (opts.optimizer || "adam") === "adam";
-    if (backend && useAdam) {
-      for (const p of params) {
-        const bytes = p.numel * 4;
-        p._adamMBuf = backend.createEmptyBuffer(bytes);
-        p._adamVBuf = backend.createEmptyBuffer(bytes);
-        backend.writeBuffer(p._adamMBuf, new Float32Array(p.numel));
-        backend.writeBuffer(p._adamVBuf, new Float32Array(p.numel));
-      }
-    }
+    // Create optimizer (handles GPU/CPU Adam/SGD state internally)
+    const opt = new Optimizer(params, {
+      lr, optimizer: opts.optimizer || "adam",
+      beta1: opts.adamBeta1 || 0.9, beta2: opts.adamBeta2 || 0.999,
+      gradClipNorm: opts.gradClipNorm != null ? opts.gradClipNorm : 1.0,
+      warmupSteps: opts.warmupSteps || 10,
+    });
 
     // Pre-compute epoch data (cheap Int32Array allocations, enables double-buffering)
     const seqBatch = (opts.sequences && Array.isArray(opts.sequences) && opts.sequences.length > 0) ? opts.sequences : null;
@@ -817,134 +998,16 @@
       }
 
       const { xFlat, yFlat, actualB } = nextData;
-      // Pre-prepare next epoch's data (overlaps with GPU compute below)
       if (e + 1 < epochs) nextData = prepEpochData(e + 1);
 
-      // Forward (async — GPU matmuls with CPU readbacks)
-      const logits = await model.forward(params, xFlat, actualB, T, ternarize);  // [B*(T-1), V]
-      const loss = backend
-        ? await crossEntropyGPU(logits, yFlat)
-        : crossEntropy(logits, yFlat);
+      // Forward + loss (auto-dispatches to GPU or CPU)
+      const logits = await model.forward(xFlat, actualB, T, ternarize);
+      const loss = await Tensor.crossEntropy(logits, yFlat);
 
-      // Backward
+      // Backward + optimizer step (handles GPU/CPU internally)
       loss.backward();
-
-      // --- Optimizer step ---
-      const useAdam = (opts.optimizer || "adam") === "adam";
-      const beta1 = opts.adamBeta1 || 0.9;
-      const beta2 = opts.adamBeta2 || 0.999;
-      const epsAdam = 1e-8;
-      window._adamStep = (window._adamStep || 0) + 1;
-      const astep = window._adamStep;
-      const warmup = Math.max(1, opts.warmupSteps || 10);
-      const effLr = astep <= warmup ? lr * (astep / warmup) : lr;
-      const bc1 = 1 - Math.pow(beta1, astep);
-      const bc2 = 1 - Math.pow(beta2, astep);
-      const maxNorm = opts.gradClipNorm != null ? opts.gradClipNorm : 1.0;
-
-      if (backend) {
-        // --- GPU path: grads stay on GPU, optimizer via compute shader ---
-        await loss.resolveGradsGPU();
-
-        // Gradient clipping: reduce sumSquares per param, read scalars, conditional scale
-        if (maxNorm > 0) {
-          backend.beginBatch();
-          const normBufs = params.map(p =>
-            p._gradGPUBuf ? backend.reduce(p._gradGPUBuf, 1, p.numel, 2) : null
-          );
-          backend.endBatch();
-          const normSqs = await Promise.all(
-            normBufs.map(buf => buf
-              ? backend.readBuffer(buf, 1).then(d => { backend.releaseBuffer(buf); return d[0]; })
-              : Promise.resolve(0)
-            )
-          );
-          const totalNorm = Math.sqrt(normSqs.reduce((a, b) => a + b, 0));
-          if (totalNorm > maxNorm) {
-            const clipScale = maxNorm / totalNorm;
-            backend.beginBatch();
-            const scaledBufs = params.map(p => {
-              if (!p._gradGPUBuf) return null;
-              return backend.elementwise(p._gradGPUBuf, null, p.numel, 3, clipScale);
-            });
-            backend.endBatch();
-            params.forEach((p, i) => {
-              if (scaledBufs[i]) {
-                backend.releaseBuffer(p._gradGPUBuf);
-                p._gradGPUBuf = scaledBufs[i];
-              }
-            });
-          }
-        }
-
-        // Optimizer update dispatch
-        backend.beginBatch();
-        if (useAdam) {
-          for (const p of params) {
-            if (!p._gradGPUBuf) continue;
-            backend.adamUpdate(
-              p._gradGPUBuf, p._adamMBuf, p._adamVBuf, p.gpuBuffer,
-              p.numel, beta1, beta2, effLr, bc1, bc2, epsAdam
-            );
-          }
-        } else {
-          for (const p of params) {
-            if (!p._gradGPUBuf) continue;
-            backend.sgdUpdate(p._gradGPUBuf, p.gpuBuffer, p.numel, lr);
-          }
-        }
-        backend.endBatch();
-
-        // Release grad buffers
-        for (const p of params) {
-          if (p._gradGPUBuf) { backend.releaseBuffer(p._gradGPUBuf); p._gradGPUBuf = null; }
-        }
-
-      } else {
-        // --- CPU path: resolve grads to CPU, clip + Adam/SGD on CPU ---
-        if (hasGPU) await loss.resolveGrads();
-
-        if (maxNorm > 0) {
-          let totalNormSq = 0;
-          for (const p of params) {
-            if (p.grad) for (let i = 0; i < p.grad.length; i++) totalNormSq += p.grad[i] * p.grad[i];
-          }
-          const totalNorm = Math.sqrt(totalNormSq);
-          if (totalNorm > maxNorm) {
-            const clipScale = maxNorm / totalNorm;
-            for (const p of params) {
-              if (p.grad) for (let i = 0; i < p.grad.length; i++) p.grad[i] *= clipScale;
-            }
-          }
-        }
-
-        if (useAdam) {
-          for (const p of params) {
-            if (!p.grad) continue;
-            if (!p._adam_m) p._adam_m = new Float32Array(p.data.length);
-            if (!p._adam_v) p._adam_v = new Float32Array(p.data.length);
-            const m = p._adam_m, v = p._adam_v, g = p.grad;
-            for (let i = 0; i < p.data.length; i++) {
-              m[i] = beta1 * m[i] + (1 - beta1) * g[i];
-              v[i] = beta2 * v[i] + (1 - beta2) * g[i] * g[i];
-              p.data[i] -= effLr * (m[i] / bc1) / (Math.sqrt(v[i] / bc2) + epsAdam);
-            }
-            if (typeof p.markCPUDirty === "function") p.markCPUDirty();
-          }
-        } else {
-          for (const p of params) {
-            if (p.grad) {
-              for (let i = 0; i < p.data.length; i++) p.data[i] -= lr * p.grad[i];
-              if (typeof p.markCPUDirty === "function") p.markCPUDirty();
-            }
-          }
-        }
-
-        // Re-upload updated weights to GPU for next epoch
-        for (const p of params) {
-          if (hasGPU && p.gpuBuffer) p.toGPU();
-        }
-      }
+      await opt.resolveAndClip(loss);
+      await opt.step();
 
       // Read and log profiling results for this epoch
       if (profiling) {
@@ -963,23 +1026,18 @@
     if (profiling) backend.disableProfiling();
 
     // Read final weights back from GPU after all epochs
-    if (backend) {
-      await Promise.all(params.map(p => p.toCPU()));
+    if (hasGPU) {
+      await model.toCPU();
     }
 
-    // Release GPU buffers + Adam state
+    // Release optimizer state + GPU buffers
+    opt.release();
     if (hasGPU) {
-      for (const p of params) {
-        if (p._adamMBuf && backend) { backend.releaseBuffer(p._adamMBuf); p._adamMBuf = null; }
-        if (p._adamVBuf && backend) { backend.releaseBuffer(p._adamVBuf); p._adamVBuf = null; }
-        if (p._gradGPUBuf && backend) { backend.releaseBuffer(p._gradGPUBuf); p._gradGPUBuf = null; }
-        p.releaseGPU();
-      }
-      model.releaseGPU(); // RoPE tables
+      model.releaseGPU();
     }
 
     // Re-serialize
-    const updated = model.serializeParams(params);
+    const updated = model.toFlatWeights();
 
     const qTag = ternarize ? "-bitlinear" : "";
     const gpuTag = hasGPU ? "-webgpu" : "";
@@ -1012,22 +1070,11 @@
     return result;
   }
 
-  // Add expected param count helper
-  BBTTransformer.prototype._expectedParamCount = function () {
-    let count = this.V * this.D;  // tok_emb
-    for (let l = 0; l < this.L; l++) {
-      count += 4 * this.D * this.D;    // q, k, v, o
-      count += this.D;                  // n1_w
-      count += this.D * 2 * this.dFF;  // gate_up
-      count += this.D;                  // n2_w
-      count += this.dFF * this.D;       // down
-    }
-    count += this.D;  // norm_f_w
-    if (!this.tieWeights) count += this.D * this.V;
-    return count;
-  };
-
   // Attach to global
   window.tinygradV0.BBTTransformer = BBTTransformer;
+  window.tinygradV0.trainLocalV0 = trainLocalV0;
+  window.tinygradV0.trainLocalV0Async = trainLocalV0Async;
   window.tinygradV0.trainLocalV1 = trainLocalV1;
+  window.tinygradV0.sampleBatch = sampleBatch;
+  window.tinygradV0.debugAssertGPUHead = debugAssertGPUHead;
 })();

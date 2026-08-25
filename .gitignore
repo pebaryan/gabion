@@ -210,3 +210,4 @@ __marimo__/
 .deps/
 .qwen/
 artifacts/
+tests/_js_bbt_fixture*.json
