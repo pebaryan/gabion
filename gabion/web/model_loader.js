@@ -6,14 +6,17 @@
   "use strict";
 
   /**
-   * Build a BBTTransformer from wire data. layerRange [start, end) selects a
-   * layer slice (shard worker: lean model, layer-only weights); null = full model.
+   * Build a BBTTransformer from wire data. opts:
+   *   layerRange [start, end) — layer slice (shard worker: lean model, layer-only weights)
+   *   nLayers — override layer count (coordinator: 0 layers, full embedding/norm/head)
    */
-  function _buildModel(data, weights, layerRange = null) {
+  function _buildModel(data, weights, opts = {}) {
     if (!data.config) throw new Error("not a gabion wire-format model");
     const c = data.config;
+    const layerRange = opts.layerRange || null;
     const start = layerRange ? layerRange[0] : 0;
-    const L = layerRange ? layerRange[1] - layerRange[0] : c.n_layers;
+    const L = layerRange ? layerRange[1] - layerRange[0]
+      : (opts.nLayers != null ? opts.nLayers : c.n_layers);
     const model = new window.tinygradV0.BBTTransformer({
       vocabSize: c.vocab_size, dModel: c.d_model, nHeads: c.n_heads,
       kvHeads: c.n_kv_heads || c.n_heads, nLayers: L,
@@ -107,11 +110,11 @@
     return await res.json();
   }
 
-  /** Coordinator model: manifest + coord.f16 (embedding + final norm [+ lm_head]). */
+  /** Coordinator model: manifest + coord.f16 (embedding + final norm [+ lm_head]), 0 layers. */
   async function loadCoordinator(manifest, f16Url) {
     const fres = await fetch(f16Url);
     if (!fres.ok) throw new Error(`fetch ${f16Url}: ${fres.status}`);
-    return _buildModel(manifest, f16ToF32(await fres.arrayBuffer()), null);
+    return _buildModel(manifest, f16ToF32(await fres.arrayBuffer()), { nLayers: 0 });
   }
 
   /** Shard worker model: manifest + shard_{i}.f16 (layer blocks only). */

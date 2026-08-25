@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gabion shard worker</title>
+<style>
+  body { background: #101418; color: #9fb0bf; font: .8rem ui-monospace, Consolas, monospace;
+         padding: 1rem; max-width: 640px; }
+  #s { color: #7fd1ff; white-space: pre-wrap; }
+  #e { color: #ff7d7d; white-space: pre-wrap; }
+  .row { margin: .2rem 0; }
+  .ok { color: #8fd98f; }
+</style>
+</head>
+<body>
+<div class="row">gabion shard worker</div>
+<div id="s">booting…</div>
+<div id="e"></div>
+
+<script src="/gabion/web/tinygrad_v0.js?v=5"></script>
+<script src="/gabion/web/webgpu_backend.js?v=5"></script>
+<script src="/gabion/web/tokenizer.js?v=5"></script>
+<script src="/gabion/web/bbt_forward.js?v=5"></script>
+<script src="/gabion/web/model_loader.js?v=5"></script>
+<script>
+"use strict";
+// Kernel set the decode path can dispatch (KV attention + matmuls + silu).
+const KERNELS = ["matmul","elementwise","reduce","softmax","rope","batched_matmul","fused_attention",
+  "softmax_backward","rope_backward","batched_transpose","rmsnorm_backward","adam_update","adamw_update",
+  "sgd_update","cross_entropy_forward","cross_entropy_backward","embedding_forward","silu_mul",
+  "silu_mul_backward","layernorm","layernorm_backward","dropout_fwd","dropout_bwd","conv2d_fwd",
+  "conv2d_bwd_dx","conv2d_bwd_dw","conv_bwd_db","convtranspose2d_fwd","convtranspose2d_bwd_dx",
+  "convtranspose2d_bwd_dw","batchnorm_stats","batchnorm_fwd","batchnorm_bwd_stats","batchnorm_bwd_dx",
+  "affine_channel","affine_channel_bwd_dw","affine_last","affine_last_bwd_dw","lstm_cell","lstm_cell_bwd",
+  "lstm_cell_bwd_dx","lstm_cell_bwd_dh","lstm_cell_bwd_dwih","lstm_cell_bwd_dwhh","kv_attention_scores",
+  "kv_attention_apply","kv_group_sum"];
+const $ = (id) => document.getElementById(id);
+const status = (s) => { $("s").textContent = s; };
+const err = (s) => { $("e").textContent = s; };
+
+async function initGPU() {
+  if (!navigator.gpu) return null;
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error("no WebGPU adapter");
+  const device = await adapter.requestDevice();
+  WebGPUBackend.init(device);
+  for (const name of KERNELS) {
+    const r = await fetch(`/gabion/web/kernels/${name}.wgsl`, { cache: "no-store" });
+    if (!r.ok) throw new Error(`kernel ${name}: HTTP ${r.status}`);
+    WebGPUBackend.registerShader(name, await r.text());
+  }
+  return WebGPUBackend.instance;
+}
+
+(async function boot() {
+  const p = new URLSearchParams(location.search);
+  const myIndex = parseInt(p.get("shard"), 10);
+  const dir = p.get("dir") || "/gabion/web/models/qwen2.5-0.5b-shards";
+  try {
+    await initGPU();
+    const manifest = await gabionLoader.loadBBTShards(dir + "/model.json");
+    const spec = manifest.shards[myIndex];
+    if (!spec) throw new Error(`manifest has no shard ${myIndex} (${manifest.shards.length} shards)`);
+    const model = await gabionLoader.loadShard(manifest, `${dir}/${spec.file}`, myIndex);
+    const state = model.initKVCache(model.T);
+    status(`WebGPU ready · shard ${myIndex} loaded: layers ${spec.layers[0]}..${spec.layers[1] - 1} ` +
+           `(${spec.n_layers} layers, ${model.D} dim, kv ${model.kvH}), KV maxLen ${state.maxLen}`);
+
+    const chan = new BroadcastChannel("gabion-shards");
+    chan.onmessage = async (ev) => {
+      const m = ev.data;
+      if (m.shard !== myIndex || (m.cmd !== "prefill" && m.cmd !== "step")) return;
+      const id = m.id;
+      const T = m.rows.length / model.D;
+      try {
+        const h = window.tinygradV0.Tensor.fromArray(m.rows, [1, T, model.D], false);
+        // startPos = this shard's own absolute position (kept across calls)
+        const outT = await model.forwardHidden(h, 1, T, state, state.pos, false, true);
+        chan.postMessage({ cmd: "result", shard: myIndex, id, rows: outT.data.slice(0) },
+          [outT.data.buffer]);
+      } catch (e) {
+        chan.postMessage({ cmd: "error", shard: myIndex, id, error: String(e && e.stack || e) });
+      }
+    };
+    chan.postMessage({ cmd: "ready", shard: myIndex, layers: spec.layers, nLayers: spec.n_layers, maxLen: state.maxLen });
+    status(`shard ${myIndex} READY — layers ${spec.layers[0]}..${spec.layers[1] - 1}, listening on channel`);
+  } catch (e) {
+    err(String(e && e.stack || e));
+  }
+})();
+</script>
+</body>
+</html>

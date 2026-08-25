@@ -5,7 +5,12 @@ import struct
 import numpy as np
 import pytest
 
-from tools.export_model import export_hf, f16_decode
+from tools.export_model import export_hf, f16_decode, main as export_main
+
+
+def _f16_from_bytes(b: bytes) -> np.ndarray:
+    """Raw little-endian f16 bytes -> float32 array (f16_decode expects base64)."""
+    return np.frombuffer(b, dtype="<u2").view(np.float16).astype(np.float32)
 
 
 def _write_st(path, tensors: dict):
@@ -185,6 +190,41 @@ def test_export_hf_no_bias_by_default(tmp_path):
     out = export_hf(tmp_path)
     assert "q_bias" not in out
     assert out["config"].get("attention_bias") is False
+
+
+def test_export_hf_shards_reconstruct(tmp_path, capsys):
+    """--out-shards slices the flat: coordinator + shards reassemble byte-exact."""
+    t = _write_hf_dir(tmp_path, D=8, heads=2, kv=2, L=4, d_ff=16, vocab=8, bias=True)
+    out = export_hf(tmp_path)
+    full = f16_decode(out["weights_b64"])
+    cfg = out["config"]
+    D, V, L = cfg["d_model"], cfg["vocab_size"], cfg["n_layers"]
+    kvD = D // cfg["n_heads"] * cfg["n_kv_heads"]
+    dFF = cfg["d_ff"]
+    per = 2 * D * D + 2 * D * kvD + 2 * D + 2 * D * dFF + dFF * D
+    tok_n = V * D
+
+    shard_dir = tmp_path / "shards"
+    rc = export_main(["--from-hf", str(tmp_path), "--out-shards", "2", str(shard_dir)])
+    assert rc == 0
+    m = json.loads((shard_dir / "model.json").read_text())
+    assert [s["layers"] for s in m["shards"] if s] == [[0, 2], [2, 4]]
+    assert m["shards"][0]["n_layers"] == 2
+    # coordinator = embedding + tail (final norm); shards = contiguous layer slices
+    coord = _f16_from_bytes((shard_dir / "coord.f16").read_bytes())
+    np.testing.assert_array_equal(coord, np.concatenate([full[:tok_n], full[tok_n + L * per:]]))
+    for s in m["shards"]:
+        if not s:
+            continue
+        a, b = s["layers"]
+        sl = _f16_from_bytes((shard_dir / s["file"]).read_bytes())
+        np.testing.assert_array_equal(sl, full[tok_n + a * per: tok_n + b * per])
+    # byte-exact reassembly of the full flat
+    rebuilt = np.concatenate([coord[:tok_n], *[_f16_from_bytes((shard_dir / s["file"]).read_bytes())
+                                               for s in m["shards"] if s], coord[tok_n:]])
+    np.testing.assert_array_equal(rebuilt, full)
+    # biases ride in the manifest untouched
+    assert len(m["q_bias"]) == L and m["config"]["attention_bias"] is True
 
 
 def test_export_hf_f16(tmp_path):

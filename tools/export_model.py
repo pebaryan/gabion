@@ -1063,7 +1063,7 @@ def fetch_gpt2_tokenizer() -> tuple[dict, list[str]]:
     return vocab, merges
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group(required=True)
@@ -1089,7 +1089,7 @@ def main() -> int:
                     help="write a sharded wire: model.json (manifest) + coord.f16 "
                          "(embedding + final norm) + shard_{i}.f16 (contiguous layer "
                          "slices of the flat) — one shard file per browser worker")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.from_gguf:
         out = export_gguf(args.from_gguf)

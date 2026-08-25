@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gabion shards — one llama, many tabs</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, Consolas, monospace; margin: 2rem auto; max-width: 860px;
+         padding: 0 1rem; background: #101418; color: #d7dde4; }
+  h1 { font-size: 1.2rem; color: #7fd1ff; }
+  .bar { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: .6rem 0; }
+  label { display: flex; gap: .4rem; align-items: center; font-size: .85rem; color: #9fb0bf; }
+  input[type=text], textarea { background: #1a2028; color: #d7dde4; border: 1px solid #2d3748;
+         border-radius: 6px; padding: .35rem .5rem; font: inherit; }
+  textarea { width: 100%; height: 3.2rem; resize: vertical; }
+  button { background: #1e6fd9; color: #fff; border: 0; border-radius: 6px; padding: .45rem 1.1rem;
+         font: inherit; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: wait; }
+  #status { font-size: .8rem; color: #7fd1ff; min-height: 1.1em; white-space: pre-wrap; }
+  #shards { font-size: .75rem; color: #9fb0bf; }
+  .ok { color: #8fd98f; } .err { color: #ff7d7d; }
+  #output { white-space: pre-wrap; word-break: break-word; background: #161c24; border: 1px solid #2d3748;
+         border-radius: 8px; padding: .9rem; min-height: 6rem; max-height: 24rem; overflow-y: auto; }
+  #stats { font-size: .8rem; color: #8fd98f; }
+</style>
+</head>
+<body>
+<h1>gabion shards — qwen2.5-0.5b split across browser tabs</h1>
+<div class="bar">
+  <label>shards dir <input type="text" id="dir" value="/gabion/web/models/qwen2.5-0.5b-shards" style="width:22rem"></label>
+  <label>tokens <input type="text" id="tokens" value="64" style="width:4rem"></label>
+  <label>temp <input type="text" id="temp" value="0.7" style="width:4rem"></label>
+  <label>top-k <input type="text" id="topk" value="40" style="width:4rem"></label>
+  <label>top-p <input type="text" id="topp" value="0.9" style="width:4rem"></label>
+  <label>seed <input type="text" id="seed" value="" placeholder="random" style="width:6rem"></label>
+</div>
+<div class="bar">
+  <label><input type="checkbox" id="chat" checked> chat format</label>
+  <label><input type="checkbox" id="stop" checked> stop at &lt;|endoftext|&gt;/&lt;|im_end|&gt;</label>
+  <button id="go">Spawn shards + Generate</button>
+</div>
+<div class="bar"><label>prompt</label>
+  <textarea id="prompt">The capital of France is</textarea>
+</div>
+<div id="shards">no shard tabs yet — click Generate to spawn them</div>
+<div id="status">booted — manifest will be fetched on Generate</div>
+<div id="output">(generation appears here)</div>
+<div id="stats"></div>
+<pre id="resultJson" hidden>{}</pre>
+
+<script src="/gabion/web/tinygrad_v0.js?v=5"></script>
+<script src="/gabion/web/webgpu_backend.js?v=5"></script>
+<script src="/gabion/web/tokenizer.js?v=5"></script>
+<script src="/gabion/web/bbt_forward.js?v=5"></script>
+<script src="/gabion/web/model_loader.js?v=5"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const out = { model: {}, shards: [], promptTokens: 0, generatedTokens: 0, text: "",
+              tokPerSec: 0, ms: 0, stopped: false, error: null };
+let busy = false;
+
+function status(s, cls) { $("status").textContent = s; $("status").className = cls || ""; }
+function setResult() { $("resultJson").textContent = JSON.stringify(out); window.__demoResult = out; }
+
+async function generate() {
+  if (busy) return;
+  busy = true; $("go").disabled = true;
+  $("output").textContent = ""; $("stats").textContent = ""; $("shards").textContent = "";
+  out.error = null;
+  const t0 = performance.now();
+  const chan = new BroadcastChannel("gabion-shards");
+  const pending = new Map();
+  let nextId = 1;
+  chan.onmessage = (ev) => {
+    const m = ev.data;
+    if (m.cmd === "result") { const p = pending.get(m.id); if (p) { pending.delete(m.id); p.resolve(m.rows); } }
+    else if (m.cmd === "error") { const p = pending.get(m.id); if (p) { pending.delete(m.id); p.reject(new Error(m.error)); } }
+  };
+  const send = (shard, rows, id) => {
+    chan.postMessage({ cmd: "prefill", shard, id, rows }, [rows.buffer]);
+    return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+  };
+  const pipeline = async (rows) => {
+    let cur = rows;
+    for (let i = 0; i < out.shards.length; i++) {
+      const id = nextId++;
+      cur = await send(i, cur, id);
+    }
+    return cur;
+  };
+
+  try {
+    const dir = $("dir").value.trim().replace(/\/$/, "");
+    const manifest = await gabionLoader.loadBBTShards(dir + "/model.json");
+    const specs = manifest.shards.filter(Boolean);
+    out.shards = specs;
+    out.model = { n_layers: manifest.config.n_layers, d_model: manifest.config.d_model,
+                  vocab: manifest.config.vocab_size, shard_count: specs.length };
+    status(`manifest: ${out.model.n_layers} layers, ${specs.length} shard files — spawning tabs…`);
+    // Spawn one tab per shard (user gesture -> popups allowed)
+    const spawned = [];
+    for (let i = 0; i < specs.length; i++) {
+      spawned.push(window.open(
+        `/gabion/web/shard_worker.html?shard=${i}&dir=${encodeURIComponent(dir)}`,
+        `gabion-shard-${i}`, "width=420,height=160"));
+    }
+    // Wait for all shards to report ready (timeout 180s)
+    const ready = new Array(specs.length).fill(false);
+    const readyWait = new Promise((resolve) => {
+      const iv = setInterval(() => { if (ready.every(Boolean)) { clearInterval(iv); resolve(); } }, 250);
+      setTimeout(() => { clearInterval(iv); resolve(); }, 180000);
+    });
+    const prevOn = chan.onmessage;
+    chan.onmessage = (ev) => {
+      const m = ev.data;
+      if (m.cmd === "ready" && m.shard != null && m.shard < specs.length) {
+        ready[m.shard] = true;
+        const seen = ready.filter(Boolean).length;
+        $("shards").textContent = `shard tabs: ${seen}/${specs.length} ready (${m.layers[0]}..${m.layers[1] - 1})…`;
+      }
+      prevOn(ev);
+    };
+    await readyWait;
+    const nReady = ready.filter(Boolean).length;
+    if (nReady < specs.length) throw new Error(`only ${nReady}/${specs.length} shard tabs became ready`);
+    $("shards").textContent = `shard tabs: ${nReady}/${specs.length} ready`;
+    status(`coordinator: loading embedding + head…`);
+
+    const coord = await gabionLoader.loadCoordinator(manifest, dir + "/coord.f16");
+    status(`coordinator loaded (${out.model.d_model} dim, 0 layers) — generating…`);
+
+    const maxNew = Math.max(1, Math.min(512, parseInt($("tokens").value, 10) || 64));
+    const temp = parseFloat($("temp").value);
+    const topK = Math.max(0, parseInt($("topk").value, 10) || 0);
+    const topP = parseFloat($("topp").value);
+    let rng = null;
+    const seedTxt = $("seed").value.trim();
+    if (seedTxt !== "") {
+      let s = 0;
+      for (let i = 0; i < seedTxt.length; i++) s = (Math.imul(31, s) + seedTxt.charCodeAt(i)) | 0;
+      rng = () => {
+        s = (s + 0x6D2B79F5) | 0;
+        let t = Math.imul(s ^ (s >>> 15), 1 | s);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    let prompt = $("prompt").value;
+    if ($("chat").checked && coord.chatTemplate) {
+      prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+             + "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    }
+    const ids = coord.tokenize(prompt);
+    out.promptTokens = ids.length;
+
+    let stopTokens = [];
+    if ($("stop").checked && coord.tokenizer) {
+      const v = coord.tokenizer.vocab;
+      if (v["<|endoftext|>"] !== undefined) stopTokens.push(v["<|endoftext|>"]);
+      if ($("chat").checked && v["<|im_end|>"] !== undefined) stopTokens.push(v["<|im_end|>"]);
+    }
+
+    const tailLogits = async (hRow) => {
+      const hT = window.tinygradV0.Tensor.fromArray(hRow, [1, 1, coord.D], false);
+      const normed = coord.normF.forward(hT);
+      const logitsT = normed.reshape([1, coord.D]).matmul(coord.tokEmb.weight.transpose2d());
+      return Float32Array.from((await logitsT.toCPU()).data);
+    };
+
+    // Prefill: embed the whole prompt, run the shard pipeline once
+    const embT = coord.tokEmb.forward(new Int32Array(ids), 1, ids.length);
+    const preRows = Float32Array.from((await embT.toCPU()).data);
+    status(`prefill: ${ids.length} tokens through ${specs.length} shards…`);
+    const preOut = await pipeline(preRows);
+    const lg = await tailLogits(preOut.subarray((ids.length - 1) * coord.D));
+    let tok = coord._sample(lg, temp, topK, topP, rng || undefined);
+
+    // Decode loop
+    const gen = [];
+    let stopped = false;
+    for (let i = 0; i < maxNew; i++) {
+      gen.push(tok);
+      if (stopTokens.indexOf(tok) !== -1) { stopped = true; break; }
+      if (i === maxNew - 1) break;
+      const emb = coord.tokEmb.forward(new Int32Array([tok]), 1, 1);
+      const row = Float32Array.from((await emb.toCPU()).data);
+      const o = await pipeline(row);
+      tok = coord._sample(await tailLogits(o), temp, topK, topP, rng || undefined);
+      const ms = performance.now() - t0;
+      $("stats").textContent = `${gen.length}/${maxNew} tokens · ${(gen.length / (ms / 1000)).toFixed(2)} tok/s`;
+    }
+    out.stopped = stopped;
+    const ms = performance.now() - t0;
+    const display = gen.length && stopTokens.indexOf(gen[gen.length - 1]) !== -1 ? gen.slice(0, -1) : gen;
+    out.text = coord.tokenizer ? coord.tokenizer.decode(Array.from(display)) : "";
+    out.tokenIds = Array.from(gen).slice(0, 64);
+    out.generatedTokens = gen.length;
+    out.tokPerSec = gen.length / (ms / 1000);
+    out.ms = ms;
+    $("output").textContent = out.text;
+    $("stats").textContent = `${out.generatedTokens} tokens in ${(ms / 1000).toFixed(1)}s · ` +
+      `${out.tokPerSec.toFixed(2)} tok/s · ${out.stopped ? "stopped at boundary · " : ""}` +
+      `${specs.length} shard tabs · prompt ${out.promptTokens} tok`;
+    status("done");
+  } catch (e) {
+    out.error = String(e && e.stack || e);
+    status("error: " + out.error, "err");
+    $("output").textContent = out.error;
+  }
+  setResult();
+  busy = false; $("go").disabled = false;
+}
+
+$("go").onclick = generate;
+const p = new URLSearchParams(location.search);
+if (p.get("auto")) {
+  if (p.get("dir")) $("dir").value = p.get("dir");
+  if (p.get("prompt") != null) $("prompt").value = p.get("prompt");
+  if (p.get("tokens")) $("tokens").value = p.get("tokens");
+  if (p.get("temp")) $("temp").value = p.get("temp");
+  if (p.get("topk")) $("topk").value = p.get("topk");
+  if (p.get("topp")) $("topp").value = p.get("topp");
+  if (p.get("seed")) $("seed").value = p.get("seed");
+  if (p.get("chat") === "0") $("chat").checked = false;
+  if (p.get("stop") === "0") $("stop").checked = false;
+  generate();
+}
+</script>
+</body>
+</html>
