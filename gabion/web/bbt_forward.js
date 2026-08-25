@@ -911,8 +911,10 @@
           x = x.add(o);
           chk("layer" + l + ".x", x.data);
 
-          // FFN + residual
+          // FFN + residual — GPU-resident when the FFN weights are on GPU
+          // (gate_up/down are the dominant per-layer CPU cost: ~30ms each)
           let h2 = bl.norm2.forward(x);
+          if (backend && bl.gateUp.weight.onGPU) h2 = h2.toGPU();
           h2 = await this._swiGLU(h2, 1, 1, bl.gateUp.weight, bl.down.weight, ternarize);
           if (h2.onGPU) await h2.toCPU();
           chk("layer" + l + ".h2", h2.data);

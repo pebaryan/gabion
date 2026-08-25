@@ -49,16 +49,18 @@
 <div id="stats"></div>
 <pre id="resultJson" hidden>{}</pre>
 
-<script src="/gabion/web/tinygrad_v0.js?v=8"></script>
-<script src="/gabion/web/webgpu_backend.js?v=8"></script>
-<script src="/gabion/web/tokenizer.js?v=8"></script>
-<script src="/gabion/web/bbt_forward.js?v=8"></script>
-<script src="/gabion/web/model_loader.js?v=8"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=10"></script>
+<script src="/gabion/web/webgpu_backend.js?v=10"></script>
+<script src="/gabion/web/tokenizer.js?v=10"></script>
+<script src="/gabion/web/bbt_forward.js?v=10"></script>
+<script src="/gabion/web/model_loader.js?v=10"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 const out = { model: {}, shards: [], promptTokens: 0, generatedTokens: 0, text: "",
-              tokPerSec: 0, ms: 0, stopped: false, error: null };
+              tokPerSec: 0, ms: 0, stopped: false, error: null,
+              stageMs: { load: 0, ready: 0, prefill: 0, decode: 0 },
+              perTokenMs: [], hopMs: [], embedMs: [], headMs: [] };
 let busy = false;
 
 function status(s, cls) { $("status").textContent = s; $("status").className = cls || ""; }
@@ -85,16 +87,20 @@ async function generate() {
     return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
   };
   const pipeline = async (rows) => {
+    const hopMs = [];
     let cur = rows;
     for (let i = 0; i < out.shards.length; i++) {
       const id = nextId++;
+      const h0 = performance.now();
       cur = await send(i, cur, id);
+      hopMs.push(performance.now() - h0);
     }
-    return cur;
+    return { rows: cur, hopMs };
   };
 
   try {
     const dir = $("dir").value.trim().replace(/\/$/, "");
+    const tL0 = performance.now();
     const manifest = await gabionLoader.loadBBTShards(dir + "/model.json");
     const specs = manifest.shards.filter(Boolean);
     out.shards = specs;
@@ -130,13 +136,17 @@ async function generate() {
       }
       prevOn(ev);
     };
+    const tR0 = performance.now();
     await readyWait;
     const nReady = ready.filter(Boolean).length;
     if (nReady < specs.length) throw new Error(`only ${nReady}/${specs.length} shard workers became ready`);
+    out.stageMs.ready = +(performance.now() - tR0).toFixed(0);
     log(`all ${specs.length} shard workers ready`);
     status(`coordinator: loading embedding + head…`);
 
     const coord = await gabionLoader.loadCoordinator(manifest, dir + "/coord.f16");
+    out.stageMs.load = +(performance.now() - tL0).toFixed(0);
+    out.stageMs.ready = 0;
     status(`coordinator loaded (${out.model.d_model} dim, 0 layers) — generating…`);
 
     const maxNew = Math.max(1, Math.min(512, parseInt($("tokens").value, 10) || 64));
@@ -172,17 +182,25 @@ async function generate() {
     }
 
     const tailLogits = async (hRow) => {
+      const t0l = performance.now();
       const hT = window.tinygradV0.Tensor.fromArray(hRow, [1, 1, coord.D], false);
       const normed = coord.normF.forward(hT);
       const logitsT = normed.reshape([1, coord.D]).matmul(coord.tokEmb.weight.transpose2d());
-      return Float32Array.from((await logitsT.toCPU()).data);
+      const r = Float32Array.from((await logitsT.toCPU()).data);
+      out.headMs.push(performance.now() - t0l);
+      return r;
     };
 
     // Prefill: embed the whole prompt, run the shard pipeline once
+    const tEmb0 = performance.now();
     const embT = coord.tokEmb.forward(new Int32Array(ids), 1, ids.length);
     const preRows = Float32Array.from((await embT.toCPU()).data);
+    out.embedMs.push(performance.now() - tEmb0);
     status(`prefill: ${ids.length} tokens through ${specs.length} shards…`);
-    const preOut = await pipeline(preRows);
+    const tPre0 = performance.now();
+    const { rows: preOut, hopMs: preHop } = await pipeline(preRows);
+    out.stageMs.prefill = performance.now() - tPre0;
+    out.hopMs.push(...preHop.map(h => +h.toFixed(1)));
     const lg = await tailLogits(preOut.subarray((ids.length - 1) * coord.D));
     let tok = coord._sample(lg, temp, topK, topP, rng || undefined);
 
@@ -193,10 +211,15 @@ async function generate() {
       gen.push(tok);
       if (stopTokens.indexOf(tok) !== -1) { stopped = true; break; }
       if (i === maxNew - 1) break;
+      const tTok0 = performance.now();
+      const tEmb = performance.now();
       const emb = coord.tokEmb.forward(new Int32Array([tok]), 1, 1);
       const row = Float32Array.from((await emb.toCPU()).data);
-      const o = await pipeline(row);
+      out.embedMs.push(performance.now() - tEmb);
+      const { rows: o, hopMs: hop } = await pipeline(row);
+      out.hopMs.push(...hop.map(h => +h.toFixed(1)));
       tok = coord._sample(await tailLogits(o), temp, topK, topP, rng || undefined);
+      out.perTokenMs.push(+(performance.now() - tTok0).toFixed(1));
       const ms = performance.now() - t0;
       $("stats").textContent = `${gen.length}/${maxNew} tokens · ${(gen.length / (ms / 1000)).toFixed(2)} tok/s`;
     }

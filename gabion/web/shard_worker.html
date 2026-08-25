@@ -17,11 +17,11 @@
 <div id="s">booting…</div>
 <div id="e"></div>
 
-<script src="/gabion/web/tinygrad_v0.js?v=8"></script>
-<script src="/gabion/web/webgpu_backend.js?v=8"></script>
-<script src="/gabion/web/tokenizer.js?v=8"></script>
-<script src="/gabion/web/bbt_forward.js?v=8"></script>
-<script src="/gabion/web/model_loader.js?v=8"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=10"></script>
+<script src="/gabion/web/webgpu_backend.js?v=10"></script>
+<script src="/gabion/web/tokenizer.js?v=10"></script>
+<script src="/gabion/web/bbt_forward.js?v=10"></script>
+<script src="/gabion/web/model_loader.js?v=10"></script>
 <script>
 "use strict";
 // Kernel set the decode path can dispatch (KV attention + matmuls + silu).
@@ -63,6 +63,9 @@ async function initGPU() {
     const spec = manifest.shards[myIndex];
     if (!spec) throw new Error(`manifest has no shard ${myIndex} (${manifest.shards.length} shards)`);
     const model = await gabionLoader.loadShard(manifest, `${dir}/${spec.file}`, myIndex);
+ // GPU-resident FFN: upload gate_up/down (the dominant per-layer matmuls);
+ // forwardHidden pushes the FFN input to GPU and _swiGLU stays on GPU.
+ for (const l of model.layers) { l.gateUp.weight.toGPU(); l.down.weight.toGPU(); }
     const state = model.initKVCache(model.T);
     status(`WebGPU ready · shard ${myIndex} loaded: layers ${spec.layers[0]}..${spec.layers[1] - 1} ` +
            `(${spec.n_layers} layers, ${model.D} dim, kv ${model.kvH}), KV maxLen ${state.maxLen}`);
@@ -73,11 +76,12 @@ async function initGPU() {
       if (m.run !== runId || m.shard !== myIndex || (m.cmd !== "prefill" && m.cmd !== "step")) return;
       const id = m.id;
       const T = m.rows.length / model.D;
+      const w0 = performance.now();
       try {
         const h = window.tinygradV0.Tensor.fromArray(m.rows, [1, T, model.D], false);
         // startPos = this shard's own absolute position (kept across calls)
         const outT = await model.forwardHidden(h, 1, T, state, state.pos, false, true);
-        chan.postMessage({ cmd: "result", run: runId, shard: myIndex, id, rows: outT.data.slice(0) },
+        chan.postMessage({ cmd: "result", run: runId, shard: myIndex, id, rows: outT.data.slice(0), ms: performance.now() - w0 },
           [outT.data.buffer]);
       } catch (e) {
         chan.postMessage({ cmd: "error", run: runId, shard: myIndex, id, error: String(e && e.stack || e) });
