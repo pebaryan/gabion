@@ -49,14 +49,30 @@
 <div id="stats"></div>
 <pre id="resultJson" hidden>{}</pre>
 
-<script src="/gabion/web/tinygrad_v0.js?v=10"></script>
-<script src="/gabion/web/webgpu_backend.js?v=10"></script>
-<script src="/gabion/web/tokenizer.js?v=10"></script>
-<script src="/gabion/web/bbt_forward.js?v=10"></script>
-<script src="/gabion/web/model_loader.js?v=10"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=11"></script>
+<script src="/gabion/web/webgpu_backend.js?v=11"></script>
+<script src="/gabion/web/tokenizer.js?v=11"></script>
+<script src="/gabion/web/bbt_forward.js?v=11"></script>
+<script src="/gabion/web/model_loader.js?v=11"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+// Coordinator-side GPU: only the lm_head matmul needs acceleration
+// ([1,896]x[896,151936] ≈ 900ms CPU per token). Embedding lookup is trivial.
+let coordGPU = null;
+async function initCoordGPU() {
+  if (coordGPU || !navigator.gpu) return coordGPU;
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return (coordGPU = false);
+    const device = await adapter.requestDevice();
+    WebGPUBackend.init(device);
+    const r = await fetch("/gabion/web/kernels/matmul.wgsl", { cache: "no-store" });
+    if (r.ok) WebGPUBackend.registerShader("matmul", await r.text());
+    coordGPU = WebGPUBackend.instance;
+  } catch (e) { coordGPU = false; }
+  return coordGPU;
+}
 const out = { model: {}, shards: [], promptTokens: 0, generatedTokens: 0, text: "",
               tokPerSec: 0, ms: 0, stopped: false, error: null,
               stageMs: { load: 0, ready: 0, prefill: 0, decode: 0 },
@@ -147,6 +163,15 @@ async function generate() {
     const coord = await gabionLoader.loadCoordinator(manifest, dir + "/coord.f16");
     out.stageMs.load = +(performance.now() - tL0).toFixed(0);
     out.stageMs.ready = 0;
+    // Upload the embedding to the coordinator's GPU for the lm_head matmul
+    // (cache the transposed head once — the CPU transpose is ~400ms)
+    await initCoordGPU();
+    if (coordGPU) {
+      coord.tokEmb.weight.toGPU();
+      coord._headW = coord.tokEmb.weight.transpose2d();
+    } else {
+      coord._headW = coord.tokEmb.weight.transpose2d();
+    }
     status(`coordinator loaded (${out.model.d_model} dim, 0 layers) — generating…`);
 
     const maxNew = Math.max(1, Math.min(512, parseInt($("tokens").value, 10) || 64));
@@ -185,7 +210,7 @@ async function generate() {
       const t0l = performance.now();
       const hT = window.tinygradV0.Tensor.fromArray(hRow, [1, 1, coord.D], false);
       const normed = coord.normF.forward(hT);
-      const logitsT = normed.reshape([1, coord.D]).matmul(coord.tokEmb.weight.transpose2d());
+      const logitsT = normed.reshape([1, coord.D]).matmul(coord._headW);
       const r = Float32Array.from((await logitsT.toCPU()).data);
       out.headMs.push(performance.now() - t0l);
       return r;
