@@ -1673,6 +1673,10 @@
       });
     }
 
+    square() {
+      return this.mul(this);
+    }
+
     transpose3d() {
       if (this.shape.length !== 3) throw new Error(`transpose3d requires 3D, got ${this.shape}`);
       const [B, m, n] = this.shape;
@@ -3129,6 +3133,17 @@
     }
   }
 
+  class LatentUNet extends Module {
+    constructor(latentDim = 4, baseChannels = 4, timeDim = 16, opts = {}) {
+      super();
+      // latent UNet operates on 4x4 latent space — smaller chMults to keep tiny
+      this.unet = new UNet(latentDim, baseChannels, timeDim, { chMults: [1, 1], ...opts });
+    }
+    forward(z, tEmb) {
+      return this.unet.forward(z, tEmb);
+    }
+  }
+
   class DDPMSampler {
     constructor(betas) {
       this.betas = Float32Array.from(betas);
@@ -3140,17 +3155,22 @@
         this.alphaBars[i] = prod;
       }
     }
-    /** One DDPM step: x_{t-1} = (1/sqrt(alpha_t))*(x_t - beta_t/sqrt(1-alphaBar_t)*eps) (+ sigma*z if t>0, z=0 for deterministic test) */
-    step(x, t, eps) {
+    /** One DDPM step: x_{t-1} = (1/sqrt(alpha_t))*(x_t - beta_t/sqrt(1-alphaBar_t)*eps) (+ sigma*z if t>0) */
+    step(x, t, eps, z = null) {
       const beta = this.betas[t];
       const alpha = this.alphas[t];
       const alphaBar = this.alphaBars[t];
       const coef1 = 1 / Math.sqrt(alpha);
       const coef2 = beta / Math.sqrt(1 - alphaBar);
-      // x - coef2*eps
       const scaledEps = eps.scale(coef2);
       const sub = x.sub(scaledEps);
-      return sub.scale(coef1);
+      let out = sub.scale(coef1);
+      if (z !== null && z !== undefined && t > 0) {
+        const alphaBarPrev = t > 0 ? this.alphaBars[t - 1] : 1.0;
+        const sigma = Math.sqrt(beta * (1 - alphaBarPrev) / (1 - alphaBar));
+        out = out.add(z.scale(sigma));
+      }
+      return out;
     }
     /** Full sample loop: x_T -> x_0 using unet predictions. Deterministic (z=0). */
     sample(unet, xT, timesteps, tEmbs) {
@@ -3162,6 +3182,28 @@
         x = this.step(x, t, eps);
       }
       return x;
+    }
+  }
+
+  class DDIMSampler extends DDPMSampler {
+    /** DDIM step: deterministic when eta=0, stochastic otherwise */
+    step(x, t, eps, { eta = 0.0, z = null } = {}) {
+      const alphaBar = this.alphaBars[t];
+      const alphaBarPrev = t > 0 ? this.alphaBars[t - 1] : 1.0;
+      const alpha = this.alphas[t];
+      // predict x0
+      const sqrtAlphaBar = Math.sqrt(alphaBar);
+      const sqrtOneMinusAlphaBar = Math.sqrt(1 - alphaBar);
+      // x0_pred = (x - sqrt(1-abar)*eps) / sqrt(abar)
+      const x0Pred = x.sub(eps.scale(sqrtOneMinusAlphaBar)).scale(1 / sqrtAlphaBar);
+      const sigma = eta * Math.sqrt((1 - alphaBarPrev) / (1 - alphaBar)) * Math.sqrt(1 - alphaBar / alphaBarPrev);
+      const sqrtOneMinusAlphaBarPrev = Math.sqrt(1 - alphaBarPrev - sigma * sigma);
+      // dir = sqrt(1 - abarPrev - sigma^2) * eps
+      let out = x0Pred.scale(Math.sqrt(alphaBarPrev)).add(eps.scale(sqrtOneMinusAlphaBarPrev));
+      if (z !== null && z !== undefined && eta > 0 && t > 0) {
+        out = out.add(z.scale(sigma));
+      }
+      return out;
     }
   }
 
@@ -3484,6 +3526,7 @@
     UNet,
     VAEEncoder,
     VAEDecoder,
+    LatentUNet,
     VAE,
   };
   const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD, LAMB, LARS, Muon };
@@ -3502,6 +3545,8 @@
     LARS,
     Muon,
     DDPMSampler,
+    DDIMSampler,
+    LatentUNet,
     VAEEncoder,
     VAEDecoder,
     VAE,

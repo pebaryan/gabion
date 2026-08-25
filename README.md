@@ -34,6 +34,7 @@ Reference it as `module.path:ClassName`.
 
 Built-ins:
 - `gabion.user_models.linear:LinearAdapter`
+- Diffusion tiny (pixel DDPM + VAE 8x8→4x4 latent, `UNet`/`LatentUNet`/`VAE`, `DDPM`/`DDIM` samplers) verified vs tinygrad 0.14 in `tests/js_nn_optim_smoke`
 - `gabion.user_models.mnist_softmax:MnistSoftmaxAdapter`
 - `gabion.user_models.bbt_transformer:BBTTransformerAdapter`
 

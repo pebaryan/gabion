@@ -276,6 +276,11 @@ const sampSampler = new tg.DDPMSampler(sampBetas);
 const sampX = Tensor.fromArray(fixture.samp_x, [2,2,2,2], false);
 const sampEps = Tensor.fromArray(fixture.samp_eps, [2,2,2,2], false);
 const sampOut = sampSampler.step(sampX, fixture.samp_t, sampEps);
+const sampZ = Tensor.fromArray(fixture.samp_z, [2,2,2,2], false);
+const sampOutStoch = sampSampler.step(sampX, fixture.samp_t, sampEps, sampZ);
+const ddimSampler = new tg.DDIMSampler(sampBetas);
+const ddimOutEta0 = ddimSampler.step(sampX, fixture.samp_t, sampEps, {eta:0.0, z:sampZ});
+const ddimOutEta1 = ddimSampler.step(sampX, fixture.samp_t, sampEps, {eta:1.0, z:sampZ});
 
 // VAE tiny forward
 const vae = new tg.nn.VAE(2, 4, 4, { numGroups: 2 });
@@ -319,12 +324,56 @@ const vaeEps = Tensor.fromArray(fixture.vae_eps, [2,4,4,4], false);
 const vaeOut = vae.forward(vaeX, vaeEps);
 const vaeDiff = vaeOut.recon.sub(vaeX);
 const vaeLoss = vaeDiff.mul(vaeDiff).mean();
+// VAE KL: -0.5 * mean(sum(1+logvar - mu^2 - exp(logvar), axis=1))
+const vaeOnes = Tensor.fromArray(new Float32Array(vaeOut.logvar.numel).fill(1), vaeOut.logvar.shape, false);
+const vaeMuSq = vaeOut.mu.square();
+const vaeExpLogvar = vaeOut.logvar.exp();
+const vaeKlPer = vaeOnes.add(vaeOut.logvar).sub(vaeMuSq).sub(vaeExpLogvar);
+const vaeKl = vaeKlPer.sum([1]).scale(-0.5).mean();
+const vaeTotalLoss = vaeLoss.add(vaeKl.scale(0.0005));
 vaeLoss.grad = new Float32Array([1]);
 {
   const topo=[];const seen=new Set();const build=(tt)=>{if(seen.has(tt))return;seen.add(tt);for(const q of tt._parents) build(q);topo.push(tt);};
   build(vaeLoss);
   for(let i=topo.length-1;i>=0;i--){const tt=topo[i];if(tt.grad===null&&!tt._gradGPUBuf&&!tt._pendingGradBuf) continue;const g=tt.grad||new Float32Array(tt.numel).fill(0);tt._backward(g, tt._gradGPUBuf||tt._pendingGradBuf||null);}
 }
+
+// latent e2e after VAE
+const latentStem = new tg.nn.Conv2d(4,4,3,{padding:1,bias:false});
+latentStem.weight.data.set(Float32Array.from(fixture.latent_stem_w));
+const latentD0Gn1 = new tg.nn.GroupNorm(2,4,{eps:1e-5}); latentD0Gn1.weight.data.set(Float32Array.from(fixture.latent_d0_gn1w)); latentD0Gn1.bias.data.set(Float32Array.from(fixture.latent_d0_gn1b));
+const latentD0C1 = new tg.nn.Conv2d(4,4,3,{padding:1,bias:false}); latentD0C1.weight.data.set(Float32Array.from(fixture.latent_d0_c1w));
+const latentD0Gn2 = new tg.nn.GroupNorm(2,4,{eps:1e-5}); latentD0Gn2.weight.data.set(Float32Array.from(fixture.latent_d0_gn2w)); latentD0Gn2.bias.data.set(Float32Array.from(fixture.latent_d0_gn2b));
+const latentD0C2 = new tg.nn.Conv2d(4,4,3,{padding:1,bias:false}); latentD0C2.weight.data.set(Float32Array.from(fixture.latent_d0_c2w));
+const latentD0Mlp = Float32Array.from(fixture.latent_d0_mlp);
+const latentDown0 = new tg.nn.Conv2d(4,4,3,{stride:2,padding:1,bias:false}); latentDown0.weight.data.set(Float32Array.from(fixture.latent_down0w));
+const latentM1Gn1 = new tg.nn.GroupNorm(2,4,{eps:1e-5}); latentM1Gn1.weight.data.set(Float32Array.from(fixture.latent_m1_gn1w)); latentM1Gn1.bias.data.set(Float32Array.from(fixture.latent_m1_gn1b));
+const latentM1C1 = new tg.nn.Conv2d(4,4,3,{padding:1,bias:false}); latentM1C1.weight.data.set(Float32Array.from(fixture.latent_m1_c1w));
+const latentM1Gn2 = new tg.nn.GroupNorm(2,4,{eps:1e-5}); latentM1Gn2.weight.data.set(Float32Array.from(fixture.latent_m1_gn2w)); latentM1Gn2.bias.data.set(Float32Array.from(fixture.latent_m1_gn2b));
+const latentM1C2 = new tg.nn.Conv2d(4,4,3,{padding:1,bias:false}); latentM1C2.weight.data.set(Float32Array.from(fixture.latent_m1_c2w));
+const latentM1Mlp = Float32Array.from(fixture.latent_m1_mlp);
+const latentUp0 = new tg.nn.ConvTranspose2d(4,4,3,{stride:2,padding:1,outputPadding:1,bias:false}); latentUp0.weight.data.set(Float32Array.from(fixture.latent_up0w));
+const latentOutGn = new tg.nn.GroupNorm(2,4,{eps:1e-5}); latentOutGn.weight.data.set(Float32Array.from(fixture.latent_out_gnw)); latentOutGn.bias.data.set(Float32Array.from(fixture.latent_out_gnb));
+const latentOutC = new tg.nn.Conv2d(4,4,3,{padding:1,bias:true}); latentOutC.weight.data.set(Float32Array.from(fixture.latent_out_cw)); latentOutC.bias.data.set(Float32Array.from(fixture.latent_out_cb));
+function latentRB(xt, tt, gn1, c1, gn2, c2, mlp){
+  let h = gn1.forward(xt).silu();
+  h = c1.forward(h);
+  h = gn2.forward(h).silu();
+  h = c2.forward(h);
+  const proj = tt.matmul(new Tensor(mlp, [16,4], false));
+  return h.add(xt).addChannelMap(proj);
+}
+const latentZ = vaeOut.z;
+const latentT = Tensor.fromArray(fixture.unet_t, [2,16], false);
+let latentH = latentStem.forward(latentZ);
+latentH = latentRB(latentH, latentT, latentD0Gn1, latentD0C1, latentD0Gn2, latentD0C2, latentD0Mlp);
+latentH = latentDown0.forward(latentH);
+latentH = latentRB(latentH, latentT, latentM1Gn1, latentM1C1, latentM1Gn2, latentM1C2, latentM1Mlp);
+latentH = latentUp0.forward(latentH);
+latentH = latentOutGn.forward(latentH).silu();
+latentH = latentOutC.forward(latentH);
+const latentDenoised = latentH;
+const latentRecon = vae.decoder.forward(latentDenoised);
 
 const unetNoise = Tensor.fromArray(fixture.unet_noise, [2,2,8,8], false);
 const unetDiff = unetY.sub(unetNoise);
@@ -372,9 +421,17 @@ const report = {
   vae_z: maxAbs(vaeOut.z.data, fixture.vae_z),
   vae_loss: vaeLoss.data[0],
   vae_loss_err: Math.abs(vaeLoss.data[0] - fixture.vae_loss),
+  vae_kl: vaeKl.data[0],
+  vae_kl_err: Math.abs(vaeKl.data[0] - fixture.vae_kl),
+  vae_total: vaeTotalLoss.data[0],
+  vae_total_err: Math.abs(vaeTotalLoss.data[0] - fixture.vae_total_loss),
   vae_g_stem: maxAbs(vae.encoder.stem.weight.grad, fixture.vae_g_stem),
   vae_g_out: maxAbs(vae.decoder.outConv.weight.grad, fixture.vae_g_out),
   samp_fwd: maxAbs(sampOut.data, fixture.samp_out),
+  samp_stoch: maxAbs(sampOutStoch.data, fixture.samp_out_stoch),
+  ddim_eta0: maxAbs(ddimOutEta0.data, fixture.ddim_out_eta0),
+  ddim_eta1: maxAbs(ddimOutEta1.data, fixture.ddim_out_eta1),
+  latent_recon: maxAbs(latentRecon.data, fixture.latent_recon),
   unet_fwd: maxAbs(unetY.data, fixture.unet_y),
   unet_loss: unetLoss.data[0],
   unet_loss_err: Math.abs(unetLoss.data[0] - fixture.unet_loss),

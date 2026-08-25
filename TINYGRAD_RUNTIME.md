@@ -135,3 +135,13 @@ for d in ALL_DEVICES:
     except Exception as e:
         print(f"{d} FAIL -> {type(e).__name__}: {e}")
 ```
+## JS Diffusion Smoke (tinygrad 0.14 parity)
+
+Tiny pixel DDPM (UNet 2->4->8 UNet, 8x8) + VAE (8x8->4x4, mu/logvar 1x1, reparam, KL) + LatentUNet (4ch latent) verified in `tests/js_nn_optim_smoke.py/.mjs` via vm sandbox:
+- UNet fwd 4e-7, unet_loss 1e-7, sampler deterministic 2e-7, stochastic sigma*z 2e-7, DDIM eta0/eta1 2e-7
+- VAE recon/mu/logvar/z 3-7e-7, vae_loss 1e-7, vae_kl 0 (exact), vae_total 1e-7, latent_recon 7e-7
+- ResBlock/SpatialAttention 1e-6; all <1e-4
+
+Run:
+`unset CPU CUDA WEBGPU METAL CL AMD NV; export DEV=CPU CC="C:/Program Files/LLVM/bin/clang.exe" PATH="C:/Program Files/LLVM/bin:$PATH" PYTHONPATH=D:/code/gabion; C:/Users/aryan/miniconda3/envs/p311/python.exe tests/js_nn_optim_smoke.py`
+

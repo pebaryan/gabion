@@ -361,7 +361,26 @@ def build_fixture() -> dict:
     samp_scaled = (samp_eps.astype(np.float64) * float(samp_coef2)).astype(np.float32)
     samp_sub = (samp_x.astype(np.float64) - samp_scaled.astype(np.float64)).astype(np.float32)
     samp_out = (samp_sub.astype(np.float64) * float(samp_coef1)).astype(np.float32)
-
+    # stochastic DDPM (sigma*z)
+    samp_z = rng.normal(0, 1, size=(2,2,2,2)).astype(np.float32)
+    samp_alphaBarPrev = np.float32(samp_alphaBars[samp_t-1]) if samp_t>0 else np.float32(1.0)
+    samp_sigma = np.float32(np.sqrt(float(samp_beta) * float(np.float32(1.0)-float(samp_alphaBarPrev)) / float(np.float32(1.0)-float(samp_alphaBar))))
+    samp_out_stoch = (samp_out.astype(np.float64) + samp_z.astype(np.float64)*float(samp_sigma)).astype(np.float32)
+    # DDIM eta=0 (deterministic) and eta=1
+    def ddim_step(x, eps, t, eta):
+        abar = np.float32(samp_alphaBars[t])
+        abarPrev = np.float32(samp_alphaBars[t-1]) if t>0 else np.float32(1.0)
+        sqrtAbar = np.float32(np.sqrt(float(abar)))
+        sqrtOneMinusAbar = np.float32(np.sqrt(float(np.float32(1.0)-float(abar))))
+        x0 = ((x.astype(np.float64) - eps.astype(np.float64)*float(sqrtOneMinusAbar))/float(sqrtAbar)).astype(np.float32)
+        sigma = np.float32(float(eta) * np.sqrt(float(np.float32(1.0)-float(abarPrev))/float(np.float32(1.0)-float(abar))) * np.sqrt(float(np.float32(1.0)-float(abar)/float(abarPrev))))
+        sqrtOneMinusAbarPrevMinusSigma2 = np.float32(np.sqrt(max(0.0, float(np.float32(1.0)-float(abarPrev) - float(sigma*sigma)))))
+        out = (x0.astype(np.float64)*float(np.sqrt(float(abarPrev))) + eps.astype(np.float64)*float(sqrtOneMinusAbarPrevMinusSigma2)).astype(np.float32)
+        if eta>0 and t>0:
+            out = (out.astype(np.float64) + samp_z.astype(np.float64)*float(sigma)).astype(np.float32)
+        return out
+    ddim_out_eta0 = ddim_step(samp_x, samp_eps, samp_t, 0.0)
+    ddim_out_eta1 = ddim_step(samp_x, samp_eps, samp_t, 1.0)
     # VAE tiny (8x8 -> 4x4 latent) forward reference
     vae_x = rng.normal(0, 1, size=(2, 2, 8, 8)).astype(np.float32)
     vae_eps = rng.normal(0, 1, size=(2, 4, 4, 4)).astype(np.float32)
@@ -426,8 +445,49 @@ def build_fixture() -> dict:
     # grad check for encoder stem
     vae_loss = ((vae_recon_t - vae_xt) * (vae_recon_t - vae_xt)).mean()
     vae_loss_val = float(vae_loss.numpy())
+    vae_kl_t = (-0.5 * (1 + vae_logvar_t - vae_mu_t.square() - vae_logvar_t.exp()).sum(axis=1)).mean()
+    vae_kl = float(vae_kl_t.numpy())
+    vae_total_loss_t = vae_loss + vae_kl_t * 0.0005
+    vae_total_loss = float(vae_total_loss_t.numpy())
     vae_grads = vae_loss.gradient(vae_stem.weight, vae_out_c.weight)
     vae_g_stem, vae_g_out = [g.numpy().astype(np.float64).reshape(-1) for g in vae_grads]
+    # latent e2e: vae encode -> latent tiny unet (4ch) -> vae decode
+    latent_stem = TGConv2d(4, 4, 3, padding=1, bias=False)
+    latent_d0_gn1 = TGGroupNorm(2, 4, eps=1e-5)
+    latent_d0_c1 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    latent_d0_gn2 = TGGroupNorm(2, 4, eps=1e-5)
+    latent_d0_c2 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    latent_d0_mlp = rng.normal(0,0.5,size=(16,4)).astype(np.float32)
+    latent_d0_mlp_t = Tensor(latent_d0_mlp.tolist())
+    latent_down0 = TGConv2d(4, 4, 3, stride=2, padding=1, bias=False)
+    latent_m1_gn1 = TGGroupNorm(2, 4, eps=1e-5)
+    latent_m1_c1 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    latent_m1_gn2 = TGGroupNorm(2, 4, eps=1e-5)
+    latent_m1_c2 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    latent_m1_mlp = rng.normal(0,0.5,size=(16,4)).astype(np.float32)
+    latent_m1_mlp_t = Tensor(latent_m1_mlp.tolist())
+    latent_up0 = TGConvTranspose2d(4, 4, 3, stride=2, padding=1, output_padding=1, bias=False)
+    latent_out_gn = TGGroupNorm(2, 4, eps=1e-5)
+    latent_out_c = TGConv2d(4, 4, 3, padding=1, bias=True)
+    def latent_rb(xt, tt, gn1, c1, gn2, c2, mlp_t):
+        h = gn1(xt).silu()
+        h = c1(h)
+        h = gn2(h).silu()
+        h = c2(h)
+        return h + xt + tt.matmul(mlp_t).reshape(xt.shape[0], h.shape[1], 1, 1)
+    def latent_forward(zt, tt):
+        h = latent_stem(zt)
+        h = latent_rb(h, tt, latent_d0_gn1, latent_d0_c1, latent_d0_gn2, latent_d0_c2, latent_d0_mlp_t)
+        h = latent_down0(h)
+        h = latent_rb(h, tt, latent_m1_gn1, latent_m1_c1, latent_m1_gn2, latent_m1_c2, latent_m1_mlp_t)
+        h = latent_up0(h)
+        h = latent_out_gn(h).silu()
+        h = latent_out_c(h)
+        return h
+    latent_tt = Tensor(unet_t.tolist())
+    latent_z_denoised = latent_forward(vae_z_t, latent_tt)
+    latent_recon_t = vae_decode(latent_z_denoised)
+    latent_recon = latent_recon_t.numpy().astype(np.float64).reshape(-1)
     # alternative direct float32 via numpy: ensure same as JS scale/add
     # recompute via same float32 path as JS does (scale then sub then scale)
     # The above already mimics JS float32
@@ -662,6 +722,33 @@ def build_fixture() -> dict:
         "samp_eps": samp_eps.astype(float).reshape(-1).tolist(),
         "samp_t": int(samp_t),
         "samp_out": samp_out.astype(float).reshape(-1).tolist(),
+        "samp_z": samp_z.astype(float).reshape(-1).tolist(),
+        "samp_sigma": float(samp_sigma),
+        "samp_out_stoch": samp_out_stoch.astype(float).reshape(-1).tolist(),
+        "ddim_out_eta0": ddim_out_eta0.astype(float).reshape(-1).tolist(),
+        "ddim_out_eta1": ddim_out_eta1.astype(float).reshape(-1).tolist(),
+        "latent_stem_w": latent_stem.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_d0_gn1w": latent_d0_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_d0_gn1b": latent_d0_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "latent_d0_c1w": latent_d0_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_d0_gn2w": latent_d0_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_d0_gn2b": latent_d0_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "latent_d0_c2w": latent_d0_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_d0_mlp": latent_d0_mlp.astype(float).reshape(-1).tolist(),
+        "latent_down0w": latent_down0.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_m1_gn1w": latent_m1_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_m1_gn1b": latent_m1_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "latent_m1_c1w": latent_m1_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_m1_gn2w": latent_m1_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_m1_gn2b": latent_m1_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "latent_m1_c2w": latent_m1_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_m1_mlp": latent_m1_mlp.astype(float).reshape(-1).tolist(),
+        "latent_up0w": latent_up0.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_out_gnw": latent_out_gn.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_out_gnb": latent_out_gn.bias.numpy().astype(float).reshape(-1).tolist(),
+        "latent_out_cw": latent_out_c.weight.numpy().astype(float).reshape(-1).tolist(),
+        "latent_out_cb": latent_out_c.bias.numpy().astype(float).reshape(-1).tolist(),
+        "latent_recon": latent_recon.tolist(),
         "vae_x": vae_x.astype(float).reshape(-1).tolist(),
         "vae_eps": vae_eps.astype(float).reshape(-1).tolist(),
         "vae_stem_w": vae_stem.weight.numpy().astype(float).reshape(-1).tolist(),
@@ -704,6 +791,8 @@ def build_fixture() -> dict:
         "vae_logvar": vae_logvar.tolist(),
         "vae_z": vae_z.tolist(),
         "vae_loss": float(vae_loss_val),
+        "vae_kl": float(vae_kl),
+        "vae_total_loss": float(vae_total_loss),
         "vae_g_stem": vae_g_stem.tolist(),
         "vae_g_out": vae_g_out.tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
@@ -756,8 +845,9 @@ def main() -> int:
             report["sa_grad_x"], report["sa_gnw"], report["sa_gnb"], report["sa_qkv"], report["sa_proj"]) < 1e-4,
         "unet": report["unet_fwd"] < 1e-4,
         "unet_loss": report["unet_loss_err"] < 1e-4 and report["unet_loss_g_stem"] < 1e-4 and report["unet_loss_g_out"] < 1e-4,
-        "sampler": report["samp_fwd"] < 1e-5,
-        "vae": report["vae_recon"] < 1e-4 and report["vae_mu"] < 1e-4 and report["vae_logvar"] < 1e-4 and report["vae_z"] < 1e-4 and report["vae_loss_err"] < 1e-4 and report["vae_g_stem"] < 1e-4 and report["vae_g_out"] < 1e-4,
+        "sampler": report["samp_fwd"] < 1e-5 and report["samp_stoch"] < 1e-5 and report["ddim_eta0"] < 1e-5 and report["ddim_eta1"] < 1e-5,
+        "vae": report["vae_recon"] < 1e-4 and report["vae_mu"] < 1e-4 and report["vae_logvar"] < 1e-4 and report["vae_z"] < 1e-4 and report["vae_loss_err"] < 1e-4 and report["vae_g_stem"] < 1e-4 and report["vae_g_out"] < 1e-4 and report["vae_kl_err"] < 1e-4 and report["vae_total_err"] < 1e-4,
+        "latent_e2e": report["latent_recon"] < 1e-4,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])
