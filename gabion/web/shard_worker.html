@@ -17,11 +17,11 @@
 <div id="s">booting…</div>
 <div id="e"></div>
 
-<script src="/gabion/web/tinygrad_v0.js?v=7"></script>
-<script src="/gabion/web/webgpu_backend.js?v=7"></script>
-<script src="/gabion/web/tokenizer.js?v=7"></script>
-<script src="/gabion/web/bbt_forward.js?v=7"></script>
-<script src="/gabion/web/model_loader.js?v=7"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=8"></script>
+<script src="/gabion/web/webgpu_backend.js?v=8"></script>
+<script src="/gabion/web/tokenizer.js?v=8"></script>
+<script src="/gabion/web/bbt_forward.js?v=8"></script>
+<script src="/gabion/web/model_loader.js?v=8"></script>
 <script>
 "use strict";
 // Kernel set the decode path can dispatch (KV attention + matmuls + silu).
@@ -55,6 +55,7 @@ async function initGPU() {
 (async function boot() {
   const p = new URLSearchParams(location.search);
   const myIndex = parseInt(p.get("shard"), 10);
+  const runId = p.get("run") || "";
   const dir = p.get("dir") || "/gabion/web/models/qwen2.5-0.5b-shards";
   try {
     await initGPU();
@@ -69,26 +70,26 @@ async function initGPU() {
     const chan = new BroadcastChannel("gabion-shards");
     chan.onmessage = async (ev) => {
       const m = ev.data;
-      if (m.shard !== myIndex || (m.cmd !== "prefill" && m.cmd !== "step")) return;
+      if (m.run !== runId || m.shard !== myIndex || (m.cmd !== "prefill" && m.cmd !== "step")) return;
       const id = m.id;
       const T = m.rows.length / model.D;
       try {
         const h = window.tinygradV0.Tensor.fromArray(m.rows, [1, T, model.D], false);
         // startPos = this shard's own absolute position (kept across calls)
         const outT = await model.forwardHidden(h, 1, T, state, state.pos, false, true);
-        chan.postMessage({ cmd: "result", shard: myIndex, id, rows: outT.data.slice(0) },
+        chan.postMessage({ cmd: "result", run: runId, shard: myIndex, id, rows: outT.data.slice(0) },
           [outT.data.buffer]);
       } catch (e) {
-        chan.postMessage({ cmd: "error", shard: myIndex, id, error: String(e && e.stack || e) });
+        chan.postMessage({ cmd: "error", run: runId, shard: myIndex, id, error: String(e && e.stack || e) });
       }
     };
-    chan.postMessage({ cmd: "ready", shard: myIndex, layers: spec.layers, nLayers: spec.n_layers, maxLen: state.maxLen });
+    chan.postMessage({ cmd: "ready", run: runId, shard: myIndex, layers: spec.layers, nLayers: spec.n_layers, maxLen: state.maxLen });
     status(`shard ${myIndex} READY — layers ${spec.layers[0]}..${spec.layers[1] - 1}, listening on channel`);
   } catch (e) {
     err(String(e && e.stack || e));
     try {
       new BroadcastChannel("gabion-shards").postMessage(
-        { cmd: "ready-error", shard: myIndex, error: String(e && e.message || e) });
+        { cmd: "ready-error", run: runId, shard: myIndex, error: String(e && e.message || e) });
     } catch (_) { /* no coordinator listening */ }
   }
 })();
