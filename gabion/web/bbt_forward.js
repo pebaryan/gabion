@@ -1256,7 +1256,9 @@
             for (let i = 0; i < yData.length; i++) yData[i] *= 1 / (1 + Math.exp(-qGate[i]));
           }
           const y3 = this._reshapeFromHeads(Tensor.fromArray(yData, [BH, 1, headDim], false), 1, 1, H, headDim);
-          const o = (ternarize ? this._bitlinear(y3.reshape([1, D]), bl.o.weight) : y3.reshape([1, D]).matmul(bl.o.weight)).reshape([1, 1, D]);
+          // qwen35's attention output is H*headDim (not D) — o_proj is [H*hd, D]
+          const attnOut = this.arch === "qwen35" ? this.H * headDim : D;
+          const o = (ternarize ? this._bitlinear(y3.reshape([1, attnOut]), bl.o.weight) : y3.reshape([1, attnOut]).matmul(bl.o.weight)).reshape([1, 1, D]);
           if (o.onGPU) await o.toCPU();
           chk("layer" + l + ".o", o.data);
           x = x.add(o);
