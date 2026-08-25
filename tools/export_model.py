@@ -742,7 +742,28 @@ def _hf_tokenizer(path: Path) -> tuple[dict, list[str], str] | None:
     known = set(vocab)
     merges = [m for m in merges if isinstance(m, str) and " " in m
               and all(tok in known for tok in m.split())]
-    return vocab, merges, str(data.get("tokenizer_class", "BPE"))
+    # specials: HF flags them via added_tokens[].special. Added tokens often
+    # live ONLY there (not in model.vocab) -- merge them into the vocab so the
+    # JS tokenizer can look them up (their ids are valid embedding rows).
+    special = []
+    for at in data.get("added_tokens", []) or []:
+        if isinstance(at, dict) and at.get("special") and at.get("content"):
+            tok = at["content"]
+            if tok not in vocab:
+                vocab[tok] = int(at.get("id", len(vocab)))
+            special.append(tok)
+    if not special:
+        # no added_tokens: fall back to vocab entries no merge can produce
+        mergeable = {t.split()[0] for t in merges} | {t.split()[1] for t in merges}
+        special = [t for t in vocab if t not in mergeable]
+    # chat_template: tokenizer.json first, then tokenizer_config.json
+    chat_template = data.get("chat_template")
+    if not chat_template:
+        tjc = Path(path) / "tokenizer_config.json"
+        if tjc.is_file():
+            chat_template = json.loads(tjc.read_text(encoding="utf-8")).get("chat_template")
+    return (vocab, merges, str(data.get("tokenizer_class", "BPE")), special,
+            chat_template)
 
 
 def export_hf(path: Path, config: dict | None = None) -> dict:
@@ -851,9 +872,13 @@ def export_hf(path: Path, config: dict | None = None) -> dict:
             "weights_b64": base64.b64encode(flat16.view("<u2").tobytes()).decode("ascii")}
     tokdata = _hf_tokenizer(path)
     if tokdata is not None:
-        vocab, merges, toktype = tokdata
+        vocab, merges, toktype, special, chat_template = tokdata
         wire["vocab"] = vocab
         wire["merges"] = merges
+        if special:
+            wire["special"] = special
+        if chat_template:
+            wire["chat_template"] = chat_template
         cfg["tokenizer"] = f"hf:{toktype}"
     for mm in files.values():
         mm.close()

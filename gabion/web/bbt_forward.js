@@ -854,11 +854,12 @@
         }
 
         // Attend over the prefix (0..pos) via the KV-cache kernels (GQA: query
-        // head bh attends to cache row (bh * kvH) / H — mapped inside the kernels)
+        // head bh attends to cache row (bh * kvH) / H — mapped inside the kernels).
+        // The cache is [kvH, maxLen, headDim] with slots > pos uninitialized, so
+        // causal=1 masks j > pos to -inf BEFORE any cache read (kernels do this);
+        // L stays maxLen (it doubles as the cache row stride in the kernels).
         const qT = Tensor.fromArray(q.data, [BH, headDim], false).toGPU();
-        const kView = kCache.reshape([kvH, pos + 1, headDim]);
-        const vView = vCache.reshape([kvH, pos + 1, headDim]);
-        const y = kvAttention(qT, kView, vView, { causal: false, kvH, H });
+        const y = kvAttention(qT, kCache, vCache, { causal: true, pos, kvH, H });
         const yData = await y.toCPU();
 
         // Reshape back, output projection, residual
@@ -924,6 +925,13 @@
       const state = opts.state || this.initKVCache(opts.maxLen);
       const tokens = [...tokenIds];
       const logitsList = [];
+      // Prime the cache / prefix with the FULL prompt first: decodeStep sees one
+      // token at a time, so every prompt token except the last must be fed before
+      // generation starts (the last prompt token is consumed by the first step).
+      for (let i = 0; i < tokens.length - 1; i++) {
+        if (state.pos >= state.maxLen) break; // context full
+        await this.decodeStep(tokens[i], state, ternarize);
+      }
       for (let i = 0; i < maxNew; i++) {
         if (state.pos >= state.maxLen) break; // context full
         const { logits, state: st } = await this.decodeStep(tokens[tokens.length - 1], state, ternarize);

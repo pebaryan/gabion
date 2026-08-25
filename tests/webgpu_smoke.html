@@ -317,6 +317,21 @@ async function run() {
     return maxAbs(got, ref);
   });
 
+  await runCheck("kv_attention_prefix", async () => {
+    const BH = 4, kvH = 2, H = 4, L = 16, pos = 3, hd = 16;
+    const q = randF32(rng, BH * hd), kc = randF32(rng, 1 * kvH * L * hd), vc = randF32(rng, 1 * kvH * L * hd);
+    const refScores = refKvScores(q, kc, BH, kvH, H, L, hd, 1 / Math.sqrt(hd), 1, pos);
+    const ref = refKvApply(refScores, vc, BH, kvH, H, L, hd);
+    const qBuf = backend.createBufferFromData(q), kB = backend.createBufferFromData(kc), vBuf = backend.createBufferFromData(vc);
+    const sBuf = backend.kvAttentionScores(qBuf, kB, { BH, L, headDim: hd, scale: 1 / Math.sqrt(hd), causal: 1, pos, kvH, H });
+    const gotS = await backend.readBuffer(sBuf, BH * L);
+    const e1 = maxAbs(gotS, refScores);
+    const oBuf = backend.kvAttentionApply(sBuf, vBuf, { BH, L, headDim: hd, scale: 1 / Math.sqrt(hd), causal: 1, pos, kvH, H });
+    const got = await backend.readBuffer(oBuf, BH * hd);
+    const e2 = maxAbs(got, ref);
+    return Math.max(e1, e2);
+  });
+
   // kv_group_sum B=1 H=4 kvH=2 T=8 hd=16
   await runCheck("kv_group_sum", async () => {
     const B = 1, H = 4, kvH = 2, T = 8, hd = 16;
