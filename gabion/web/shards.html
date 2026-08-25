@@ -42,17 +42,17 @@
 <div class="bar"><label>prompt</label>
   <textarea id="prompt">The capital of France is</textarea>
 </div>
-<div id="shards">no shard tabs yet — click Generate to spawn them</div>
+<div id="shards">no shard workers yet — click Generate to spawn them</div>
 <div id="status">booted — manifest will be fetched on Generate</div>
 <div id="output">(generation appears here)</div>
 <div id="stats"></div>
 <pre id="resultJson" hidden>{}</pre>
 
-<script src="/gabion/web/tinygrad_v0.js?v=5"></script>
-<script src="/gabion/web/webgpu_backend.js?v=5"></script>
-<script src="/gabion/web/tokenizer.js?v=5"></script>
-<script src="/gabion/web/bbt_forward.js?v=5"></script>
-<script src="/gabion/web/model_loader.js?v=5"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=6"></script>
+<script src="/gabion/web/webgpu_backend.js?v=6"></script>
+<script src="/gabion/web/tokenizer.js?v=6"></script>
+<script src="/gabion/web/bbt_forward.js?v=6"></script>
+<script src="/gabion/web/model_loader.js?v=6"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -98,12 +98,23 @@ async function generate() {
     out.model = { n_layers: manifest.config.n_layers, d_model: manifest.config.d_model,
                   vocab: manifest.config.vocab_size, shard_count: specs.length };
     status(`manifest: ${out.model.n_layers} layers, ${specs.length} shard files — spawning tabs…`);
-    // Spawn one tab per shard (user gesture -> popups allowed)
+    // Spawn one worker per shard — try a popup tab, fall back to a same-origin
+    // iframe (headless Chrome blocks window.open without a user gesture). Both
+    // are separate browsing contexts, so BroadcastChannel reaches them equally.
     const spawned = [];
     for (let i = 0; i < specs.length; i++) {
-      spawned.push(window.open(
-        `/gabion/web/shard_worker.html?shard=${i}&dir=${encodeURIComponent(dir)}`,
-        `gabion-shard-${i}`, "width=420,height=160"));
+      const url = `/gabion/web/shard_worker.html?shard=${i}&dir=${encodeURIComponent(dir)}`;
+      let w = null;
+      try { w = window.open(url, `gabion-shard-${i}`, "width=420,height=160"); } catch (e) { w = null; }
+      if (w) {
+        spawned.push(w);
+      } else {
+        const f = document.createElement("iframe");
+        f.src = url;
+        f.style.cssText = "width:100%;height:120px;border:1px solid #2d3748;border-radius:6px;margin:.2rem 0;background:#161c24";
+        $("shards").appendChild(f);
+        spawned.push(f);
+      }
     }
     // Wait for all shards to report ready (timeout 180s)
     const ready = new Array(specs.length).fill(false);
