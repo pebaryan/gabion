@@ -831,6 +831,108 @@
     }
 
     /**
+     * LSTM cell backward: recomputes forward activations and produces gate grads.
+     * dh/dc: [B*H]. Returns { dsBuf: [B*4H], dcPrevBuf: [B*H] }.
+     */
+    lstmCellBwd(xBuf, hBuf, cBuf, wihBuf, whhBuf, bIhBuf, bHhBuf, dhBuf, dcBuf, P) {
+      const pipeline = this.getPipeline("lstm_cell_bwd");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.B, P.H, P.inputSize, 0]));
+      const dsBuf = this.createEmptyBuffer(P.B * 4 * P.H * 4);
+      const dcPrevBuf = this.createEmptyBuffer(P.B * P.H * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: hBuf } },
+          { binding: 3, resource: { buffer: cBuf } },
+          { binding: 4, resource: { buffer: wihBuf } },
+          { binding: 5, resource: { buffer: whhBuf } },
+          { binding: 6, resource: { buffer: bIhBuf } },
+          { binding: 7, resource: { buffer: bHhBuf } },
+          { binding: 8, resource: { buffer: dhBuf } },
+          { binding: 9, resource: { buffer: dcBuf } },
+          { binding: 10, resource: { buffer: dsBuf } },
+          { binding: 11, resource: { buffer: dcPrevBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.B * P.H / 256), 1, 1, uniformBuf);
+      return { dsBuf, dcPrevBuf };
+    }
+
+    /** LSTM input gradient. ds: [B*4H], wih: [4H*I]. Returns dxBuf [B*I]. */
+    lstmCellBwdDx(dsBuf, wihBuf, P) {
+      const pipeline = this.getPipeline("lstm_cell_bwd_dx");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.B, P.H, P.inputSize, 0]));
+      const dxBuf = this.createEmptyBuffer(P.B * P.inputSize * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: dsBuf } },
+          { binding: 2, resource: { buffer: wihBuf } },
+          { binding: 3, resource: { buffer: dxBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.B * P.inputSize / 256), 1, 1, uniformBuf);
+      return dxBuf;
+    }
+
+    /** LSTM hidden-state gradient. ds: [B*4H], whh: [4H*H]. Returns dhPrevBuf [B*H]. */
+    lstmCellBwdDh(dsBuf, whhBuf, P) {
+      const pipeline = this.getPipeline("lstm_cell_bwd_dh");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.B, P.H, P.inputSize, 0]));
+      const dhPrevBuf = this.createEmptyBuffer(P.B * P.H * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: dsBuf } },
+          { binding: 2, resource: { buffer: whhBuf } },
+          { binding: 3, resource: { buffer: dhPrevBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.B * P.H / 256), 1, 1, uniformBuf);
+      return dhPrevBuf;
+    }
+
+    /** LSTM input-projection weight gradient. x: [B*I], ds: [B*4H]. Returns dwihBuf [4H*I]. */
+    lstmCellBwdDwih(xBuf, dsBuf, P) {
+      const pipeline = this.getPipeline("lstm_cell_bwd_dwih");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.B, P.H, P.inputSize, 0]));
+      const dwihBuf = this.createEmptyBuffer(4 * P.H * P.inputSize * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: dsBuf } },
+          { binding: 3, resource: { buffer: dwihBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(4 * P.H * P.inputSize / 256), 1, 1, uniformBuf);
+      return dwihBuf;
+    }
+
+    /** LSTM recurrent-projection weight gradient. h: [B*H], ds: [B*4H]. Returns dwhhBuf [4H*H]. */
+    lstmCellBwdDwhh(hBuf, dsBuf, P) {
+      const pipeline = this.getPipeline("lstm_cell_bwd_dwhh");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.B, P.H, P.inputSize, 0]));
+      const dwhhBuf = this.createEmptyBuffer(4 * P.H * P.H * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: hBuf } },
+          { binding: 2, resource: { buffer: dsBuf } },
+          { binding: 3, resource: { buffer: dwhhBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(4 * P.H * P.H / 256), 1, 1, uniformBuf);
+      return dwhhBuf;
+    }
+
+    /**
      * Dispatch row-wise reduction.
      * op: 0=sum, 1=max, 2=sumSquares
      * Input: [rows, cols] buffer, Output: [rows] buffer.

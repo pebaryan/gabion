@@ -1589,9 +1589,13 @@
       this.grad = new Float32Array([1.0]);
       for (let i = topo.length - 1; i >= 0; i--) {
         const t = topo[i];
-        if (!t.grad) continue;
-        // Pass both CPU grad array and GPU grad buffer (if available)
-        t._backward(t.grad, t._gradGPUBuf || null);
+        // A tensor can carry its gradient as a CPU array (t.grad), a resolved GPU
+        // buffer (t._gradGPUBuf), or an as-yet-unresolved GPU buffer produced by a
+        // child's closure (t._pendingGradBuf). Run its backward whenever any exists,
+        // passing the GPU buffer through as goutBuf so closures can dispatch GPU
+        // kernels without a CPU round-trip.
+        if (!t.grad && !t._gradGPUBuf && !t._pendingGradBuf) continue;
+        t._backward(t.grad, t._gradGPUBuf || t._pendingGradBuf || null);
       }
     }
 
@@ -2812,8 +2816,10 @@
       const h = hc ? hc[0] : Tensor.zeros([B, H], false);
       const c = hc ? hc[1] : Tensor.zeros([B, H], false);
       const backend = gpu();
-      if (backend && x.onGPU && h.onGPU && c.onGPU && this.weightIh.onGPU && this.weightHh.onGPU &&
+      if (backend && x.onGPU && this.weightIh.onGPU && this.weightHh.onGPU &&
           (!this.biasIh || this.biasIh.onGPU) && (!this.biasHh || this.biasHh.onGPU)) {
+        h.toGPU();
+        c.toGPU();
         const P = { B, H, inputSize: this.inputSize, hasBias: this.biasIh ? 1 : 0 };
         const { hOutBuf, cOutBuf } = backend.lstmCell(
           x.gpuBuffer, h.gpuBuffer, c.gpuBuffer,
@@ -2821,10 +2827,42 @@
           this.biasIh ? this.biasIh.gpuBuffer : null, this.biasHh ? this.biasHh.gpuBuffer : null, P);
         const req = x.requiresGrad || h.requiresGrad || c.requiresGrad || this.weightIh.requiresGrad || this.weightHh.requiresGrad ||
           !!(this.biasIh && this.biasIh.requiresGrad) || !!(this.biasHh && this.biasHh.requiresGrad);
-        const hT = new Tensor(new Float32Array(B * H), [B, H], req, [x, h, c, this.weightIh, this.weightHh], () => {
-          throw new Error("lstm_cell GPU backward not implemented");
-        }, hOutBuf, "gpu");
+        const parents = [x, h, c, this.weightIh, this.weightHh];
+        if (this.biasIh) parents.push(this.biasIh);
+        if (this.biasHh) parents.push(this.biasHh);
+        const bwdP = { B, H, inputSize: this.inputSize };
+        const bIhBuf = this.biasIh ? this.biasIh.gpuBuffer : null;
+        const bHhBuf = this.biasHh ? this.biasHh.gpuBuffer : null;
+        const dbP = { N: B, Cin: 1, H: 1, W: 1, Cout: 4 * H, Ho: 1, Wo: 1, kH: 1, kW: 1, groups: 1, cinPerG: 1, coutPerG: 4 * H, sH: 1, sW: 1, dH: 1, dW: 1, pH: 0, pW: 0, hasBias: 1 };
         const cT = new Tensor(new Float32Array(B * H), [B, H], req, [], () => {}, cOutBuf, "gpu");
+        const hT = new Tensor(new Float32Array(B * H), [B, H], req, parents, (dh, dhBuf) => {
+          // LSTM cell backward (one BPTT step): recompute forward activations on GPU
+          // and dispatch race-free gather kernels for all grads. dh arrives as the
+          // engine's goutBuf (or CPU array / own pending grad); dc is the grad of
+          // this step's c output, set by the NEXT step's closure as cT._pendingGradBuf
+          // (zero when the loss has no path through c).
+          const be = gpu();
+          if (!be) throw new Error("lstm_cell GPU backward requires a backend");
+          let dhGpu = dhBuf || hT._pendingGradBuf || null;
+          let dhCreated = false;
+          if (!dhGpu) { dhGpu = be.createBufferFromData(dh || new Float32Array(B * H)); dhCreated = true; }
+          let dcGpu = cT._pendingGradBuf || null;
+          let dcCreated = false;
+          if (!dcGpu) { dcGpu = be.createBufferFromData(cT.grad || new Float32Array(B * H)); dcCreated = true; }
+          const { dsBuf, dcPrevBuf } = be.lstmCellBwd(
+            x.gpuBuffer, h.gpuBuffer, c.gpuBuffer,
+            this.weightIh.gpuBuffer, this.weightHh.gpuBuffer, bIhBuf, bHhBuf, dhGpu, dcGpu, bwdP);
+          if (x.requiresGrad) x._pendingGradBuf = be.lstmCellBwdDx(dsBuf, this.weightIh.gpuBuffer, bwdP);
+          if (h.requiresGrad) h._pendingGradBuf = be.lstmCellBwdDh(dsBuf, this.weightHh.gpuBuffer, bwdP);
+          if (c.requiresGrad) c._pendingGradBuf = dcPrevBuf;
+          if (this.weightIh.requiresGrad) this.weightIh._pendingGradBuf = be.lstmCellBwdDwih(x.gpuBuffer, dsBuf, bwdP);
+          if (this.weightHh.requiresGrad) this.weightHh._pendingGradBuf = be.lstmCellBwdDwhh(h.gpuBuffer, dsBuf, bwdP);
+          if (this.biasIh && this.biasIh.requiresGrad) this.biasIh._pendingGradBuf = be.convBwdDb(dsBuf, dbP);
+          if (this.biasHh && this.biasHh.requiresGrad) this.biasHh._pendingGradBuf = be.convBwdDb(dsBuf, dbP);
+          be.releaseBuffer(dsBuf);
+          if (dhCreated) dhGpu.destroy();
+          if (dcCreated) dcGpu.destroy();
+        }, hOutBuf, "gpu");
         return [hT, cT];
       }
       const gi = x.matmul(this.weightIh.transpose2d());

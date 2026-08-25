@@ -542,9 +542,121 @@ const report = {};
   report.lstm_c = maxAbs(cK, cpuC);
 }
 
+// ---- LSTM cell backward: transpiled kernels vs engine CPU autograd (both h and c chains) ----
+{
+  const rng = (() => { let s = 161803; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
+  const B = 2, I = 3, H = 4;
+  const x = new Float32Array(B * I), h0 = new Float32Array(B * H), c0 = new Float32Array(B * H);
+  const wih = new Float32Array(4 * H * I), whh = new Float32Array(4 * H * H);
+  const bIh = new Float32Array(4 * H), bHh = new Float32Array(4 * H);
+  const dh = new Float32Array(B * H), dc = new Float32Array(B * H);
+  for (let i = 0; i < x.length; i++) x[i] = rng() * 2 - 1;
+  for (let i = 0; i < h0.length; i++) h0[i] = rng() * 2 - 1;
+  for (let i = 0; i < c0.length; i++) c0[i] = rng() * 2 - 1;
+  for (let i = 0; i < wih.length; i++) wih[i] = (rng() * 2 - 1) * 0.5;
+  for (let i = 0; i < whh.length; i++) whh[i] = (rng() * 2 - 1) * 0.5;
+  for (let i = 0; i < bIh.length; i++) bIh[i] = (rng() * 2 - 1) * 0.1;
+  for (let i = 0; i < bHh.length; i++) bHh[i] = (rng() * 2 - 1) * 0.1;
+  for (let i = 0; i < dh.length; i++) dh[i] = rng() * 2 - 1;
+  for (let i = 0; i < dc.length; i++) dc[i] = rng() * 2 - 1;
+
+  // CPU reference via the engine's autograd graph
+  const cell = new tg.nn.LSTMCell(I, H, { bias: true });
+  cell.weightIh.data.set(wih);
+  cell.weightHh.data.set(whh);
+  cell.biasIh.data.set(bIh);
+  cell.biasHh.data.set(bHh);
+  const xt = Tensor.fromArray(x, [B, I], true);
+  const ht = Tensor.fromArray(h0, [B, H], true);
+  const ct = Tensor.fromArray(c0, [B, H], true);
+  const [hT, cT] = cell.forward(xt, [ht, ct]);
+  hT.grad = Float32Array.from(dh);
+  cT.grad = Float32Array.from(dc);
+  // manual reverse-topo walk over both chains (scalar-loss check bypassed)
+  {
+    const topo = [], seen = new Set();
+    const build = (t) => { if (seen.has(t)) return; seen.add(t); for (const p of t._parents) build(p); topo.push(t); };
+    build(hT); build(cT);
+    for (let i = topo.length - 1; i >= 0; i--) {
+      const t = topo[i];
+      if (!t.grad) continue;
+      t._backward(t.grad, null);
+    }
+  }
+
+  // WGSL lstm_cell_bwd + friends transpiled
+  const sig = (v) => 1 / (1 + Math.exp(-v));
+  const ds = new Float32Array(B * 4 * H), dcPrev = new Float32Array(B * H);
+  for (let idx = 0; idx < B * H; idx++) {
+    const n = (idx / H) | 0, j = idx % H;
+    let s0 = bIh[j] + bHh[j], s1 = bIh[H + j] + bHh[H + j], s2 = bIh[2 * H + j] + bHh[2 * H + j], s3 = bIh[3 * H + j] + bHh[3 * H + j];
+    const xB = n * I, hB = n * H;
+    for (let k = 0; k < I; k++) {
+      const xv = x[xB + k];
+      s0 += xv * wih[j * I + k]; s1 += xv * wih[(H + j) * I + k];
+      s2 += xv * wih[(2 * H + j) * I + k]; s3 += xv * wih[(3 * H + j) * I + k];
+    }
+    for (let k = 0; k < H; k++) {
+      const hv = h0[hB + k];
+      s0 += hv * whh[j * H + k]; s1 += hv * whh[(H + j) * H + k];
+      s2 += hv * whh[(2 * H + j) * H + k]; s3 += hv * whh[(3 * H + j) * H + k];
+    }
+    const i = sig(s0), f = sig(s1), g = Math.tanh(s2), o = sig(s3);
+    const cprev = c0[idx];
+    const cnew = f * cprev + i * g;
+    const c1 = Math.tanh(cnew);
+    const dcTot = dc[idx] + dh[idx] * o * (1 - c1 * c1);
+    const base = n * 4 * H;
+    ds[base + j] = dcTot * g * i * (1 - i);
+    ds[base + H + j] = dcTot * cprev * f * (1 - f);
+    ds[base + 2 * H + j] = dcTot * i * (1 - g * g);
+    ds[base + 3 * H + j] = dh[idx] * c1 * o * (1 - o);
+    dcPrev[idx] = dcTot * f;
+  }
+  const dxK = new Float32Array(B * I), dhK = new Float32Array(B * H);
+  for (let idx = 0; idx < B * I; idx++) {
+    const n = (idx / I) | 0, k = idx % I;
+    let acc = 0;
+    for (let j = 0; j < H; j++) for (let g = 0; g < 4; g++) acc += ds[n * 4 * H + g * H + j] * wih[(g * H + j) * I + k];
+    dxK[idx] = acc;
+  }
+  for (let idx = 0; idx < B * H; idx++) {
+    const n = (idx / H) | 0, k = idx % H;
+    let acc = 0;
+    for (let j = 0; j < H; j++) for (let g = 0; g < 4; g++) acc += ds[n * 4 * H + g * H + j] * whh[(g * H + j) * H + k];
+    dhK[idx] = acc;
+  }
+  const dwihK = new Float32Array(4 * H * I), dwhhK = new Float32Array(4 * H * H), dbK = new Float32Array(4 * H);
+  for (let idx = 0; idx < 4 * H * I; idx++) {
+    const k = idx % I, j = ((idx / I) | 0) % H, g = ((idx / (I * H)) | 0) % 4;
+    let acc = 0;
+    for (let n = 0; n < B; n++) acc += ds[n * 4 * H + g * H + j] * x[n * I + k];
+    dwihK[idx] = acc;
+  }
+  for (let idx = 0; idx < 4 * H * H; idx++) {
+    const k = idx % H, j = ((idx / H) | 0) % H, g = ((idx / (H * H)) | 0) % 4;
+    let acc = 0;
+    for (let n = 0; n < B; n++) acc += ds[n * 4 * H + g * H + j] * h0[n * H + k];
+    dwhhK[idx] = acc;
+  }
+  for (let u = 0; u < 4 * H; u++) {
+    let acc = 0;
+    for (let n = 0; n < B; n++) acc += ds[n * 4 * H + u];
+    dbK[u] = acc;
+  }
+  report.lstm_dx = maxAbs(dxK, xt.grad);
+  report.lstm_dh = maxAbs(dhK, ht.grad);
+  report.lstm_dc = maxAbs(dcPrev, ct.grad);
+  report.lstm_dwih = maxAbs(dwihK, cell.weightIh.grad);
+  report.lstm_dwhh = maxAbs(dwhhK, cell.weightHh.grad);
+  report.lstm_dbih = maxAbs(dbK, cell.biasIh.grad);
+  report.lstm_dbhh = maxAbs(dbK, cell.biasHh.grad);
+}
+
 const convChecks = [report.conv2d_fwd, report.conv2d_dx, report.conv2d_dw, report.conv2d_db, report.ct_fwd, report.ct_dx, report.ct_dw, report.ct_db];
 const normChecks = [report.bn_fwd, report.bn_dx, report.bn_dgamma, report.bn_dbeta, report.aff_fwd, report.aff_dx, report.aff_dw, report.aff_db];
 const lastChecks = [report.ln_bwd, report.afflast_fwd, report.afflast_dx, report.afflast_dw, report.afflast_db, report.lstm_h, report.lstm_c];
-if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4)) || lastChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
+const lstmBwdChecks = [report.lstm_dx, report.lstm_dh, report.lstm_dc, report.lstm_dwih, report.lstm_dwhh, report.lstm_dbih, report.lstm_dbhh];
+if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4)) || lastChecks.some((v) => !(v < 1e-4)) || lstmBwdChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
 
 console.log(JSON.stringify(report, null, 2));
