@@ -51,7 +51,9 @@ def f16_decode(b64: str) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
-# GGUF reader (subset: metadata + F32/F16/Q8_0/Q4_0/Q4_1 tensors)
+# GGUF reader (subset: metadata + F32/F16/Q4_0/Q4_1/Q5_0/Q8_0/Q2_K/Q4_K/Q6_K/
+# TQ2_0 tensors). Every dequant is byte-exact against gguf-py -- see
+# tests/test_export_model.py::test_dequant_matches_gguf_py.
 # --------------------------------------------------------------------------
 
 # Current ggml/GGUF type enum (gguf-py GGMLQuantizationType; note the 2025
@@ -144,31 +146,29 @@ def _dequant(name: str, raw: bytes, dims: tuple, gtype: str) -> np.ndarray:
             vals[b * 32:(b + 1) * 32] = np.asarray(xs, dtype=np.float32) * float(d)
         return vals.reshape(shape)
     if gtype == "Q4_0":
-        # block of 16: f16 scale + 16 x 4-bit signed (offset 8)
-        nblocks = n // 16
-        vals = np.empty(n, dtype=np.float32)
-        for b in range(nblocks):
-            (d,) = struct.unpack_from("<e", raw, b * 18)
-            packed = raw[b * 18 + 2:b * 18 + 18]
-            nib = np.frombuffer(packed, dtype=np.uint8).astype(np.int16)
-            xs = np.empty(16, dtype=np.float32)
-            for i in range(16):
-                v = (nib[i // 2] >> (4 * (i % 2))) & 0x0F
-                xs[i] = float(v - 8) * float(d)
-            vals[b * 16:(b + 1) * 16] = xs
-        return vals.reshape(shape)
+        # block of 32: f16 d + 16 nibble bytes (18 B). ggml puts the LOW nibble of
+        # byte j at element j and the HIGH nibble at element j+16 -- the halves are
+        # split, not interleaved. value = (x - 8) * d
+        nb = n // 32
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 18).reshape(nb, 18)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 2:]
+        out = np.empty((nb, 32), dtype=np.float32)
+        out[:, :16] = ((qs & 0x0F).astype(np.int32) - 8) * d[:, None]
+        out[:, 16:] = ((qs >> 4).astype(np.int32) - 8) * d[:, None]
+        return out.reshape(shape)
     if gtype == "Q4_1":
-        # block of 32: f16 d + f16 m + 16 nibble bytes (value = x*d + m)
-        nblocks = n // 32
-        vals = np.empty(n, dtype=np.float32)
-        for b in range(nblocks):
-            (d,) = struct.unpack_from("<e", raw, b * 20)
-            (m,) = struct.unpack_from("<e", raw, b * 20 + 2)
-            nib = raw[b * 20 + 4:b * 20 + 20]
-            for i in range(32):
-                v = (nib[i // 2] >> (4 * (i % 2))) & 0x0F
-                vals[b * 32 + i] = float(v) * float(d) + float(m)
-        return vals.reshape(shape)
+        # block of 32: f16 d + f16 m + 16 nibble bytes (20 B); same split-nibble
+        # layout as Q4_0. value = x*d + m
+        nb = n // 32
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 20).reshape(nb, 20)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        m = blk[:, 2:4].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 4:]
+        out = np.empty((nb, 32), dtype=np.float32)
+        out[:, :16] = (qs & 0x0F).astype(np.float32) * d[:, None] + m[:, None]
+        out[:, 16:] = (qs >> 4).astype(np.float32) * d[:, None] + m[:, None]
+        return out.reshape(shape)
     if gtype in ("Q4_K", "Q6_K"):
         return _dequant_k(raw, n, gtype).reshape(shape)
     if gtype in ("Q2_K", "TQ2_0"):
@@ -276,18 +276,25 @@ def _dequant_k2(raw: bytes, n: int, gtype: str) -> np.ndarray:
             qb = (qs[:, half * 32:half * 32 + 32][:, byte_idx] >> shift) & 0x03
             out[:, half * 128:half * 128 + 128] = dl * qb.astype(np.float32) - ml
         return out.reshape(-1)
-    # TQ2_0: FILE layout: qs[64], d[2] (66 B); val = ((2-bit) - 1) * d
+    # TQ2_0: FILE layout: qs[64], d[2] (66 B); val = ((2-bit) - 1) * d.
+    # ggml's dequantize_row_tq2_0 loops byte-group j (2 x 32 bytes) -> bit plane l
+    # (4) -> byte m (32), so element j*128 + l*32 + m reads qs[j*32 + m] >> 2l.
     blk = np.frombuffer(raw, dtype="<u1", count=nb * 66).reshape(nb, 66)
     f16s = blk[:, 64:66].copy().view("<f2")[:, 0].astype(np.float32)
     qs = blk[:, 0:64]
-    i = np.arange(256)
-    bits = (qs[:, i // 4] >> (2 * (i % 4))) & 0x03
+    o = np.arange(256)
+    byte = (o // 128) * 32 + (o % 32)
+    shift = 2 * ((o % 128) // 32)
+    bits = (qs[:, byte] >> shift) & 0x03
     return ((bits.astype(np.float32) - 1.0) * f16s[:, None]).reshape(-1)
 
 
 def _tensor_data(buf: bytes, name: str, dims: tuple, gtype: str, offset: int, base: int = 0) -> np.ndarray:
     if gtype in ("F32", "F16", "Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q4_K", "Q6_K", "Q2_K", "TQ2_0"):
-        return _dequant(name, buf[base + offset:], dims, gtype)
+        # memoryview, not buf[base + offset:]: slicing bytes COPIES the whole tail,
+        # which on a multi-hundred-MB GGUF costs a full-file copy per tensor.
+        # np.frombuffer and struct.unpack_from both accept a memoryview.
+        return _dequant(name, memoryview(buf)[base + offset:], dims, gtype)
     raise NotImplementedError(f"GGUF tensor '{name}': unsupported type {gtype}")
 
 
@@ -370,38 +377,45 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
         dims, gtype, off = by_name[name]
         return _tensor_data(buf, name, dims, gtype, off, data_base)
 
-    def as_2d(t: np.ndarray, want: tuple) -> np.ndarray:
-        if t.shape == want:
-            return t
-        if t.shape == want[::-1]:
-            return t.T
-        raise ValueError(f"shape {t.shape} vs expected {want}")
+    def as_linear(name: str, want: tuple) -> np.ndarray:
+        """A GGUF linear weight has ne = (in_features, out_features), and _dequant
+        reverses ne, so it hands back (out, in). The wire format wants (in, out) for
+        the JS `x.matmul(weight)`, i.e. always the transpose. Never infer this from
+        the shape: a square matrix matches both ways and would silently pass through
+        in the wrong orientation."""
+        t = get(name)
+        if t is None:
+            raise ValueError(f"GGUF is missing required tensor '{name}'")
+        t = t.T
+        if t.shape != want:
+            raise ValueError(f"GGUF tensor '{name}': shape {t.shape} vs expected {want}")
+        return t
 
     tok = get("token_embd.weight")
-    tok = as_2d(tok, (n_vocab, D))
+    # token_embd ne = (n_embd, n_vocab), so _dequant already yields (n_vocab, n_embd)
+    if tok.shape != (n_vocab, D):
+        raise ValueError(f"token_embd.weight: shape {tok.shape} vs expected {(n_vocab, D)}")
     tensors = [tok]
     for i in range(L):
-        q = as_2d(get(f"blk.{i}.attn_q.weight"), (D, D))
-        k = as_2d(get(f"blk.{i}.attn_k.weight"), (D, kvD))
-        v = as_2d(get(f"blk.{i}.attn_v.weight"), (D, kvD))
-        o = as_2d(get(f"blk.{i}.attn_output.weight"), (D, D))
+        q = as_linear(f"blk.{i}.attn_q.weight", (D, D))
+        k = as_linear(f"blk.{i}.attn_k.weight", (D, kvD))
+        v = as_linear(f"blk.{i}.attn_v.weight", (D, kvD))
+        o = as_linear(f"blk.{i}.attn_output.weight", (D, D))
         n1 = get(f"blk.{i}.attn_norm.weight").reshape(-1)
-        gate = as_2d(get(f"blk.{i}.ffn_gate.weight"), (D, d_ff))
-        up = as_2d(get(f"blk.{i}.ffn_up.weight"), (D, d_ff))
+        gate = as_linear(f"blk.{i}.ffn_gate.weight", (D, d_ff))
+        up = as_linear(f"blk.{i}.ffn_up.weight", (D, d_ff))
         gate_up = np.concatenate([gate, up], axis=1)  # JS splitLast([dFF, dFF]) -> gate first
         n2 = get(f"blk.{i}.ffn_norm.weight").reshape(-1)
-        down = as_2d(get(f"blk.{i}.ffn_down.weight"), (d_ff, D))
+        down = as_linear(f"blk.{i}.ffn_down.weight", (d_ff, D))
         tensors += [q, k, v, o, n1, gate_up, n2, down]
     tensors.append(get("output_norm.weight").reshape(-1))
 
-    out_w = get("output.weight")
-    if out_w is None:
+    if "output.weight" not in by_name:
         tie = True
         print("[info] GGUF has no output.weight; using tied embedding")
     else:
         tie = False
-        out_w = as_2d(out_w, (D, n_vocab))
-        tensors.append(out_w)
+        tensors.append(as_linear("output.weight", (D, n_vocab)))
     cfg = config or {
         "vocab_size": n_vocab, "d_model": D, "n_heads": heads,
         "n_kv_heads": kv_heads, "n_layers": L,
@@ -414,7 +428,10 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
     # tokenizer is generic over {vocab, merges}).
     if tokens and meta.get("tokenizer.ggml.merges"):
         wire["vocab"] = {t: i for i, t in enumerate(tokens)}
-        wire["merges"] = [ln for ln in meta["tokenizer.ggml.merges"] if ln and not ln.startswith("#")]
+        # No '#'-filter here: tokenizer.ggml.merges is a structured array with no
+        # '#version:' header, and byte-level BPE has real merges starting with '#'
+        # (GPT-2 has 8, e.g. "# #" -> the "##" token).
+        wire["merges"] = [ln for ln in meta["tokenizer.ggml.merges"] if ln]
         cfg["tokenizer"] = f"{arch}:{meta.get('tokenizer.ggml.pre', 'bpe')}"
     return wire
 
@@ -434,7 +451,8 @@ def fetch_gpt2_tokenizer() -> tuple[dict, list[str]]:
         vocab = json.loads(r.read().decode("utf-8"))
     with urllib.request.urlopen(GPT2_URLS["merges"], timeout=30) as r:
         text = r.read().decode("utf-8")
-    merges = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    # anchor to the '#version:' header -- '#' alone also drops real merges
+    merges = [ln for ln in text.splitlines() if ln and not ln.startswith("#version")]
     return vocab, merges
 
 

@@ -106,6 +106,11 @@ def _write_gguf(path: Path, meta: dict, tensors: dict[str, np.ndarray]) -> None:
             out += struct.pack("<I", 11) + struct.pack("<q", v)
         elif isinstance(v, float):
             out += struct.pack("<I", 6) + struct.pack("<f", v)
+        elif isinstance(v, list):  # array: u32 elem_type, u64 count, bare elements
+            assert all(isinstance(e, str) for e in v), "only string arrays supported"
+            out += struct.pack("<I", 9) + struct.pack("<IQ", 8, len(v))
+            for e in v:
+                put_str(e)
         else:
             raise TypeError(type(v))
 
@@ -113,7 +118,10 @@ def _write_gguf(path: Path, meta: dict, tensors: dict[str, np.ndarray]) -> None:
         put_str(k)
         put_val(v)
 
-    # tensor infos: name, n_dims, dims, ggml_type, offset (offsets fixed up below)
+    # tensor infos: name, n_dims, dims, ggml_type, offset (offsets fixed up below).
+    # Arrays are handed in torch orientation and written as ne = shape[::-1], which
+    # is exactly what gguf-py does -- so a linear weight (out, in) lands as
+    # ne = (in, out) and the fixtures exercise the real export path.
     infos = []
     for name, arr in tensors.items():
         put_str(name)
@@ -182,13 +190,14 @@ def test_gguf_parse_and_export(tmp_path):
     tensors = {
         "token_embd.weight": rng.normal(0, 0.1, (V, D)).astype(np.float32),
         "blk.0.attn_norm.weight": rng.normal(0, 0.1, (D,)).astype(np.float32),
+        # linear weights in torch orientation (out_features, in_features)
         "blk.0.attn_q.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
         "blk.0.attn_k.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
         "blk.0.attn_v.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
         "blk.0.attn_output.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
-        "blk.0.ffn_gate.weight": rng.normal(0, 0.1, (D, dFF)).astype(np.float32),
-        "blk.0.ffn_up.weight": rng.normal(0, 0.1, (D, dFF)).astype(np.float32),
-        "blk.0.ffn_down.weight": rng.normal(0, 0.1, (dFF, D)).astype(np.float32),
+        "blk.0.ffn_gate.weight": rng.normal(0, 0.1, (dFF, D)).astype(np.float32),
+        "blk.0.ffn_up.weight": rng.normal(0, 0.1, (dFF, D)).astype(np.float32),
+        "blk.0.ffn_down.weight": rng.normal(0, 0.1, (D, dFF)).astype(np.float32),
         "blk.0.ffn_norm.weight": rng.normal(0, 0.1, (D,)).astype(np.float32),
         "output_norm.weight": rng.normal(0, 0.1, (D,)).astype(np.float32),
     }
@@ -209,8 +218,13 @@ def test_gguf_parse_and_export(tmp_path):
     assert np.max(np.abs(tok - tensors["token_embd.weight"])) < 1e-2
     # gate_up = concat(gate, up) along last dim (gate first, matching JS splitLast)
     gu = flat[n_tok + 4 * D * D + D: n_tok + 4 * D * D + D + 2 * D * dFF].reshape(D, 2 * dFF)
-    assert np.max(np.abs(gu[:, :dFF] - tensors["blk.0.ffn_gate.weight"])) < 1e-2
-    assert np.max(np.abs(gu[:, dFF:] - tensors["blk.0.ffn_up.weight"])) < 1e-2
+    assert np.max(np.abs(gu[:, :dFF] - tensors["blk.0.ffn_gate.weight"].T)) < 1e-2
+    assert np.max(np.abs(gu[:, dFF:] - tensors["blk.0.ffn_up.weight"].T)) < 1e-2
+    # square projections must be transposed too -- the case a shape check can't see
+    q = flat[n_tok:n_tok + D * D].reshape(D, D)
+    assert np.max(np.abs(q - tensors["blk.0.attn_q.weight"].T)) < 1e-2
+    o = flat[n_tok + 3 * D * D:n_tok + 4 * D * D].reshape(D, D)
+    assert np.max(np.abs(o - tensors["blk.0.attn_output.weight"].T)) < 1e-2
 
 
 def test_gguf_gqa_export(tmp_path):
@@ -229,15 +243,16 @@ def test_gguf_gqa_export(tmp_path):
     D, kvD = 8, 2  # head_dim = 2, kv_heads=1
     tensors = {
         "token_embd.weight": rng.normal(0, 0.1, (17, D)).astype(np.float32),
+        # linear weights in torch orientation (out_features, in_features)
         "blk.0.attn_q.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
-        "blk.0.attn_k.weight": rng.normal(0, 0.1, (D, kvD)).astype(np.float32),
-        "blk.0.attn_v.weight": rng.normal(0, 0.1, (D, kvD)).astype(np.float32),
+        "blk.0.attn_k.weight": rng.normal(0, 0.1, (kvD, D)).astype(np.float32),
+        "blk.0.attn_v.weight": rng.normal(0, 0.1, (kvD, D)).astype(np.float32),
         "blk.0.attn_output.weight": rng.normal(0, 0.1, (D, D)).astype(np.float32),
         "blk.0.attn_norm.weight": rng.normal(0, 0.1, (D,)).astype(np.float32),
-        "blk.0.ffn_gate.weight": rng.normal(0, 0.1, (D, 32)).astype(np.float32),
-        "blk.0.ffn_up.weight": rng.normal(0, 0.1, (D, 32)).astype(np.float32),
+        "blk.0.ffn_gate.weight": rng.normal(0, 0.1, (32, D)).astype(np.float32),
+        "blk.0.ffn_up.weight": rng.normal(0, 0.1, (32, D)).astype(np.float32),
         "blk.0.ffn_norm.weight": rng.normal(0, 0.1, (D,)).astype(np.float32),
-        "blk.0.ffn_down.weight": rng.normal(0, 0.1, (32, D)).astype(np.float32),
+        "blk.0.ffn_down.weight": rng.normal(0, 0.1, (D, 32)).astype(np.float32),
         "output_norm.weight": rng.normal(0, 0.1, (D,)).astype(np.float32),
     }
     gguf = tmp_path / "gqa.gguf"
@@ -251,12 +266,12 @@ def test_gguf_gqa_export(tmp_path):
     per_layer = 2 * D * D + 2 * D * kvD + 2 * D + 2 * D * 32 + 32 * D
     assert len(flat) == n_tok + per_layer + D
     k = flat[n_tok + D * D:n_tok + D * D + D * kvD].reshape(D, kvD)
-    assert np.allclose(k, tensors["blk.0.attn_k.weight"], atol=1e-2)
+    assert np.allclose(k, tensors["blk.0.attn_k.weight"].T, atol=1e-2)
     # gate_up holds gate then up (after q,k,v,o,n1)
     gu_off = n_tok + 2 * D * D + 2 * D * kvD + D
     gu = flat[gu_off:gu_off + 2 * D * 32].reshape(D, 2 * 32)
-    assert np.allclose(gu[:, :32], tensors["blk.0.ffn_gate.weight"], atol=1e-2)
-    assert np.allclose(gu[:, 32:], tensors["blk.0.ffn_up.weight"], atol=1e-2)
+    assert np.allclose(gu[:, :32], tensors["blk.0.ffn_gate.weight"].T, atol=1e-2)
+    assert np.allclose(gu[:, 32:], tensors["blk.0.ffn_up.weight"].T, atol=1e-2)
 
 
 def test_export_tinygrad_gqa(tmp_path):
@@ -328,6 +343,63 @@ def test_gguf_k_quants(tmp_path):
     name, dims, gtype, off = infos[0]
     assert gtype == "F32"
     assert _tensor_data(buf, name, dims, gtype, off, base).shape == (256,)
+
+
+def test_dequant_matches_gguf_py():
+    """Every dequant, byte-exact against gguf-py on RANDOM data.
+
+    The hand-written fixtures above use uniform fills, so any within-block
+    element permutation passes them. Random bytes pin the ordering down -- this
+    is what catches a wrong nibble split (Q4_0/Q4_1) or bit-plane order (TQ2_0).
+    """
+    gguf = pytest.importorskip("gguf")
+    from gguf.constants import GGMLQuantizationType as QT
+    from tools.export_model import _dequant
+
+    rng = np.random.default_rng(7)
+
+    # types gguf-py can round-trip from floats
+    for name, qt in [("Q4_0", QT.Q4_0), ("Q4_1", QT.Q4_1),
+                     ("Q5_0", QT.Q5_0), ("Q8_0", QT.Q8_0)]:
+        x = rng.standard_normal(1024).astype(np.float32) * 0.5
+        raw = gguf.quants.quantize(x, qt).tobytes()
+        ref = gguf.quants.dequantize(np.frombuffer(raw, np.uint8), qt).astype(np.float32)
+        got = _dequant(name, raw, (1024,), name)
+        assert np.array_equal(got, ref.reshape(-1)), f"{name}: max {np.abs(got - ref).max()}"
+
+    # k-quants: gguf-py only dequantizes these, so drive them from random blocks
+    for name, qt, block_bytes in [("Q2_K", QT.Q2_K, 84), ("Q4_K", QT.Q4_K, 144),
+                                  ("Q6_K", QT.Q6_K, 210), ("TQ2_0", QT.TQ2_0, 66)]:
+        nb = 4
+        raw = rng.integers(0, 256, nb * block_bytes, dtype=np.uint8)
+        raw[1::2] &= 0x3B  # tame every f16 slot's exponent: no NaN/Inf in the ref
+        raw = raw.tobytes()
+        ref = gguf.quants.dequantize(np.frombuffer(raw, np.uint8), qt).astype(np.float32)
+        got = _dequant(name, raw, (nb * 256,), name)
+        assert np.array_equal(got, ref.reshape(-1)), f"{name}: max {np.abs(got - ref).max()}"
+
+
+def test_gguf_merges_keep_hash_prefixed_entries(tmp_path):
+    """Byte-level BPE has real merges starting with '#'; they must survive export."""
+    D, V = 8, 4
+    merges = ["Ġ t", "# #", "## #", "#$ #$"]
+    meta = {
+        "general.architecture": "llama", "llama.block_count": 0,
+        "llama.embedding_length": D, "llama.attention.head_count": 2,
+        "llama.attention.head_count_kv": 2, "llama.feed_forward_length": 16,
+        "llama.context_length": 32, "llama.vocab_size": V,
+        "tokenizer.ggml.tokens": ["a", "b", "#", "##"],
+        "tokenizer.ggml.merges": merges,
+    }
+    tensors = {
+        "token_embd.weight": np.zeros((V, D), np.float32),
+        "output_norm.weight": np.ones(D, np.float32),
+    }
+    gguf = tmp_path / "tok.gguf"
+    _write_gguf(gguf, meta, tensors)
+    out = export_gguf(gguf)
+    assert out["merges"] == merges
+    assert out["vocab"] == {"a": 0, "b": 1, "#": 2, "##": 3}
 
 
 def test_export_cli(tmp_path, monkeypatch):

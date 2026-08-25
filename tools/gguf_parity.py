@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Real-GGUF parity check: tinygrad pure-matmul reference vs the browser JS model.
+"""Real-GGUF parity check: numpy pure-matmul reference vs the browser JS model.
 
-Builds a llama-arch forward in tinygrad (embedding, RMSNorm, RoPE, GQA attention,
+Builds a llama-arch forward in numpy (embedding, RMSNorm, RoPE, GQA attention,
 SwiGLU, final norm, lm_head) from the dequantized weights of a real GGUF, runs it
 on fixed token ids, then runs the SAME wire-format weights through the JS engine
 (node + gabionLoader) and compares logits. The Python adapter is a BitLinear
 (ternary) transformer and cannot serve as a float-model reference.
+
+Both sides emit [B*(T-1), V] -- the last position is dropped -- and EVERY logit is
+compared, so an error at t>0 (RoPE, causal mask, GQA grouping) cannot hide behind a
+truncated sample.
 
 Usage: python tools/gguf_parity.py <model.gguf> [--tokens 0 1 2 3 ...]
 """
@@ -29,9 +33,7 @@ from tools.export_model import export_gguf, f16_decode  # noqa: E402
 
 
 def build_reference(out: dict, tokens: list[int], B: int = 1, T: int = 8):
-    """Pure-matmul llama forward in tinygrad; returns (logits_np, flat_weights)."""
-    from tinygrad import Tensor
-
+    """Pure-matmul llama forward in numpy; returns (logits_np, flat_weights)."""
     cfg = out["config"]
     V, D, H, kvH, L, dFF = (cfg["vocab_size"], cfg["d_model"], cfg["n_heads"],
                             cfg["n_kv_heads"], cfg["n_layers"], cfg["d_ff"])
@@ -122,6 +124,7 @@ def run_js(flat: np.ndarray, out: dict, tokens: list[int], B: int, T: int) -> di
     """
     cfg = out["config"]
     bin_path = Path(ROOT) / ".gguf_parity_flat.f32"
+    logits_path = Path(ROOT) / ".gguf_parity_logits.f32"
     bin_path.write_bytes(np.asarray(flat, dtype="<f4").tobytes())
     src = f"""
 const fs = require('fs'), vm = require('vm');
@@ -157,19 +160,29 @@ for (const rel of ['gabion/web/tinygrad_v0.js','gabion/web/bbt_forward.js','gabi
   if (consumed !== weights.length) throw new Error(`cursor ${{consumed}} != ${{weights.length}}`);
   const xFlat = Int32Array.from(tokens);
   const logits = await model.forward(xFlat, {B}, {T}, false);
-  console.log(JSON.stringify({{ n: logits.data.length, data: Array.from(logits.data.slice(0, 5000)) }}));
+  // Write every logit as binary; JSON.stringify of ~1e6 floats is slow and the
+  // old `.slice(0, 5000)` silently reduced the comparison to a fraction of row 0.
+  const d = logits.data;
+  fs.writeFileSync({json.dumps(str(logits_path))},
+    Buffer.from(d.buffer, d.byteOffset, d.byteLength));
+  console.log(JSON.stringify({{ n: d.length }}));
 }})().catch(e => {{ console.error(e); process.exit(1); }});
 """
     tmp = Path(ROOT) / ".gguf_parity_tmp.cjs"
     tmp.write_text(src, encoding="utf-8")
     try:
         proc = subprocess.run(["node", str(tmp)], cwd=str(ROOT), capture_output=True, text=True, timeout=900)
+        if proc.returncode != 0:
+            raise RuntimeError(f"node failed: {proc.stderr[:2000]}")
+        lines = proc.stdout.strip().splitlines()
+        if not lines:
+            raise RuntimeError(f"node produced no stdout; stderr: {proc.stderr[:2000]}")
+        res = json.loads(lines[-1])
+        res["data"] = np.fromfile(logits_path, dtype="<f4")
     finally:
         tmp.unlink(missing_ok=True)
         bin_path.unlink(missing_ok=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"node failed: {proc.stderr[:2000]}")
-    res = json.loads(proc.stdout.strip().splitlines()[-1])
+        logits_path.unlink(missing_ok=True)
     return res
 
 
@@ -190,9 +203,17 @@ def main() -> int:
         print(f"     wire json -> {args.out_json}")
 
     T = min(args.seq, cfg["seq_len"])
-    tokens = args.tokens or [0, 1, 2, 3, 4, 5, 6, 7][:T]
-    tokens = tokens[:T]
-    print(f"[2/3] tinygrad reference forward (T={T}, tokens={tokens}) ...")
+    if T < 2:
+        raise SystemExit("--seq must be >= 2: the last position is dropped from the logits")
+    # cycle rather than truncate, so --seq beyond the supplied/default token list works
+    base = list(args.tokens) if args.tokens else [0, 1, 2, 3, 4, 5, 6, 7]
+    if not base:
+        raise SystemExit("--tokens given but empty")
+    bad = [t for t in base if not 0 <= t < cfg["vocab_size"]]
+    if bad:
+        raise SystemExit(f"token ids out of range for vocab_size={cfg['vocab_size']}: {bad}")
+    tokens = [base[i % len(base)] for i in range(T)]
+    print(f"[2/3] numpy reference forward (T={T}, tokens={tokens}) ...")
     ref, flat = build_reference(out, tokens, B=1, T=T)
     print(f"     ref logits [{ref.shape[0]}x{ref.shape[1]}], finite={np.isfinite(ref).all()}, std={np.std(ref):.4f}")
 
@@ -200,10 +221,20 @@ def main() -> int:
     js = run_js(flat, out, tokens, 1, T)
     ref_flat = np.asarray(ref).reshape(-1).astype(np.float64)
     js_data = np.asarray(js["data"], dtype=np.float64)
-    n = min(len(ref_flat), len(js_data))
-    d = np.abs(ref_flat[:n] - js_data[:n])
-    print(f"     logits compared: {n} (js={js['n']}, ref={len(ref_flat)})")
-    print(f"     max_abs={d.max():.3e} mean_abs={d.mean():.3e}")
+    # Both sides are [B*(T-1), V]; a length mismatch is itself a parity failure and
+    # must not be papered over by comparing a common prefix.
+    if len(js_data) != len(ref_flat):
+        print(f"     LENGTH MISMATCH js={len(js_data)} ref={len(ref_flat)}")
+        print("verdict FAIL")
+        return 2
+    d = np.abs(ref_flat - js_data)
+    worst = int(np.argmax(d))
+    print(f"     logits compared: {len(d)} (all of [{ref.shape[0]}x{ref.shape[1]}])")
+    print(f"     max_abs={d.max():.3e} mean_abs={d.mean():.3e} "
+          f"(worst at position {worst // ref.shape[1]}, vocab {worst % ref.shape[1]})")
+    # per-position worst, so an error confined to t>0 is visible rather than averaged away
+    per_pos = d.reshape(ref.shape).max(axis=1)
+    print("     per-position max_abs: " + " ".join(f"{v:.2e}" for v in per_pos))
     ok = d.max() < 1e-3 and math.isfinite(float(np.mean(js_data)))
     print("verdict", "PASS" if ok else "FAIL")
     return 0 if ok else 2

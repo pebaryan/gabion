@@ -56,6 +56,11 @@ function check(name, cond, detail = "") {
   const stressBack = tok.decode(stressIds);
   check("gpt2 unicode round-trip", stressBack === stress, JSON.stringify(stressBack));
 
+  // '#'-prefixed merges ("# #" -> "##", "## ##" -> "####") are real BPE rules and
+  // must be present in the fixture; dropping them silently splits "####" into pieces
+  const hashIds = Array.from(tok.encode("####"));
+  check("gpt2 '#' merges applied", hashIds.length === 1 && hashIds[0] === 4242, JSON.stringify(hashIds));
+
   // Idempotent: re-encoding the decoded text gives the same ids
   const reIds = Array.from(tok.encode(stressBack));
   check("gpt2 encode(decode(x)) stable", JSON.stringify(reIds) === JSON.stringify(Array.from(stressIds)));
