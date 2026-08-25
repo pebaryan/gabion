@@ -49,11 +49,11 @@
 <div id="stats"></div>
 <pre id="resultJson" hidden>{}</pre>
 
-<script src="/gabion/web/tinygrad_v0.js?v=14"></script>
-<script src="/gabion/web/webgpu_backend.js?v=14"></script>
-<script src="/gabion/web/tokenizer.js?v=14"></script>
-<script src="/gabion/web/bbt_forward.js?v=14"></script>
-<script src="/gabion/web/model_loader.js?v=14"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=15"></script>
+<script src="/gabion/web/webgpu_backend.js?v=15"></script>
+<script src="/gabion/web/tokenizer.js?v=15"></script>
+<script src="/gabion/web/bbt_forward.js?v=15"></script>
+<script src="/gabion/web/model_loader.js?v=15"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -178,6 +178,10 @@ async function generate() {
     if (coordGPU) {
       coord.tokEmb.weight.toGPU();
       coord._headW = coord.tokEmb.weight.transpose2d();
+      // Free the untransposed embedding GPU copy — only headW is needed;
+      // keeping both (1.09GB) with the shards' weights risks device loss.
+      coord.tokEmb.weight.gpuBuffer = null;
+      coord.tokEmb.weight._dirty = "cpu";
     } else {
       coord._headW = coord.tokEmb.weight.transpose2d();
     }
