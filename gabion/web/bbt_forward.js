@@ -1106,8 +1106,9 @@
               const ik = 1 / Math.sqrt(sk + 1e-6);
               for (let r = 0; r < rep; r++) {
                 for (let j = 0; j < S.hk; j++) {
-                  q2[(h * rep + r) * S.hk + j] = y[h * S.hk + j] * iq;
-                  k2[(h * rep + r) * S.hk + j] = y[kd + h * S.hk + j] * ik;
+                  // tinygrad's repeat is a TILE: heads [h0..h15, h0..h15] (v = r*nk + h)
+                  q2[(r * S.nk + h) * S.hk + j] = y[h * S.hk + j] * iq;
+                  k2[(r * S.nk + h) * S.hk + j] = y[kd + h * S.hk + j] * ik;
                 }
               }
             }
@@ -1172,6 +1173,9 @@
               dbg.beta = Float32Array.from(beta);
               dbg.state = Float32Array.from(
                 this._q35RecStates.subarray(l * S.nv * S.hv * S.hk, (l + 1) * S.nv * S.hv * S.hk));
+              dbg.q2 = Float32Array.from(q2);
+              dbg.k2 = Float32Array.from(k2);
+              dbg.v4 = Float32Array.from(vv);
             }
             x = x.add(Tensor.fromArray(o, [1, 1, D], false));
           } else if (this.arch === "lfm2" && bl.isConv) {
