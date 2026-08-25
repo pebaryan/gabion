@@ -40,7 +40,7 @@
       this.D = config.dModel || 64;
       this.H = config.nHeads || 4;
       this.kvH = config.kvHeads || config.nHeads || 4;
-      this.L = config.nLayers || 2;
+      this.L = config.nLayers != null ? config.nLayers : 2;
       this.T = config.seqLen || 32;
       this.dFF = config.dFF || (this.D * 4);
       this.tieWeights = config.tieWeights !== false;

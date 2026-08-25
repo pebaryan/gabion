@@ -123,7 +123,7 @@
     if (!spec) throw new Error(`no shard ${index} in manifest`);
     const fres = await fetch(f16Url);
     if (!fres.ok) throw new Error(`fetch ${f16Url}: ${fres.status}`);
-    return _buildModel(manifest, f16ToF32(await fres.arrayBuffer()), spec.layers);
+    return _buildModel(manifest, f16ToF32(await fres.arrayBuffer()), { layerRange: spec.layers });
   }
 
   /** Attach tokenize / generateText conveniences to a BBTTransformer. */
