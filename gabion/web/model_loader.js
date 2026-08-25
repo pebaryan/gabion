@@ -5,20 +5,28 @@
 (function () {
   "use strict";
 
-  /** Build a BBTTransformer from wire data (config + weights + optional tokenizer). */
-  function buildModel(data, weights) {
+  /**
+   * Build a BBTTransformer from wire data. layerRange [start, end) selects a
+   * layer slice (shard worker: lean model, layer-only weights); null = full model.
+   */
+  function _buildModel(data, weights, layerRange = null) {
     if (!data.config) throw new Error("not a gabion wire-format model");
     const c = data.config;
+    const start = layerRange ? layerRange[0] : 0;
+    const L = layerRange ? layerRange[1] - layerRange[0] : c.n_layers;
     const model = new window.tinygradV0.BBTTransformer({
       vocabSize: c.vocab_size, dModel: c.d_model, nHeads: c.n_heads,
-      kvHeads: c.n_kv_heads || c.n_heads, nLayers: c.n_layers,
+      kvHeads: c.n_kv_heads || c.n_heads, nLayers: L,
       seqLen: c.seq_len, dFF: c.d_ff,
       tieWeights: c.tie_weights, actQuant: c.act_quant, ropeBase: c.rope_base,
-      qBiases: data.q_bias ? data.q_bias.map(a => new Float32Array(a)) : null,
-      kBiases: data.k_bias ? data.k_bias.map(a => new Float32Array(a)) : null,
-      vBiases: data.v_bias ? data.v_bias.map(a => new Float32Array(a)) : null,
+      lean: !!layerRange,
+      qBiases: data.q_bias ? data.q_bias.slice(start, start + L).map(a => new Float32Array(a)) : null,
+      kBiases: data.k_bias ? data.k_bias.slice(start, start + L).map(a => new Float32Array(a)) : null,
+      vBiases: data.v_bias ? data.v_bias.slice(start, start + L).map(a => new Float32Array(a)) : null,
     });
-    const consumed = model.loadFlatWeights(weights, false);
+    const consumed = layerRange
+      ? model.loadFlatLayerWeights(weights, false)
+      : model.loadFlatWeights(weights, false);
     if (consumed !== weights.length) {
       throw new Error(`weight cursor mismatch: consumed ${consumed} of ${weights.length}`);
     }
@@ -26,7 +34,13 @@
       model.tokenizer = new window.GPT2Tokenizer({ vocab: data.vocab, merges: data.merges, special: data.special });
     }
     model.chatTemplate = data.chat_template || null;
+    model.shardLayers = layerRange ? [start, start + L] : null;
     return attachGenerators(model);
+  }
+
+  /** Build a BBTTransformer from wire data (config + weights + optional tokenizer). */
+  function buildModel(data, weights) {
+    return _buildModel(data, weights, null);
   }
 
   async function loadBBTModel(url) {
@@ -76,6 +90,39 @@
     return lut;
   }
 
+  /** f16 ArrayBuffer -> Float32Array via the half->float LUT. */
+  function f16ToF32(buf) {
+    if (buf.byteLength % 2 !== 0) throw new Error("f16 flat has odd byte length");
+    const u16 = new Uint16Array(buf);
+    const out = new Float32Array(u16.length);
+    const lut = halfToFloatLUT();
+    for (let i = 0; i < u16.length; i++) out[i] = lut[u16[i]];
+    return out;
+  }
+
+  /** Sharded wire: fetch the manifest (model.json) — config/vocab/biases/shard specs. */
+  async function loadBBTShards(jsonUrl) {
+    const res = await fetch(jsonUrl);
+    if (!res.ok) throw new Error(`fetch ${jsonUrl}: ${res.status}`);
+    return await res.json();
+  }
+
+  /** Coordinator model: manifest + coord.f16 (embedding + final norm [+ lm_head]). */
+  async function loadCoordinator(manifest, f16Url) {
+    const fres = await fetch(f16Url);
+    if (!fres.ok) throw new Error(`fetch ${f16Url}: ${fres.status}`);
+    return _buildModel(manifest, f16ToF32(await fres.arrayBuffer()), null);
+  }
+
+  /** Shard worker model: manifest + shard_{i}.f16 (layer blocks only). */
+  async function loadShard(manifest, f16Url, index) {
+    const spec = manifest.shards[index];
+    if (!spec) throw new Error(`no shard ${index} in manifest`);
+    const fres = await fetch(f16Url);
+    if (!fres.ok) throw new Error(`fetch ${f16Url}: ${fres.status}`);
+    return _buildModel(manifest, f16ToF32(await fres.arrayBuffer()), spec.layers);
+  }
+
   /** Attach tokenize / generateText conveniences to a BBTTransformer. */
   function attachGenerators(model) {
     if (model.tokenize) return model;
@@ -95,5 +142,5 @@
     return model;
   }
 
-  window.gabionLoader = { loadBBTModel, loadBBTModelBin, attachGenerators };
+  window.gabionLoader = { loadBBTModel, loadBBTModelBin, loadBBTShards, loadCoordinator, loadShard, attachGenerators };
 })();

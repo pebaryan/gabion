@@ -1085,6 +1085,10 @@ def main() -> int:
     ap.add_argument("--out-bin", type=Path, default=None,
                     help="write a binary wire instead: model.json (config/vocab/merges, "
                          "no weights) + weights.f16 (raw little-endian f16 flat) into DIR")
+    ap.add_argument("--out-shards", nargs=2, metavar=("N", "DIR"), default=None,
+                    help="write a sharded wire: model.json (manifest) + coord.f16 "
+                         "(embedding + final norm) + shard_{i}.f16 (contiguous layer "
+                         "slices of the flat) — one shard file per browser worker")
     args = ap.parse_args()
 
     if args.from_gguf:
@@ -1115,6 +1119,39 @@ def main() -> int:
             out["config"]["tokenizer"] = args.with_tokenizer
 
     n_weights = len(f16_decode(out["weights_b64"]))
+    if args.out_shards:
+        n = int(args.out_shards[0])
+        d = Path(args.out_shards[1])
+        d.mkdir(parents=True, exist_ok=True)
+        cfg = out["config"]
+        V, D, L = cfg["vocab_size"], cfg["d_model"], cfg["n_layers"]
+        kvD = D // cfg["n_heads"] * cfg["n_kv_heads"]
+        dFF = cfg.get("d_ff") or (D * 4)
+        per = 2 * D * D + 2 * D * kvD + 2 * D + 2 * D * dFF + dFF * D
+        f16 = np.frombuffer(base64.b64decode(out["weights_b64"]), dtype="<u2").view(np.float16)
+        tok_n = V * D
+        assert len(f16) == tok_n + L * per + D + (0 if cfg["tie_weights"] else D * V)
+        # coordinator: embedding + tail (final norm [+ lm_head when untied])
+        coord = np.concatenate([f16[:tok_n], f16[tok_n + L * per:]]).view("<u2").tobytes()
+        (d / "coord.f16").write_bytes(coord)
+        # shards: contiguous per-layer slices of the flat
+        shards = []
+        bounds = [round(i * L / n) for i in range(n + 1)]
+        for i in range(n):
+            a, b = bounds[i], bounds[i + 1]
+            if a == b:
+                shards.append(None)
+                continue
+            sl = f16[tok_n + a * per: tok_n + b * per].view("<u2").tobytes()
+            (d / f"shard_{i}.f16").write_bytes(sl)
+            shards.append({"layers": [a, b], "file": f"shard_{i}.f16", "n_layers": b - a})
+        out["shards"] = shards
+        out["coord"] = {"file": "coord.f16"}
+        out.pop("weights_b64")
+        (d / "model.json").write_text(json.dumps(out), encoding="utf-8")
+        print(f"wrote {d / 'model.json'} + coord.f16 + {sum(1 for s in shards if s)} shard files "
+              f"({n_weights} weights total, {len(out.get('vocab', {})) if out.get('vocab') else 0} vocab tokens)")
+        return 0
     if args.out_bin:
         d = Path(args.out_bin)
         d.mkdir(parents=True, exist_ok=True)

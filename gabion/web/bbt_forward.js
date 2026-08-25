@@ -55,7 +55,8 @@
       this._vBiases = config.vBiases || null;
 
       // nn layers
-      this.tokEmb = new nn.Embedding(this.V, this.D);
+      this.lean = !!config.lean; // shard workers: no embedding/norm/lm-head
+      this.tokEmb = this.lean ? new nn.Embedding(1, 1) : new nn.Embedding(this.V, this.D);
       this.layers = [];
       for (let l = 0; l < this.L; l++) {
         const bl = new TransformerBlock(this.D, this.H, this.kvD, this.dFF);
@@ -64,8 +65,8 @@
         if (this._vBiases) bl.vBias = this._vBiases[l];
         this.layers.push(bl);
       }
-      this.normF = new nn.RMSNorm(this.D);
-      if (!this.tieWeights) {
+      this.normF = this.lean ? new nn.RMSNorm(1) : new nn.RMSNorm(this.D);
+      if (!this.tieWeights && !this.lean) {
         this.lmHead = new nn.Linear(this.D, this.V);
       }
 
@@ -144,6 +145,31 @@
       take(this.normF.weight);
       if (!this.tieWeights) {
         take(this.lmHead.weight, uploadToGPU);
+      }
+      return cursor;
+    }
+
+    /** Load ONLY the per-layer weight blocks (shard files: no embedding/norm).
+     *  Same per-layer order/sizes as loadFlatWeights. */
+    loadFlatLayerWeights(flatWeights, uploadToGPU = false) {
+      let cursor = 0;
+      const take = (tensor, gpuUpload = false) => {
+        const size = tensor.numel;
+        tensor.data.set(flatWeights.subarray(cursor, cursor + size));
+        tensor.markCPUDirty();
+        if (gpuUpload) tensor.toGPU();
+        cursor += size;
+      };
+      for (let l = 0; l < this.L; l++) {
+        const bl = this.layers[l];
+        take(bl.q.weight, uploadToGPU);
+        take(bl.k.weight, uploadToGPU);
+        take(bl.v.weight, uploadToGPU);
+        take(bl.o.weight, uploadToGPU);
+        take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
+        take(bl.gateUp.weight, uploadToGPU);
+        take(bl.norm2.weight);          // CPU (1D)
+        take(bl.down.weight, uploadToGPU);
       }
       return cursor;
     }
@@ -803,6 +829,103 @@
     }
 
     /**
+     * Layers-only forward over hidden states, with KV-cache fill + causal cache
+     * attention. h: Tensor [B, T, D]. Processes rows at absolute positions
+     * startPos..startPos+T-1: for each row, every layer runs norm1 -> q/k/v
+     * (with attention biases) -> RoPE at the absolute position -> cache append
+     * -> KV attention over the prefix -> o_proj -> residual -> norm2 -> SwiGLU
+     * -> residual. Advances state.pos to startPos + T. Used by decodeStep (T=1)
+     * and by shard workers (T>=1 prefill, T=1 decode). Requires a WebGPU
+     * backend (the CPU fallback lives in decodeStep).
+     */
+    async forwardHidden(h, B, T, state, startPos = 0, ternarize = false, debugNaN = false) {
+      const D = this.D, H = this.H, BH = H, kvH = this.kvH, headDim = this.headDim;
+      const backend = window.WebGPUBackend && WebGPUBackend.instance;
+      const chk = (stage, buf) => {
+        if (!debugNaN || !buf) return;
+        for (let i = 0; i < buf.length; i++) if (!Number.isFinite(buf[i])) {
+          throw new Error(`NaN at pos=${startPos} ${stage}`);
+        }
+      };
+      const outData = new Float32Array(B * T * D);
+      for (let r = 0; r < T; r++) {
+        const pos = startPos + r;
+        let x = Tensor.fromArray(h.data.subarray(r * D, (r + 1) * D), [B, 1, D], false);
+        for (let l = 0; l < this.L; l++) {
+          const bl = this.layers[l];
+          // Pre-norm + q/k/v projections
+          let hh = bl.norm1.forward(x);
+          const h2d = hh.reshape([1, D]);
+          let q, k, v;
+          if (ternarize) {
+            q = this._bitlinear(h2d, bl.q.weight);
+            k = this._bitlinear(h2d, bl.k.weight);
+            v = this._bitlinear(h2d, bl.v.weight);
+          } else {
+            q = h2d.matmul(bl.q.weight);
+            k = h2d.matmul(bl.k.weight);
+            v = h2d.matmul(bl.v.weight);
+          }
+          if (q.onGPU) await q.toCPU();
+          if (k.onGPU) await k.toCPU();
+          if (v.onGPU) await v.toCPU();
+          chk("layer" + l + ".q", q.data); chk("layer" + l + ".k", k.data); chk("layer" + l + ".v", v.data);
+          // Attention biases (Qwen2.5-Instruct): affine projections
+          if (bl.qBias) for (let i = 0; i < q.data.length; i++) q.data[i] += bl.qBias[i % bl.qBias.length];
+          if (bl.kBias) for (let i = 0; i < k.data.length; i++) k.data[i] += bl.kBias[i % bl.kBias.length];
+          if (bl.vBias) for (let i = 0; i < v.data.length; i++) v.data[i] += bl.vBias[i % bl.vBias.length];
+
+          // Heads + RoPE at the absolute position (k/v have kvH heads under GQA)
+          q = this._reshapeForHeads(q, 1, 1, H, headDim);
+          k = this._reshapeForHeads(k, 1, 1, kvH, headDim);
+          v = this._reshapeForHeads(v, 1, 1, kvH, headDim);
+          q = this._applyRoPE(q, BH, 1, headDim, pos);
+          k = this._applyRoPE(k, kvH, 1, headDim, pos);
+          if (q.onGPU) await q.toCPU();
+          if (k.onGPU) await k.toCPU();
+          chk("layer" + l + ".q_rope", q.data); chk("layer" + l + ".k_rope", k.data);
+
+          // Append k/v into the cache at position pos ([kvH, maxLen, headDim] layout)
+          const kCache = state.kCaches[l], vCache = state.vCaches[l];
+          for (let kv = 0; kv < kvH; kv++) {
+            backend.writeBufferAt(kCache.gpuBuffer, k.data.subarray(kv * headDim, (kv + 1) * headDim), (kv * state.maxLen + pos) * headDim);
+            backend.writeBufferAt(vCache.gpuBuffer, v.data.subarray(kv * headDim, (kv + 1) * headDim), (kv * state.maxLen + pos) * headDim);
+          }
+
+          // Attend over the prefix (0..pos) via the KV-cache kernels (GQA: query
+          // head bh attends to cache row (bh * kvH) / H — mapped inside the kernels).
+          // The cache is [kvH, maxLen, headDim] with slots > pos uninitialized, so
+          // causal=1 masks j > pos to -inf BEFORE any cache read (kernels do this);
+          // L stays maxLen (it doubles as the cache row stride in the kernels).
+          const qT = Tensor.fromArray(q.data, [BH, headDim], false).toGPU();
+          const y = kvAttention(qT, kCache, vCache, { causal: true, pos, kvH, H });
+          // toCPU() returns the Tensor (data updated in place) — take .data
+          const yData = (await y.toCPU()).data;
+          chk("layer" + l + ".attn", yData);
+
+          // Reshape back, output projection, residual
+          const y3 = this._reshapeFromHeads(Tensor.fromArray(yData, [BH, 1, headDim], false), 1, 1, H, headDim);
+          const o = (ternarize ? this._bitlinear(y3.reshape([1, D]), bl.o.weight) : y3.reshape([1, D]).matmul(bl.o.weight)).reshape([1, 1, D]);
+          if (o.onGPU) await o.toCPU();
+          chk("layer" + l + ".o", o.data);
+          x = x.add(o);
+          chk("layer" + l + ".x", x.data);
+
+          // FFN + residual
+          let h2 = bl.norm2.forward(x);
+          h2 = await this._swiGLU(h2, 1, 1, bl.gateUp.weight, bl.down.weight, ternarize);
+          if (h2.onGPU) await h2.toCPU();
+          chk("layer" + l + ".h2", h2.data);
+          x = x.add(h2);
+          chk("layer" + l + ".x2", x.data);
+        }
+        outData.set(x.data, r * D);
+      }
+      state.pos = startPos + T;
+      return Tensor.fromArray(outData, [B, T, D], false);
+    }
+
+    /**
      * Autoregressive decode of one token (predicts the token AFTER tokenId given the
      * cached prefix). tokenId: number, state: from initKVCache().
      * Returns { logits: Float32Array[V], state }.
@@ -812,7 +935,7 @@
      * interchangeable and the fallback doubles as a reference.
      */
     async decodeStep(tokenId, state, ternarize = false, debugNaN = false) {
-      const D = this.D, H = this.H, V = this.V, headDim = this.headDim, BH = H, kvH = this.kvH;
+      const D = this.D, V = this.V;
       const backend = window.WebGPUBackend && WebGPUBackend.instance;
       const pos = state.pos;
       if (pos >= state.maxLen) throw new Error(`KV cache full (maxLen=${state.maxLen})`);
@@ -838,80 +961,7 @@
       this._ensureRopeGPU();
       let x = this.tokEmb.forward(new Int32Array([tokenId]), 1, 1);
       if (x.onGPU) await x.toCPU();
-
-      for (let l = 0; l < this.L; l++) {
-        const bl = this.layers[l];
-        // Pre-norm + q/k/v projections
-        let h = bl.norm1.forward(x);
-        const h2d = h.reshape([1, D]);
-        let q, k, v;
-        if (ternarize) {
-          q = this._bitlinear(h2d, bl.q.weight);
-          k = this._bitlinear(h2d, bl.k.weight);
-          v = this._bitlinear(h2d, bl.v.weight);
-        } else {
-          q = h2d.matmul(bl.q.weight);
-          k = h2d.matmul(bl.k.weight);
-          v = h2d.matmul(bl.v.weight);
-        }
-        if (q.onGPU) await q.toCPU();
-        if (k.onGPU) await k.toCPU();
-        if (v.onGPU) await v.toCPU();
-        chk("layer" + l + ".q", q.data); chk("layer" + l + ".k", k.data); chk("layer" + l + ".v", v.data);
-        // Attention biases (Qwen2.5-Instruct): affine projections
-        if (bl.qBias) for (let i = 0; i < q.data.length; i++) q.data[i] += bl.qBias[i % bl.qBias.length];
-        if (bl.kBias) for (let i = 0; i < k.data.length; i++) k.data[i] += bl.kBias[i % bl.kBias.length];
-        if (bl.vBias) for (let i = 0; i < v.data.length; i++) v.data[i] += bl.vBias[i % bl.vBias.length];
-
-        // Heads + RoPE at the absolute position (k/v have kvH heads under GQA)
-        q = this._reshapeForHeads(q, 1, 1, H, headDim);
-        k = this._reshapeForHeads(k, 1, 1, kvH, headDim);
-        v = this._reshapeForHeads(v, 1, 1, kvH, headDim);
-        q = this._applyRoPE(q, BH, 1, headDim, pos);
-        k = this._applyRoPE(k, kvH, 1, headDim, pos);
-        if (q.onGPU) await q.toCPU();
-        if (k.onGPU) await k.toCPU();
-        chk("layer" + l + ".q_rope", q.data); chk("layer" + l + ".k_rope", k.data);
-
-        // Append k/v into the cache at position pos ([kvH, maxLen, headDim] layout)
-        const kCache = state.kCaches[l], vCache = state.vCaches[l];
-        for (let kv = 0; kv < kvH; kv++) {
-          backend.writeBufferAt(kCache.gpuBuffer, k.data.subarray(kv * headDim, (kv + 1) * headDim), (kv * state.maxLen + pos) * headDim);
-          backend.writeBufferAt(vCache.gpuBuffer, v.data.subarray(kv * headDim, (kv + 1) * headDim), (kv * state.maxLen + pos) * headDim);
-        }
-
-        // Attend over the prefix (0..pos) via the KV-cache kernels (GQA: query
-        // head bh attends to cache row (bh * kvH) / H — mapped inside the kernels).
-        // The cache is [kvH, maxLen, headDim] with slots > pos uninitialized, so
-        // causal=1 masks j > pos to -inf BEFORE any cache read (kernels do this);
-        // L stays maxLen (it doubles as the cache row stride in the kernels).
-        const qT = Tensor.fromArray(q.data, [BH, headDim], false).toGPU();
-        const y = kvAttention(qT, kCache, vCache, { causal: true, pos, kvH, H });
-        // toCPU() returns the Tensor (data updated in place) — take .data
-        const yData = (await y.toCPU()).data;
-        chk("layer" + l + ".attn", yData);
-
-        // Reshape back, output projection, residual
-        const y3 = this._reshapeFromHeads(Tensor.fromArray(yData, [BH, 1, headDim], false), 1, 1, H, headDim);
-        if (debugNaN) {
-          if (!Number.isFinite(y3.data[0])) {
-            throw new Error(`NaN at pos=${pos} layer${l}.o y3[0..3]=${Array.from(y3.data.slice(0, 4))} yData[0..3]=${Array.from(yData.slice(0, 4))} yDataLen=${yData.length} bh=${BH} hd=${headDim} y3len=${y3.data.length}`);
-          }
-        }
-        const o = (ternarize ? this._bitlinear(y3.reshape([1, D]), bl.o.weight) : y3.reshape([1, D]).matmul(bl.o.weight)).reshape([1, 1, D]);
-        if (o.onGPU) await o.toCPU();
-        chk("layer" + l + ".o", o.data);
-        x = x.add(o);
-        chk("layer" + l + ".x", x.data);
-
-        // FFN + residual
-        let h2 = bl.norm2.forward(x);
-        h2 = await this._swiGLU(h2, 1, 1, bl.gateUp.weight, bl.down.weight, ternarize);
-        if (h2.onGPU) await h2.toCPU();
-        chk("layer" + l + ".h2", h2.data);
-        x = x.add(h2);
-        chk("layer" + l + ".x2", x.data);
-      }
+      x = await this.forwardHidden(x, 1, 1, state, pos, ternarize, debugNaN);
 
       // Final norm + LM head
       x = this.normF.forward(x);
@@ -920,7 +970,6 @@
       const logitsT = x2d.matmul(logitsW);
       if (logitsT.onGPU) await logitsT.toCPU();
       chk("final.logits", logitsT.data);
-      state.pos = pos + 1;
       return { logits: Float32Array.from(logitsT.data), state };
     }
 
