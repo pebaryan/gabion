@@ -1067,6 +1067,9 @@ def main() -> int:
     ap.add_argument("--no-tie", action="store_true")
     ap.add_argument("--with-tokenizer", choices=["gpt2"], default=None)
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--out-bin", type=Path, default=None,
+                    help="write a binary wire instead: model.json (config/vocab/merges, "
+                         "no weights) + weights.f16 (raw little-endian f16 flat) into DIR")
     args = ap.parse_args()
 
     if args.from_gguf:
@@ -1097,6 +1100,16 @@ def main() -> int:
             out["config"]["tokenizer"] = args.with_tokenizer
 
     n_weights = len(f16_decode(out["weights_b64"]))
+    if args.out_bin:
+        d = Path(args.out_bin)
+        d.mkdir(parents=True, exist_ok=True)
+        f16 = base64.b64decode(out["weights_b64"])
+        (d / "weights.f16").write_bytes(f16)
+        out.pop("weights_b64")
+        (d / "model.json").write_text(json.dumps(out), encoding="utf-8")
+        print(f"wrote {d / 'model.json'} + {d / 'weights.f16'} ({n_weights} weights, "
+              f"{len(out.get('vocab', {})) if out.get('vocab') else 0} vocab tokens)")
+        return 0
     out_path = args.out or Path(str((args.from_gguf or args.from_tinygrad or args.from_hf)) + ".gabion.json")
     out_path.write_text(json.dumps(out), encoding="utf-8")
     print(f"wrote {out_path} ({n_weights} weights, "
