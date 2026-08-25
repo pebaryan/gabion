@@ -670,7 +670,8 @@ def test_export_gguf_qwen35(tmp_path):
     CONV = KD * 2 + VD
     rng = np.random.default_rng(11)
     lt = ["linear", "linear", "linear", "full", "linear", "linear"]
-    tensors = {"token_embd.weight": rng.standard_normal((V, D)).astype(np.float32)}
+    tensors = {"token_embd.weight": rng.standard_normal((V, D)).astype(np.float32),
+               "output_norm.weight": rng.standard_normal(D).astype(np.float32)}
     for i in range(L):
         tensors[f"blk.{i}.attn_norm.weight"] = rng.standard_normal(D).astype(np.float32)
         tensors[f"blk.{i}.post_attention_norm.weight"] = rng.standard_normal(D).astype(np.float32)
@@ -730,7 +731,8 @@ def test_export_gguf_qwen35(tmp_path):
     assert s["q_dim"] == KD and s["v_dim"] == VD and s["conv_dim"] == CONV
     assert cfg["tie_weights"] is True
     # flat size: emb + 1 full layer + 5 linear layers + final norm (tied head)
-    full_n = D + 2 * H * HD * D + HD + KVH * HD * D + HD + KVH * HD * D + H * HD * D + 2 * D * DFF + DFF * D
+    full_n = (D + 2 * H * HD * D + HD + KVH * HD * D + HD + KVH * HD * D
+              + H * HD * D + D + 2 * D * DFF + DFF * D)
     lin_n = (D + CONV * D + VD * D + NV * (2 + 2 * D) + CONV * KERN + DV + VD * D
              + D + 2 * D * DFF + DFF * D)
     f16 = f16_decode(out["weights_b64"])
