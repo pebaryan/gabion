@@ -131,6 +131,41 @@ def test_export_hf_tokenizer(tmp_path):
     assert out["config"]["tokenizer"] == "hf:Qwen2Tokenizer"
 
 
+def test_export_hf_specials_and_chat_template(tmp_path):
+    _write_hf_dir(tmp_path)
+    tok = json.loads((tmp_path / "tokenizer.json").read_text(encoding="utf-8"))
+    # added_tokens with special:true -> wire["special"]; chat_template passes through
+    tok["model"]["vocab"]["<|im_start|>"] = 100
+    tok["model"]["vocab"]["<|im_end|>"] = 101
+    tok["added_tokens"] = [
+        {"id": 100, "content": "<|im_start|>", "lstrip": False, "rstrip": False, "special": True},
+        {"id": 101, "content": "<|im_end|>", "lstrip": False, "rstrip": False, "special": True},
+        {"id": 102, "content": "not_special", "special": False},
+    ]
+    tok["chat_template"] = "{{ messages[0]['content'] }}"
+    (tmp_path / "tokenizer.json").write_text(json.dumps(tok))
+    out = export_hf(tmp_path)
+    assert out["special"] == ["<|im_start|>", "<|im_end|>"]
+    assert out["chat_template"] == "{{ messages[0]['content'] }}"
+    # added tokens NOT in model.vocab are merged in (they live only in added_tokens)
+    tok2 = {"tokenizer_class": "Qwen2Tokenizer", "model": {
+        "type": "BPE",
+        "vocab": {"a": 0, "b": 1, "ab": 2},
+        "merges": ["a b"]},
+        "added_tokens": [{"id": 5, "content": "<|im_start|>", "special": True}]}
+    (tmp_path / "tokenizer.json").write_text(json.dumps(tok2))
+    out2 = export_hf(tmp_path)
+    assert out2["vocab"]["<|im_start|>"] == 5
+    assert out2["special"] == ["<|im_start|>"]
+    # chat_template falls back to tokenizer_config.json
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"chat_template": "fallback"}))
+    tok3 = json.loads((tmp_path / "tokenizer.json").read_text(encoding="utf-8"))
+    tok3.pop("chat_template", None)
+    (tmp_path / "tokenizer.json").write_text(json.dumps(tok3))
+    out3 = export_hf(tmp_path)
+    assert out3["chat_template"] == "fallback"
+
+
 def test_export_hf_f16(tmp_path):
     _write_hf_dir(tmp_path, dtype="F16")
     out = export_hf(tmp_path)
