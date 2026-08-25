@@ -991,6 +991,14 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
         # '#version:' header, and byte-level BPE has real merges starting with '#'
         # (GPT-2 has 8, e.g. "# #" -> the "##" token).
         wire["merges"] = [ln for ln in meta["tokenizer.ggml.merges"] if ln]
+        # special tokens: GGUF token types 3 (control) and 4 (user-defined) --
+        # the JS tokenizer must keep these atomic (chat-template markers etc.)
+        ttypes = meta.get("tokenizer.ggml.token_type")
+        if ttypes:
+            wire["special"] = [t for i, t in enumerate(tokens)
+                               if i < len(ttypes) and ttypes[i] in (3, 4)]
+        if meta.get("tokenizer.chat_template"):
+            wire["chat_template"] = meta["tokenizer.chat_template"]
         cfg["tokenizer"] = f"{arch}:{meta.get('tokenizer.ggml.pre', 'bpe')}"
     return wire
 

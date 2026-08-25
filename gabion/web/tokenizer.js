@@ -53,6 +53,13 @@
       if (spec.merges) {
         for (let i = 0; i < spec.merges.length; i++) this.ranks[spec.merges[i]] = i;
       }
+      // Special tokens (chat-template markers etc.) are kept atomic: they are
+      // matched verbatim in the input and never run through byte-level BPE.
+      // HF exposes them via tokenizer.json added_tokens[].special; GGUF via
+      // token_type 3 (control) / 4 (user-defined) — both land in wire.special.
+      this.special = new Set(Array.isArray(spec.special) ? spec.special : []);
+      // longest-first so a prefix token (<|im_start|>) never steals a longer one
+      this._specialList = [...this.special].sort((a, b) => b.length - a.length);
     }
 
     get vocabSize() {
@@ -62,32 +69,66 @@
     /** Encode text to token ids (Int32Array). */
     encode(text) {
       const ids = [];
-      for (const m of String(text).matchAll(PAT)) {
-        const piece = m[0];
-        // Map the UTF-8 BYTES of the piece through the byte->unicode table
-        // (code units would break on surrogate pairs / non-ASCII).
-        const pieceBytes = new TextEncoder().encode(piece);
-        let chars = "";
-        for (let i = 0; i < pieceBytes.length; i++) chars += BYTE_ENCODER[pieceBytes[i]];
-        const parts = [];
-        for (let i = 0; i < chars.length; i++) parts.push(chars[i]);
-        // Greedy byte-pair merge
-        while (parts.length > 1) {
-          let best = null;
-          for (let i = 0; i < parts.length - 1; i++) {
-            const pair = parts[i] + " " + parts[i + 1];
-            const rank = this.ranks[pair];
-            if (rank !== undefined && (best === null || rank < best.rank)) best = { rank, i };
+      // BPE-encode one span (no special tokens inside); appends ids.
+      const pushSpan = (span) => {
+        for (const m of String(span).matchAll(PAT)) {
+          const piece = m[0];
+          // Map the UTF-8 BYTES of the piece through the byte->unicode table
+          // (code units would break on surrogate pairs / non-ASCII).
+          const pieceBytes = new TextEncoder().encode(piece);
+          let chars = "";
+          for (let i = 0; i < pieceBytes.length; i++) chars += BYTE_ENCODER[pieceBytes[i]];
+          const parts = [];
+          for (let i = 0; i < chars.length; i++) parts.push(chars[i]);
+          // Greedy byte-pair merge
+          while (parts.length > 1) {
+            let best = null;
+            for (let i = 0; i < parts.length - 1; i++) {
+              const pair = parts[i] + " " + parts[i + 1];
+              const rank = this.ranks[pair];
+              if (rank !== undefined && (best === null || rank < best.rank)) best = { rank, i };
+            }
+            if (!best) break;
+            parts[best.i] = parts[best.i] + parts[best.i + 1];
+            parts.splice(best.i + 1, 1);
           }
-          if (!best) break;
-          parts[best.i] = parts[best.i] + parts[best.i + 1];
-          parts.splice(best.i + 1, 1);
+          for (const p of parts) {
+            const id = this.vocab[p];
+            if (id === undefined) throw new Error(`tokenizer: token "${p}" not in vocab`);
+            ids.push(id);
+          }
         }
-        for (const p of parts) {
-          const id = this.vocab[p];
-          if (id === undefined) throw new Error(`tokenizer: token "${p}" not in vocab`);
-          ids.push(id);
+      };
+      if (this.special.size) {
+        // pre-split on special tokens; BPE the gaps (HF-style atomic specials)
+        const s = String(text);
+        let i = 0;
+        while (i < s.length) {
+          let hit = null;
+          for (const tok of this._specialList) {
+            if (s.startsWith(tok, i)) { hit = tok; break; }
+          }
+          if (hit) {
+            const id = this.vocab[hit];
+            if (id === undefined) throw new Error(`tokenizer: special token "${hit}" not in vocab`);
+            ids.push(id);
+            i += hit.length;
+          } else {
+            let j = i + 1;
+            while (j < s.length) {
+              let nxt = false;
+              for (const tok of this._specialList) {
+                if (s.startsWith(tok, j)) { nxt = true; break; }
+              }
+              if (nxt) break;
+              j++;
+            }
+            pushSpan(s.slice(i, j));
+            i = j;
+          }
         }
+      } else {
+        pushSpan(text);
       }
       return Int32Array.from(ids);
     }

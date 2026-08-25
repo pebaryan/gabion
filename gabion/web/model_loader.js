@@ -24,8 +24,9 @@
       throw new Error(`weight cursor mismatch: consumed ${consumed} of ${weights.length}`);
     }
     if (data.vocab && data.merges && window.GPT2Tokenizer) {
-      model.tokenizer = new window.GPT2Tokenizer({ vocab: data.vocab, merges: data.merges });
+      model.tokenizer = new window.GPT2Tokenizer({ vocab: data.vocab, merges: data.merges, special: data.special });
     }
+    model.chatTemplate = data.chat_template || null;
     return attachGenerators(model);
   }
 

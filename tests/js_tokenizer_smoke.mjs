@@ -66,6 +66,35 @@ function check(name, cond, detail = "") {
   check("gpt2 encode(decode(x)) stable", JSON.stringify(reIds) === JSON.stringify(Array.from(stressIds)));
 }
 
+// ---- Special tokens stay atomic (chat-template markers) ----
+{
+  // qwen-style: <|im_start|> / <|im_end|> as protected vocab entries; the
+  // byte-level merge rules would otherwise shred them into byte tokens.
+  const ims = "<|im_start|>", ime = "<|im_end|>";
+  const a = String.fromCharCode(97);
+  const tok = new GPT2Tokenizer({
+    vocab: { [ims]: 151640, [ime]: 151645, [a]: 0, [a + a]: 1, [a + a + a]: 2 },
+    merges: [`${a} ${a}`, `${a}${a} ${a}`],
+    special: [ims, ime],
+  });
+  const text = ims + "aa" + ime + ims + "aaa" + ime;
+  const ids = Array.from(tok.encode(text));
+  check("special tokens atomic", ids[0] === 151640 && ids[1] === 1 && ids[2] === 151645
+    && ids[3] === 151640 && ids[4] === 2 && ids[5] === 151645, JSON.stringify(ids));
+  // BPE still runs inside the protected spans: "aa" -> 1, "aaa" -> 2
+  check("span BPE intact", ids[1] === 1 && ids[4] === 2, JSON.stringify(ids));
+  // decode round-trips through the specials (byte fallback for plain text)
+  const back = tok.decode(ids);
+  check("special decode round-trip", back === text, JSON.stringify(back));
+  // without the special list the same text must NOT be atomic (control): the
+  // marker either shreds into byte tokens or cannot be encoded at all
+  const plain = new GPT2Tokenizer({ vocab: tok.vocab, merges: [`${a} ${a}`] });
+  let threw = false;
+  try { plain.encode(text); } catch (e) { threw = true; }
+  check("no-special control: markers split or fail", threw,
+    "expected encode() to fail without special protection");
+}
+
 if (failures > 0) {
   console.log(`\n${failures} failure(s)`);
   process.exit(2);
