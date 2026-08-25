@@ -82,8 +82,13 @@ def test_export_tinygrad_roundtrip(tmp_path):
     assert names == js_order
 
 
-def _write_gguf(path: Path, meta: dict, tensors: dict[str, np.ndarray]) -> None:
-    """Write a minimal GGUF v3 file with F32/F16/Q8_0 tensors."""
+def _write_gguf(path: Path, meta: dict, tensors: dict[str, np.ndarray],
+                align: int = 32) -> tuple[int, int]:
+    """Write a minimal GGUF v3 file with F32/F16/Q8_0 tensors.
+
+    `align` is the data-section alignment actually used for the layout; pass a
+    matching "general.alignment" in meta to exercise the non-default path.
+    """
     out = bytearray()
     out += b"GGUF"
     out += struct.pack("<I", 3)
@@ -134,7 +139,8 @@ def _write_gguf(path: Path, meta: dict, tensors: dict[str, np.ndarray]) -> None:
 
     # data (F32/F16 for the hand-written file); GGUF offsets are relative to the
     # 32-byte-aligned start of the data section (spec)
-    data_base = (len(out) + 31) & ~31
+    info_end = len(out)          # where the tensor-info section stops
+    data_base = (info_end + align - 1) & ~(align - 1)
     out += b"\x00" * (data_base - len(out))
     offsets = {}
     for name, arr in tensors.items():
@@ -171,6 +177,7 @@ def _write_gguf(path: Path, meta: dict, tensors: dict[str, np.ndarray]) -> None:
     for name, arr in tensors.items():
         out += np.asarray(arr, dtype="<f4" if arr.dtype == np.float32 else "<f2").tobytes()
     Path(path).write_bytes(bytes(out))
+    return info_end, data_base
 
 
 def test_gguf_parse_and_export(tmp_path):
@@ -343,6 +350,47 @@ def test_gguf_k_quants(tmp_path):
     name, dims, gtype, off = infos[0]
     assert gtype == "F32"
     assert _tensor_data(buf, name, dims, gtype, off, base).shape == (256,)
+
+
+def test_gguf_honours_general_alignment(tmp_path):
+    """A file declaring general.alignment=64 must be read at 64-byte offsets.
+
+    Whether a 32-vs-64 mistake actually shifts the data section depends on where
+    the tensor-info section happens to end, so sweep a padding key across the
+    residues: a reader hardcoding 32 gets the wrong base for some of them.
+    """
+    from tools.export_model import parse_gguf
+
+    D, V = 8, 4
+    rng = np.random.default_rng(5)
+    emb = rng.normal(0, 0.1, (V, D)).astype(np.float32)
+    mismatched_under_32 = 0
+    for pad in range(0, 64, 4):
+        meta = {
+            "general.architecture": "llama", "general.alignment": 64,
+            "general.pad": "x" * pad,
+            "llama.block_count": 0, "llama.embedding_length": D,
+            "llama.attention.head_count": 2, "llama.attention.head_count_kv": 2,
+            "llama.feed_forward_length": 16, "llama.context_length": 32,
+            "llama.vocab_size": V,
+        }
+        tensors = {"token_embd.weight": emb,
+                   "output_norm.weight": np.ones(D, np.float32)}
+        gguf = tmp_path / f"align64_{pad}.gguf"
+        info_end, written_base = _write_gguf(gguf, meta, tensors, align=64)
+
+        _meta, infos, base = parse_gguf(gguf)
+        assert base == written_base, f"pad={pad}: base {base} != written {written_base}"
+        assert base % 64 == 0, base
+        # would a reader hardcoding 32 have landed somewhere else?
+        if ((info_end + 31) & ~31) != written_base:
+            mismatched_under_32 += 1
+
+        out = export_gguf(gguf)
+        got = f16_decode(out["weights_b64"])[:V * D].reshape(V, D)
+        assert np.max(np.abs(got - emb)) < 1e-2, f"pad={pad}"
+
+    assert mismatched_under_32 > 0, "sweep never produced a 32-vs-64 divergence"
 
 
 def test_dequant_matches_gguf_py():

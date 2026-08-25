@@ -124,8 +124,13 @@ def parse_gguf(path: Path) -> tuple[dict, list[tuple[str, tuple, str, int]], int
         (gtype, toff) = struct.unpack_from("<IQ", buf, off)
         off += 12
         infos.append((name, tuple(dims), GGML_TYPE.get(gtype, f"T{gtype}"), toff))
-    # Tensor data section is 32-byte aligned in the file (GGUF spec)
-    return meta, infos, (off + 31) & ~31
+    # The data section is aligned to general.alignment (default 32, per spec).
+    # Hardcoding 32 silently reads every tensor from the wrong offset in a file
+    # that declares 64 -- the shapes still fit, so nothing raises.
+    align = int(meta.get("general.alignment") or 32)
+    if align <= 0 or (align & (align - 1)):
+        raise ValueError(f"general.alignment must be a positive power of two, got {align}")
+    return meta, infos, (off + align - 1) & ~(align - 1)
 
 
 def _dequant(name: str, raw: bytes, dims: tuple, gtype: str) -> np.ndarray:
@@ -137,14 +142,12 @@ def _dequant(name: str, raw: bytes, dims: tuple, gtype: str) -> np.ndarray:
     if gtype == "F16":
         return np.frombuffer(raw, dtype="<f2", count=n).astype(np.float32).reshape(shape)
     if gtype == "Q8_0":
-        # block of 32: f16 scale + 32 x i8
-        nblocks = n // 32
-        vals = np.empty(n, dtype=np.float32)
-        for b in range(nblocks):
-            (d,) = struct.unpack_from("<e", raw, b * 34)
-            xs = struct.unpack_from(f"<{32}b", raw, b * 34 + 2)
-            vals[b * 32:(b + 1) * 32] = np.asarray(xs, dtype=np.float32) * float(d)
-        return vals.reshape(shape)
+        # block of 32: f16 d + 32 x i8 (34 B). value = x * d
+        nb = n // 32
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 34).reshape(nb, 34)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qs = blk[:, 2:].copy().view(np.int8).astype(np.float32)
+        return (qs * d[:, None]).reshape(shape)
     if gtype == "Q4_0":
         # block of 32: f16 d + 16 nibble bytes (18 B). ggml puts the LOW nibble of
         # byte j at element j and the HIGH nibble at element j+16 -- the halves are
