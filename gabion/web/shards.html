@@ -49,11 +49,11 @@
 <div id="stats"></div>
 <pre id="resultJson" hidden>{}</pre>
 
-<script src="/gabion/web/tinygrad_v0.js?v=11"></script>
-<script src="/gabion/web/webgpu_backend.js?v=11"></script>
-<script src="/gabion/web/tokenizer.js?v=11"></script>
-<script src="/gabion/web/bbt_forward.js?v=11"></script>
-<script src="/gabion/web/model_loader.js?v=11"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=12"></script>
+<script src="/gabion/web/webgpu_backend.js?v=12"></script>
+<script src="/gabion/web/tokenizer.js?v=12"></script>
+<script src="/gabion/web/bbt_forward.js?v=12"></script>
+<script src="/gabion/web/model_loader.js?v=12"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -67,8 +67,10 @@ async function initCoordGPU() {
     if (!adapter) return (coordGPU = false);
     const device = await adapter.requestDevice();
     WebGPUBackend.init(device);
-    const r = await fetch("/gabion/web/kernels/matmul.wgsl", { cache: "no-store" });
-    if (r.ok) WebGPUBackend.registerShader("matmul", await r.text());
+    for (const name of ["matmul", "embedding_forward"]) {
+      const r = await fetch(`/gabion/web/kernels/${name}.wgsl`, { cache: "no-store" });
+      if (r.ok) WebGPUBackend.registerShader(name, await r.text());
+    }
     coordGPU = WebGPUBackend.instance;
   } catch (e) { coordGPU = false; }
   return coordGPU;
