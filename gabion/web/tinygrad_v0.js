@@ -838,8 +838,66 @@
       }
       const req = this.requiresGrad || weight.requiresGrad || !!(bias && bias.requiresGrad);
       const parents = bias ? [this, weight, bias] : [this, weight];
-      return new Tensor(out, [N, Cout, Ho, Wo], req, parents, () => {
-        throw new Error("conv_transpose2d backward not implemented");
+      return new Tensor(out, [N, Cout, Ho, Wo], req, parents, (gout) => {
+        // ConvTranspose2d backward: mirrors the forward scatter as a gather.
+        // dx: each input element sums gout at every output position it wrote to.
+        // dw: each weight element accumulates x * gout over the same (oh, ow) hits.
+        // oh = ih*sH - pH + kh*dH, ow = iw*sW - pW + kw*dW (same as forward).
+        if (this.requiresGrad) {
+          if (!this.grad) this.grad = new Float32Array(this.numel);
+          const dx = this.grad;
+          for (let n = 0; n < N; n++) for (let ic = 0; ic < Cin; ic++) {
+            const grp = Math.floor(ic / cinPerG);
+            const oc0 = grp * CoutG;
+            for (let ih = 0; ih < H; ih++) for (let iw = 0; iw < W; iw++) {
+              let acc = 0;
+              for (let ocL = 0; ocL < CoutG; ocL++) {
+                const oc = oc0 + ocL;
+                for (let kh = 0; kh < kH; kh++) {
+                  const oh = ih * sH - pH + kh * dH;
+                  if (oh < 0 || oh >= Ho) continue;
+                  for (let kw = 0; kw < kW; kw++) {
+                    const ow = iw * sW - pW + kw * dW;
+                    if (ow < 0 || ow >= Wo) continue;
+                    acc += gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow] *
+                           wgt[ic * wStr[0] + ocL * wStr[1] + kh * wStr[2] + kw];
+                  }
+                }
+              }
+              dx[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw] += acc;
+            }
+          }
+        }
+        if (weight.requiresGrad) {
+          if (!weight.grad) weight.grad = new Float32Array(weight.numel);
+          const dw = weight.grad;
+          for (let n = 0; n < N; n++) for (let ic = 0; ic < Cin; ic++) {
+            const grp = Math.floor(ic / cinPerG);
+            const oc0 = grp * CoutG;
+            for (let ih = 0; ih < H; ih++) for (let iw = 0; iw < W; iw++) {
+              const xv = x[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw];
+              for (let ocL = 0; ocL < CoutG; ocL++) {
+                const oc = oc0 + ocL;
+                for (let kh = 0; kh < kH; kh++) {
+                  const oh = ih * sH - pH + kh * dH;
+                  if (oh < 0 || oh >= Ho) continue;
+                  for (let kw = 0; kw < kW; kw++) {
+                    const ow = iw * sW - pW + kw * dW;
+                    if (ow < 0 || ow >= Wo) continue;
+                    dw[ic * wStr[0] + ocL * wStr[1] + kh * wStr[2] + kw] +=
+                      xv * gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (bias && bias.requiresGrad) {
+          if (!bias.grad) bias.grad = new Float32Array(Cout);
+          for (let n = 0; n < N; n++) for (let oc = 0; oc < Cout; oc++)
+            for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++)
+              bias.grad[oc] += gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
+        }
       });
     }
 

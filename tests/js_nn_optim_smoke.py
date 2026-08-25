@@ -86,7 +86,24 @@ def build_fixture() -> dict:
 
     ct = nn.ConvTranspose2d(1, 1, 3, bias=True)
     ct_x = rng.normal(0, 1, size=(1, 1, 3, 3)).astype(np.float32)
-    ct_y = ct(Tensor(ct_x.tolist())).numpy().astype(np.float64).reshape(-1)
+    ct_xt = Tensor(ct_x.tolist())
+    ct_yt = ct(ct_xt)
+    ct_y = ct_yt.numpy().astype(np.float64).reshape(-1)
+    ct_g = rng.normal(0, 1, size=tuple(ct_yt.shape)).astype(np.float32)
+    ct_w_grad, ct_b_grad, ct_x_grad = (ct_yt * Tensor(ct_g.tolist())).sum().gradient(
+        ct.weight, ct.bias, ct_xt
+    )
+
+    # harder ConvTranspose2d: groups=2, stride=2, padding=1, output_padding=1
+    ct2 = nn.ConvTranspose2d(2, 4, 3, stride=2, padding=1, output_padding=1, groups=2, bias=True)
+    ct2_x = rng.normal(0, 1, size=(2, 2, 4, 4)).astype(np.float32)
+    ct2_xt = Tensor(ct2_x.tolist())
+    ct2_yt = ct2(ct2_xt)
+    ct2_y = ct2_yt.numpy().astype(np.float64).reshape(-1)
+    ct2_g = rng.normal(0, 1, size=tuple(ct2_yt.shape)).astype(np.float32)
+    ct2_w_grad, ct2_b_grad, ct2_x_grad = (ct2_yt * Tensor(ct2_g.tolist())).sum().gradient(
+        ct2.weight, ct2.bias, ct2_xt
+    )
 
     mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mg = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
@@ -156,6 +173,20 @@ def build_fixture() -> dict:
         "ct_w_shape": list(ct.weight.shape),
         "ct_b": ct.bias.numpy().astype(float).reshape(-1).tolist(),
         "ct_y": ct_y.tolist(),
+        "ct_g": ct_g.astype(float).reshape(-1).tolist(),
+        "ct_x_grad": ct_x_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "ct_w_grad": ct_w_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "ct_b_grad": ct_b_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "ct2_x": ct2_x.astype(float).reshape(-1).tolist(),
+        "ct2_x_shape": list(ct2_x.shape),
+        "ct2_w": ct2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "ct2_w_shape": list(ct2.weight.shape),
+        "ct2_b": ct2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "ct2_y": ct2_y.tolist(),
+        "ct2_g": ct2_g.astype(float).reshape(-1).tolist(),
+        "ct2_x_grad": ct2_x_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "ct2_w_grad": ct2_w_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "ct2_b_grad": ct2_b_grad.numpy().astype(np.float64).reshape(-1).tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -187,6 +218,9 @@ def main() -> int:
         "conv_groups": report["convg_max_abs"] < 1e-5,
         "conv_dilate": report["convd_max_abs"] < 1e-5,
         "conv_transpose": report["ct_max_abs"] < 1e-4,
+        "ct_backward": report["ct_grad_x"] < 1e-4 and report["ct_grad_w"] < 1e-4 and report["ct_grad_b"] < 1e-4,
+        "ct2_forward": report["ct2_max_abs"] < 1e-4,
+        "ct2_backward": report["ct2_grad_x"] < 1e-4 and report["ct2_grad_w"] < 1e-4 and report["ct2_grad_b"] < 1e-4,
         "muon": report["muon_max_abs"] < 1e-4,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})

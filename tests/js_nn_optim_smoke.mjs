@@ -111,6 +111,22 @@ ct.weight.data.set(Float32Array.from(fixture.ct_w));
 ct.bias.data.set(Float32Array.from(fixture.ct_b));
 const ctY = ct.forward(Tensor.fromArray(fixture.ct_x, fixture.ct_x_shape, false));
 
+// ConvTranspose2d backward, simple (stride 1, padding 0): drive closure with fixture gout
+const ctx = Tensor.fromArray(fixture.ct_x, fixture.ct_x_shape, true);
+const ctYg = ctx.convTranspose2d(ct.weight, ct.bias, 1, 1, 1, 0, 0);
+ctYg.grad = Float32Array.from(fixture.ct_g);
+ctYg._backward(ctYg.grad);
+
+// ConvTranspose2d backward, hard (groups 2, stride 2, padding 1, output_padding 1)
+const ct2 = new tg.nn.ConvTranspose2d(2, 4, 3, { stride: 2, padding: 1, outputPadding: 1, groups: 2, bias: true });
+ct2.weight.data.set(Float32Array.from(fixture.ct2_w));
+ct2.bias.data.set(Float32Array.from(fixture.ct2_b));
+const ct2Yf = ct2.forward(Tensor.fromArray(fixture.ct2_x, fixture.ct2_x_shape, false));
+const ct2x = Tensor.fromArray(fixture.ct2_x, fixture.ct2_x_shape, true);
+const ct2Yg = ct2x.convTranspose2d(ct2.weight, ct2.bias, 2, 2, 1, 1, 1);
+ct2Yg.grad = Float32Array.from(fixture.ct2_g);
+ct2Yg._backward(ct2Yg.grad);
+
 const mp = Tensor.fromArray(fixture.muon_p, [4, 4], true);
 mp.grad = Float32Array.from(fixture.muon_g);
 const muon = tg.Muon([mp], { lr: 1e-3, warmupSteps: 1, gradClipNorm: 0 });
@@ -134,6 +150,13 @@ const report = {
   convg_max_abs: maxAbs(convgY.data, fixture.convg_y),
   convd_max_abs: maxAbs(convdY.data, fixture.convd_y),
   ct_max_abs: maxAbs(ctY.data, fixture.ct_y),
+  ct_grad_x: maxAbs(ctx.grad, fixture.ct_x_grad),
+  ct_grad_w: maxAbs(ct.weight.grad, fixture.ct_w_grad),
+  ct_grad_b: maxAbs(ct.bias.grad, fixture.ct_b_grad),
+  ct2_max_abs: maxAbs(ct2Yf.data, fixture.ct2_y),
+  ct2_grad_x: maxAbs(ct2x.grad, fixture.ct2_x_grad),
+  ct2_grad_w: maxAbs(ct2.weight.grad, fixture.ct2_w_grad),
+  ct2_grad_b: maxAbs(ct2.bias.grad, fixture.ct2_b_grad),
   muon_max_abs: maxAbs(mp.data, fixture.muon_after),
 };
 const outPath = fixturePath.replace(/\.json$/, "_js.json");
