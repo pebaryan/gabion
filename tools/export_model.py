@@ -54,10 +54,15 @@ def f16_decode(b64: str) -> np.ndarray:
 # GGUF reader (subset: metadata + F32/F16/Q8_0/Q4_0/Q4_1 tensors)
 # --------------------------------------------------------------------------
 
+# Current ggml/GGUF type enum (gguf-py GGMLQuantizationType; note the 2025
+# renumbering: Q5_0=6, Q8_0=8, Q6_K=14, TQ1_0=34, TQ2_0=35)
 GGML_TYPE = {
-    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q8_0",
-    8: "Q8_1", 9: "Q2_K", 10: "Q3_K", 11: "Q4_K", 12: "Q5_K", 13: "Q6_K",
-    14: "Q8_K", 15: "IQ2_XXS", 16: "IQ2_XS", 17: "IQ3_XXS",
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
+    8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K",
+    14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS",
+    19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS",
+    24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M",
+    30: "BF16", 34: "TQ1_0", 35: "TQ2_0",
 }
 
 GGUF_META_TYPES = {  # value_type -> (struct fmt, size) for scalars
@@ -89,9 +94,11 @@ def _read_meta_value(buf: bytes, off: int, vtype: int) -> tuple[object, int]:
     return val, off + size
 
 
-def parse_gguf(path: Path) -> tuple[dict, list[tuple[str, tuple, str, int]]]:
-    """Returns (metadata, tensor_infos) where tensor_infos are
-    (name, dims_tuple, ggml_type, byte_offset)."""
+def parse_gguf(path: Path) -> tuple[dict, list[tuple[str, tuple, str, int]], int]:
+    """Returns (metadata, tensor_infos, data_base). tensor_infos are
+    (name, dims_tuple, ggml_type, byte_offset) with byte_offset RELATIVE to the
+    tensor data section (GGUF spec; llama.cpp writers use this). data_base is the
+    absolute file position where the data section starts."""
     buf = Path(path).read_bytes()
     assert buf[:4] == b"GGUF", "not a GGUF file"
     (version, n_tensors, n_kv) = struct.unpack_from("<IQQ", buf, 4)
@@ -115,7 +122,8 @@ def parse_gguf(path: Path) -> tuple[dict, list[tuple[str, tuple, str, int]]]:
         (gtype, toff) = struct.unpack_from("<IQ", buf, off)
         off += 12
         infos.append((name, tuple(dims), GGML_TYPE.get(gtype, f"T{gtype}"), toff))
-    return meta, infos
+    # Tensor data section is 32-byte aligned in the file (GGUF spec)
+    return meta, infos, (off + 31) & ~31
 
 
 def _dequant(name: str, raw: bytes, dims: tuple, gtype: str) -> np.ndarray:
@@ -150,25 +158,136 @@ def _dequant(name: str, raw: bytes, dims: tuple, gtype: str) -> np.ndarray:
             vals[b * 16:(b + 1) * 16] = xs
         return vals.reshape(shape)
     if gtype == "Q4_1":
-        # block of 16: f16 d + f16 m + 16 x 4-bit (value = x*d + m)
-        nblocks = n // 16
+        # block of 32: f16 d + f16 m + 16 nibble bytes (value = x*d + m)
+        nblocks = n // 32
         vals = np.empty(n, dtype=np.float32)
         for b in range(nblocks):
-            (d, m) = struct.unpack_from("<ee", raw, b * 20)
-            packed = raw[b * 20 + 4:b * 20 + 20]
-            nib = np.frombuffer(packed, dtype=np.uint8)
-            xs = np.empty(16, dtype=np.float32)
-            for i in range(16):
+            (d,) = struct.unpack_from("<e", raw, b * 20)
+            (m,) = struct.unpack_from("<e", raw, b * 20 + 2)
+            nib = raw[b * 20 + 4:b * 20 + 20]
+            for i in range(32):
                 v = (nib[i // 2] >> (4 * (i % 2))) & 0x0F
-                xs[i] = float(v) * float(d) + float(m)
-            vals[b * 16:(b + 1) * 16] = xs
+                vals[b * 32 + i] = float(v) * float(d) + float(m)
         return vals.reshape(shape)
+    if gtype in ("Q4_K", "Q6_K"):
+        return _dequant_k(raw, n, gtype).reshape(shape)
+    if gtype in ("Q2_K", "TQ2_0"):
+        return _dequant_k2(raw, n, gtype).reshape(shape)
+    if gtype == "Q5_0":
+        # block of 32: f16 d + u32 qh + qs[16] (22 B)
+        nb = n // 32
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 22).reshape(nb, 22)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        qh = blk[:, 2:6].copy().view("<u4")[:, 0].astype(np.uint32)
+        qs = blk[:, 6:]
+        j = np.arange(16)
+        xh0 = (((qh[:, None] >> j) << 4) & 0x10).astype(np.int32)
+        xh1 = ((qh[:, None] >> (j + 12)) & 0x10).astype(np.int32)
+        lo = ((qs & 0x0F).astype(np.int32) | xh0) - 16
+        hi = ((qs >> 4).astype(np.int32) | xh1) - 16
+        out = np.empty((nb, 32), dtype=np.float32)
+        out[:, :16] = lo * d[:, None]
+        out[:, 16:] = hi * d[:, None]
+        return out.reshape(shape)
     raise NotImplementedError(f"GGUF tensor '{name}': unsupported type {gtype}")
 
 
-def _tensor_data(buf: bytes, name: str, dims: tuple, gtype: str, offset: int) -> np.ndarray:
-    if gtype in ("F32", "F16", "Q8_0", "Q4_0", "Q4_1"):
-        return _dequant(name, buf[offset:], dims, gtype)
+def _dequant_k(raw: bytes, n: int, gtype: str) -> np.ndarray:
+    """Q4_K / Q6_K dequant (llama.cpp ggml-quants.c, QK_K = 256). Vectorized."""
+    nb = n // 256
+    if gtype == "Q4_K":
+        # super-block: f16 d, f16 dmin, 12 scale bytes, 128 qs bytes (144 B)
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 144).reshape(nb, 144)
+        d = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)
+        dmin = blk[:, 2:4].copy().view("<f2")[:, 0].astype(np.float32)
+        scales = blk[:, 4:16]
+        qs = blk[:, 16:]
+        # get_scale_min_k4(j): j<4 -> d=q[j]&63, m=q[j+4]&63
+        #                    else   -> d=(q[j+4]&0xF)|((q[j-4]>>6)<<4), m=(q[j+4]>>4)|((q[j]>>6)<<4)
+        sc = np.empty((nb, 8), dtype=np.uint16)
+        mn = np.empty((nb, 8), dtype=np.uint16)
+        sc[:, 0] = scales[:, 0] & 63; mn[:, 0] = scales[:, 4] & 63
+        sc[:, 1] = scales[:, 1] & 63; mn[:, 1] = scales[:, 5] & 63
+        sc[:, 2] = scales[:, 2] & 63; mn[:, 2] = scales[:, 6] & 63
+        sc[:, 3] = scales[:, 3] & 63; mn[:, 3] = scales[:, 7] & 63
+        sc[:, 4] = (scales[:, 8] & 0xF) | ((scales[:, 0] >> 6) << 4); mn[:, 4] = (scales[:, 8] >> 4) | ((scales[:, 4] >> 6) << 4)
+        sc[:, 5] = (scales[:, 9] & 0xF) | ((scales[:, 1] >> 6) << 4); mn[:, 5] = (scales[:, 9] >> 4) | ((scales[:, 5] >> 6) << 4)
+        sc[:, 6] = (scales[:, 10] & 0xF) | ((scales[:, 2] >> 6) << 4); mn[:, 6] = (scales[:, 10] >> 4) | ((scales[:, 6] >> 6) << 4)
+        sc[:, 7] = (scales[:, 11] & 0xF) | ((scales[:, 3] >> 6) << 4); mn[:, 7] = (scales[:, 11] >> 4) | ((scales[:, 7] >> 6) << 4)
+        qs32 = qs.reshape(nb, 4, 32)
+        vals = np.empty((nb, 256), dtype=np.float32)
+        for b in range(4):
+            lo = (qs32[:, b] & 0x0F).astype(np.float32)
+            hi = (qs32[:, b] >> 4).astype(np.float32)
+            d1 = (d * sc[:, 2 * b]).astype(np.float32); m1 = (dmin * mn[:, 2 * b]).astype(np.float32)
+            d2 = (d * sc[:, 2 * b + 1]).astype(np.float32); m2 = (dmin * mn[:, 2 * b + 1]).astype(np.float32)
+            vals[:, b * 64:b * 64 + 32] = d1[:, None] * lo - m1[:, None]
+            vals[:, b * 64 + 32:b * 64 + 64] = d2[:, None] * hi - m2[:, None]
+        return vals.reshape(-1)
+    # Q6_K: FILE layout (gguf-py/gguf.c): ql[128], qh[64], scales[16], d[2] (210 B)
+    # — note d is at the END of the block, unlike the in-memory C struct.
+    blk = np.frombuffer(raw, dtype="<u1", count=nb * 210).reshape(nb, 210)
+    f16s = blk[:, 208:210].copy().view("<f2")[:, 0].astype(np.float32)
+    ql = blk[:, 0:128]
+    qh = blk[:, 128:192]
+    sc = blk[:, 192:208].astype(np.int8).astype(np.float32)
+    out = np.empty((nb, 256), dtype=np.float32)
+    for half in range(2):
+        q1 = ((ql[:, half * 64:half * 64 + 32] & 0x0F) | ((qh[:, half * 32:half * 32 + 32] & 0x03) << 4)).astype(np.float32) - 32
+        q2 = ((ql[:, half * 64 + 32:half * 64 + 64] & 0x0F) | ((qh[:, half * 32:half * 32 + 32] >> 2) & 0x03) << 4).astype(np.float32) - 32
+        q3 = ((ql[:, half * 64:half * 64 + 32] >> 4) | ((qh[:, half * 32:half * 32 + 32] >> 4) & 0x03) << 4).astype(np.float32) - 32
+        q4 = ((ql[:, half * 64 + 32:half * 64 + 64] >> 4) | ((qh[:, half * 32:half * 32 + 32] >> 6) & 0x03) << 4).astype(np.float32) - 32
+        s1 = sc[:, half * 8:half * 8 + 2].repeat(16, axis=1)
+        s2 = sc[:, half * 8 + 2:half * 8 + 4].repeat(16, axis=1)
+        s3 = sc[:, half * 8 + 4:half * 8 + 6].repeat(16, axis=1)
+        s4 = sc[:, half * 8 + 6:half * 8 + 8].repeat(16, axis=1)
+        base = half * 128
+        out[:, base:base + 32] = f16s[:, None] * s1 * q1
+        out[:, base + 32:base + 64] = f16s[:, None] * s2 * q2
+        out[:, base + 64:base + 96] = f16s[:, None] * s3 * q3
+        out[:, base + 96:base + 128] = f16s[:, None] * s4 * q4
+    return out.reshape(-1)
+
+
+def _dequant_k2(raw: bytes, n: int, gtype: str) -> np.ndarray:
+    """Q2_K / TQ2_0 dequant (llama.cpp ggml-quants.c). Vectorized."""
+    nb = n // 256
+    if gtype == "Q2_K":
+        # FILE layout (gguf-py/gguf.c): scales[16], qs[64], d[2], dmin[2] (84 B)
+        blk = np.frombuffer(raw, dtype="<u1", count=nb * 84).reshape(nb, 84)
+        scales = blk[:, 0:16]
+        qs = blk[:, 16:80]
+        d = blk[:, 80:82].copy().view("<f2")[:, 0].astype(np.float32)
+        dmin = blk[:, 82:84].copy().view("<f2")[:, 0].astype(np.float32)
+        # per 128-half: 8 scales (scales[8h..8h+7]); value v (0..127):
+        #   j = v//32, sub = v%32; byte = q[sub] (q[l]/q[l+16], l=sub%16),
+        #   shift = j*2, scale = sc[j*2 + sub//16];
+        #   val = d*(sc&0xF)*qbits - dmin*(sc>>4)
+        v = np.arange(128)
+        j = v // 32
+        byte_idx = v % 32
+        shift = j * 2
+        sc_idx = j * 2 + (v % 32) // 16
+        out = np.empty((nb, 256), dtype=np.float32)
+        for half in range(2):
+            sc = scales[:, half * 8:half * 8 + 8]
+            dl = (d[:, None] * (sc[:, sc_idx] & 0x0F)).astype(np.float32)
+            ml = (dmin[:, None] * (sc[:, sc_idx] >> 4)).astype(np.float32)
+            qb = (qs[:, half * 32:half * 32 + 32][:, byte_idx] >> shift) & 0x03
+            out[:, half * 128:half * 128 + 128] = dl * qb.astype(np.float32) - ml
+        return out.reshape(-1)
+    # TQ2_0: FILE layout: qs[64], d[2] (66 B); val = ((2-bit) - 1) * d
+    blk = np.frombuffer(raw, dtype="<u1", count=nb * 66).reshape(nb, 66)
+    f16s = blk[:, 64:66].copy().view("<f2")[:, 0].astype(np.float32)
+    qs = blk[:, 0:64]
+    i = np.arange(256)
+    bits = (qs[:, i // 4] >> (2 * (i % 4))) & 0x03
+    return ((bits.astype(np.float32) - 1.0) * f16s[:, None]).reshape(-1)
+
+
+def _tensor_data(buf: bytes, name: str, dims: tuple, gtype: str, offset: int, base: int = 0) -> np.ndarray:
+    if gtype in ("F32", "F16", "Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q4_K", "Q6_K", "Q2_K", "TQ2_0"):
+        return _dequant(name, buf[base + offset:], dims, gtype)
     raise NotImplementedError(f"GGUF tensor '{name}': unsupported type {gtype}")
 
 
@@ -219,27 +338,37 @@ def export_tinygrad(path: Path, config: dict) -> dict:
 
 def export_gguf(path: Path, config: dict | None = None) -> dict:
     buf = Path(path).read_bytes()
-    meta, infos = parse_gguf(path)
+    meta, infos, data_base = parse_gguf(path)
     by_name = {n: (dims, gtype, off) for (n, dims, gtype, off) in infos}
 
-    L = int(meta["llama.block_count"])
-    D = int(meta["llama.embedding_length"])
-    heads = int(meta["llama.attention.head_count"])
-    kv_heads = int(meta.get("llama.attention.head_count_kv", heads))
+    # Arch-prefixed metadata (llama, qwen2, gemma, ... all share the key layout).
+    arch = str(meta.get("general.architecture", "llama"))
+
+    def kv(key: str):
+        return meta.get(f"{arch}.{key}") if f"{arch}.{key}" in meta else meta.get(f"llama.{key}")
+
+    L = int(kv("block_count"))
+    D = int(kv("embedding_length"))
+    heads = int(kv("attention.head_count"))
+    kv_heads = int(kv("attention.head_count_kv") or heads)
     if kv_heads > heads:
         raise NotImplementedError(
             f"head_count_kv={kv_heads} > head_count={heads}: more KV heads than query heads is not supported")
     kvD = kv_heads * (D // heads)
-    d_ff = int(meta.get("llama.feed_forward_length", 4 * D))
-    rope_base = float(meta.get("llama.rope.freq_base", 10000.0))
-    ctx = int(meta.get("llama.context_length", 2048))
-    n_vocab = int(meta.get("llama.vocab_size", 32000))
+    d_ff = int(kv("feed_forward_length") or 4 * D)
+    rope_base = float(kv("rope.freq_base") or 10000.0)
+    ctx = int(kv("context_length") or 2048)
+    # vocab size: explicit key, else the embedded tokenizer table
+    n_vocab = int(kv("vocab_size") or 32000)
+    tokens = meta.get("tokenizer.ggml.tokens")
+    if tokens:
+        n_vocab = max(n_vocab, len(tokens))
 
     def get(name: str) -> np.ndarray | None:
         if name not in by_name:
             return None
         dims, gtype, off = by_name[name]
-        return _tensor_data(buf, name, dims, gtype, off)
+        return _tensor_data(buf, name, dims, gtype, off, data_base)
 
     def as_2d(t: np.ndarray, want: tuple) -> np.ndarray:
         if t.shape == want:
@@ -265,17 +394,29 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
         tensors += [q, k, v, o, n1, gate_up, n2, down]
     tensors.append(get("output_norm.weight").reshape(-1))
 
-    tie = get("output.weight") is None
-    if not tie:
-        print("[info] GGUF has output.weight; using tied embedding anyway (set tie_weights=true)")
+    out_w = get("output.weight")
+    if out_w is None:
+        tie = True
+        print("[info] GGUF has no output.weight; using tied embedding")
+    else:
+        tie = False
+        out_w = as_2d(out_w, (D, n_vocab))
+        tensors.append(out_w)
     cfg = config or {
         "vocab_size": n_vocab, "d_model": D, "n_heads": heads,
         "n_kv_heads": kv_heads, "n_layers": L,
-        "seq_len": min(ctx, 4096), "d_ff": d_ff, "tie_weights": True,
+        "seq_len": min(ctx, 4096), "d_ff": d_ff, "tie_weights": tie,
         "act_quant": True, "rope_base": rope_base,
     }
     flat = np.concatenate([np.asarray(t, dtype=np.float32).reshape(-1) for t in tensors])
-    return {"config": cfg, "weights_b64": f16_base64(flat)}
+    wire = {"config": cfg, "weights_b64": f16_base64(flat)}
+    # Embed the GGUF's own byte-level BPE tokenizer when present (the JS
+    # tokenizer is generic over {vocab, merges}).
+    if tokens and meta.get("tokenizer.ggml.merges"):
+        wire["vocab"] = {t: i for i, t in enumerate(tokens)}
+        wire["merges"] = [ln for ln in meta["tokenizer.ggml.merges"] if ln and not ln.startswith("#")]
+        cfg["tokenizer"] = f"{arch}:{meta.get('tokenizer.ggml.pre', 'bpe')}"
+    return wire
 
 
 # --------------------------------------------------------------------------

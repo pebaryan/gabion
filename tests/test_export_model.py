@@ -124,10 +124,13 @@ def _write_gguf(path: Path, meta: dict, tensors: dict[str, np.ndarray]) -> None:
         out += struct.pack("<I", gtype)
         out += struct.pack("<Q", 0)  # placeholder offset
 
-    # data (F32/F16 only for the hand-written file)
+    # data (F32/F16 for the hand-written file); GGUF offsets are relative to the
+    # 32-byte-aligned start of the data section (spec)
+    data_base = (len(out) + 31) & ~31
+    out += b"\x00" * (data_base - len(out))
     offsets = {}
     for name, arr in tensors.items():
-        offsets[name] = len(out)
+        offsets[name] = len(out) - data_base
         out += np.asarray(arr, dtype="<f4" if arr.dtype == np.float32 else "<f2").tobytes()
 
     # fix up offsets in the info section
@@ -156,6 +159,7 @@ def _write_gguf(path: Path, meta: dict, tensors: dict[str, np.ndarray]) -> None:
         gtype = 0 if arr.dtype == np.float32 else 1
         out += struct.pack("<I", gtype)
         out += struct.pack("<Q", offsets[name])
+    out += b"\x00" * (data_base - len(out))
     for name, arr in tensors.items():
         out += np.asarray(arr, dtype="<f4" if arr.dtype == np.float32 else "<f2").tobytes()
     Path(path).write_bytes(bytes(out))
@@ -281,6 +285,49 @@ def test_export_tinygrad_gqa(tmp_path):
     assert np.allclose(k, np.asarray(params[2].numpy()), atol=1e-2)  # layer0.k
     v = flat[n_tok + D * D + D * kvD:n_tok + D * D + 2 * D * kvD].reshape(D, kvD)
     assert np.allclose(v, np.asarray(params[3].numpy()), atol=1e-2)  # layer0.v
+
+
+def test_gguf_k_quants(tmp_path):
+    """Q2_K / Q4_K / Q6_K / TQ2_0 dequant on hand-crafted single super-blocks."""
+    from tools.export_model import _dequant
+
+    np16 = np.float16
+
+    # Q2_K: scales[16], qs[64], d, dmin (file layout); sc=2, min=1, qs=0x66
+    #   qb = (0x66 >> shift) & 3 = [2,1,2,1] per 32-block; val = 0.5*2*qb - 0.25
+    q2 = bytes([0x12]) * 16 + bytes([0x66]) * 64 + struct.pack("<ee", np16(0.5), np16(0.25))
+    got = _dequant("t", q2, (256,), "Q2_K")
+    qb = np.array([2] * 32 + [1] * 32 + [2] * 32 + [1] * 32, dtype=np.float32)
+    exp = np.tile(qb - 0.25, 2)
+    assert np.allclose(got, exp, atol=1e-6), np.max(np.abs(got - exp))
+
+    # Q4_K: d, dmin first (file layout), scales all -> sc=10, m=10, qs=0x66
+    #   val = 1.0*10*6 - 0.5*10 = 55
+    q4 = struct.pack("<ee", np16(1.0), np16(0.5)) + bytes([10, 10, 10, 10, 10, 10, 10, 10, 0xAA, 0xAA, 0xAA, 0xAA]) + bytes([0x66]) * 128
+    got = _dequant("t", q4, (256,), "Q4_K")
+    assert np.allclose(got, 55.0, atol=1e-5), np.max(np.abs(got - 55.0))
+
+    # Q6_K: ql[128], qh[64], sc[16], d[2] (file layout); d=2.0, sc=1, ql=0xFF, qh=0
+    #   q=-17 -> val = 2*1*-17 = -34
+    q6 = bytes([0xFF]) * 128 + bytes([0x00]) * 64 + bytes([0x01]) * 16 + struct.pack("<e", np16(2.0))
+    got = _dequant("t", q6, (256,), "Q6_K")
+    assert np.allclose(got, -34.0, atol=1e-5)
+
+    # TQ2_0: qs[64], d[2] (file layout); qs=0xFF -> bits=3 -> val = (3-1)*0.5 = 1.0
+    tq = bytes([0xFF]) * 64 + struct.pack("<e", np16(0.5))
+    got = _dequant("t", tq, (256,), "TQ2_0")
+    assert np.allclose(got, 1.0, atol=1e-6)
+
+    # Also round-trip through a real GGUF file layout (data-section-relative offsets)
+    tensors = {"t1": _dequant("t", q2, (256,), "Q2_K")}
+    _write_gguf(tmp_path / "k.gguf", {"general.architecture": "llama"}, tensors)  # F32 only
+    from tools.export_model import parse_gguf, _tensor_data
+
+    buf = (tmp_path / "k.gguf").read_bytes()
+    meta, infos, base = parse_gguf(tmp_path / "k.gguf")
+    name, dims, gtype, off = infos[0]
+    assert gtype == "F32"
+    assert _tensor_data(buf, name, dims, gtype, off, base).shape == (256,)
 
 
 def test_export_cli(tmp_path, monkeypatch):
