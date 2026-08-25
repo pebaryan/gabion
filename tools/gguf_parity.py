@@ -73,7 +73,13 @@ def build_reference(out: dict, tokens: list[int], B: int = 1, T: int = 8):
     per = 2 * D * D + 2 * D * kvD + 2 * D + 2 * D * dFF + dFF * D
     assert len(flat) == V * D + L * per + D + (0 if cfg["tie_weights"] else D * V), len(flat)
     x = np.asarray(tok_emb[tokens], dtype=np.float32).reshape(B, T, D)  # [B,T,D]
+    qbias = out.get("q_bias") or [None] * L
+    kbias = out.get("k_bias") or [None] * L
+    vbias = out.get("v_bias") or [None] * L
     for l in range(L):
+        qb = np.asarray(qbias[l], dtype=np.float32) if qbias[l] is not None else None
+        kb = np.asarray(kbias[l], dtype=np.float32) if kbias[l] is not None else None
+        vb = np.asarray(vbias[l], dtype=np.float32) if vbias[l] is not None else None
         q_w, k_w, v_w, o_w, n1_w, gate_up_w, n2_w, down_w = (
             take((D, D)), take((D, kvD)), take((D, kvD)), take((D, D)),
             take((D,)), take((D, 2 * dFF)), take((D,)), take((dFF, D)))
@@ -82,6 +88,9 @@ def build_reference(out: dict, tokens: list[int], B: int = 1, T: int = 8):
         q = h @ q_w  # [B,T,D]
         k = h @ k_w
         v = h @ v_w
+        if qb: q = q + qb.reshape(1, 1, -1)
+        if kb: k = k + kb.reshape(1, 1, -1)
+        if vb: v = v + vb.reshape(1, 1, -1)
         q = q.reshape(B, T, H, hd).transpose(0, 2, 1, 3)  # [B,H,T,hd]
         k = k.reshape(B, T, kvH, hd).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, kvH, hd).transpose(0, 2, 1, 3)
@@ -155,6 +164,9 @@ for (const rel of ['gabion/web/tinygrad_v0.js','gabion/web/bbt_forward.js','gabi
     kvHeads: cfg.n_kv_heads || cfg.n_heads, nLayers: cfg.n_layers,
     seqLen: cfg.seq_len, dFF: cfg.d_ff,
     tieWeights: cfg.tie_weights, actQuant: cfg.act_quant, ropeBase: cfg.rope_base,
+    qBiases: {json.dumps(out.get("q_bias"))} ? {json.dumps(out.get("q_bias"))}.map(a => new Float32Array(a)) : null,
+    kBiases: {json.dumps(out.get("k_bias"))} ? {json.dumps(out.get("k_bias"))}.map(a => new Float32Array(a)) : null,
+    vBiases: {json.dumps(out.get("v_bias"))} ? {json.dumps(out.get("v_bias"))}.map(a => new Float32Array(a)) : null,
   }});
   const consumed = model.loadFlatWeights(weights, false);
   if (consumed !== weights.length) throw new Error(`cursor ${{consumed}} != ${{weights.length}}`);

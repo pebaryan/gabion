@@ -49,12 +49,20 @@
       this.kvD = this.kvH * this.headDim;
       this.eps = 1e-6;
       this.actQuant = config.actQuant !== false; // default true
+      // Optional attention biases (q/k/v per-layer; Qwen2.5-Instruct has them)
+      this._qBiases = config.qBiases || null;
+      this._kBiases = config.kBiases || null;
+      this._vBiases = config.vBiases || null;
 
       // nn layers
       this.tokEmb = new nn.Embedding(this.V, this.D);
       this.layers = [];
       for (let l = 0; l < this.L; l++) {
-        this.layers.push(new TransformerBlock(this.D, this.H, this.kvD, this.dFF));
+        const bl = new TransformerBlock(this.D, this.H, this.kvD, this.dFF);
+        if (this._qBiases) bl.qBias = this._qBiases[l];
+        if (this._kBiases) bl.kBias = this._kBiases[l];
+        if (this._vBiases) bl.vBias = this._vBiases[l];
+        this.layers.push(bl);
       }
       this.normF = new nn.RMSNorm(this.D);
       if (!this.tieWeights) {
@@ -238,7 +246,7 @@
       // Pre-norm + attention + residual
       if (x.onGPU) await x.toCPU(); // rmsNorm forward is CPU
       let h = bl.norm1.forward(x);
-      h = await this._causalSelfAttention(h, B, T, bl.q.weight, bl.k.weight, bl.v.weight, bl.o.weight, ternarize);
+      h = await this._causalSelfAttention(h, B, T, bl.q.weight, bl.k.weight, bl.v.weight, bl.o.weight, ternarize, bl.qBias || null, bl.kBias || null, bl.vBias || null);
       if (h.onGPU) await h.toCPU();
       x = x.add(h);
 
@@ -256,7 +264,7 @@
      * Multi-head causal self-attention with RoPE.
      * x: [B, T, D] -> [B, T, D]
      */
-    async _causalSelfAttention(x, B, T, qW, kW, vW, oW, ternarize = false) {
+    async _causalSelfAttention(x, B, T, qW, kW, vW, oW, ternarize = false, qBias = null, kBias = null, vBias = null) {
       const D = this.D;
       const H = this.H;
       const headDim = this.headDim;
@@ -280,6 +288,11 @@
       if (q.onGPU) await q.toCPU();
       if (k.onGPU) await k.toCPU();
       if (v.onGPU) await v.toCPU();
+
+      // Attention biases (Qwen2.5-Instruct): q/k/v projections are affine
+      if (qBias) for (let i = 0; i < q.data.length; i++) q.data[i] += qBias[i % qBias.length];
+      if (kBias) for (let i = 0; i < k.data.length; i++) k.data[i] += kBias[i % kBias.length];
+      if (vBias) for (let i = 0; i < v.data.length; i++) v.data[i] += vBias[i % vBias.length];
 
       // Reshape to [B*H, T, headDim] (CPU — data reordering); k/v are grouped
       // when GQA (kvH < H) and expanded to full query-head count for the kernels.
@@ -645,7 +658,7 @@
      * Apply Rotary Position Embeddings.
      * x: [BH, T, headDim] -> [BH, T, headDim]
      */
-    _applyRoPE(x, BH, T, headDim) {
+    _applyRoPE(x, BH, T, headDim, startPos = 0) {
       const halfDim = headDim / 2;
       const out = new Float32Array(x.data.length);
       const cosT = this._cosTable;
@@ -654,7 +667,7 @@
       for (let bh = 0; bh < BH; bh++) {
         for (let t = 0; t < T; t++) {
           const off = (bh * T + t) * headDim;
-          const tOff = t * headDim;
+          const tOff = (startPos + t) * headDim; // absolute position
           for (let i = 0; i < halfDim; i++) {
             const x1 = x.data[off + i];
             const x2 = x.data[off + halfDim + i];
@@ -798,11 +811,17 @@
      * and takes the last predicted row — identical semantics, so the two paths are
      * interchangeable and the fallback doubles as a reference.
      */
-    async decodeStep(tokenId, state, ternarize = false) {
+    async decodeStep(tokenId, state, ternarize = false, debugNaN = false) {
       const D = this.D, H = this.H, V = this.V, headDim = this.headDim, BH = H, kvH = this.kvH;
       const backend = window.WebGPUBackend && WebGPUBackend.instance;
       const pos = state.pos;
       if (pos >= state.maxLen) throw new Error(`KV cache full (maxLen=${state.maxLen})`);
+      const chk = (stage, buf) => {
+        if (!debugNaN || !buf) return;
+        for (let i = 0; i < buf.length; i++) if (!Number.isFinite(buf[i])) {
+          throw new Error(`NaN at pos=${pos} ${stage}`);
+        }
+      };
 
       // CPU fallback: prefix forward, last predicted row (exact reference semantics)
       if (!backend) {
@@ -838,13 +857,21 @@
         if (q.onGPU) await q.toCPU();
         if (k.onGPU) await k.toCPU();
         if (v.onGPU) await v.toCPU();
+        chk("layer" + l + ".q", q.data); chk("layer" + l + ".k", k.data); chk("layer" + l + ".v", v.data);
+        // Attention biases (Qwen2.5-Instruct): affine projections
+        if (bl.qBias) for (let i = 0; i < q.data.length; i++) q.data[i] += bl.qBias[i % bl.qBias.length];
+        if (bl.kBias) for (let i = 0; i < k.data.length; i++) k.data[i] += bl.kBias[i % bl.kBias.length];
+        if (bl.vBias) for (let i = 0; i < v.data.length; i++) v.data[i] += bl.vBias[i % bl.vBias.length];
 
         // Heads + RoPE at the absolute position (k/v have kvH heads under GQA)
         q = this._reshapeForHeads(q, 1, 1, H, headDim);
         k = this._reshapeForHeads(k, 1, 1, kvH, headDim);
         v = this._reshapeForHeads(v, 1, 1, kvH, headDim);
-        q = this._applyRoPE(q, BH, 1, headDim);
-        k = this._applyRoPE(k, kvH, 1, headDim);
+        q = this._applyRoPE(q, BH, 1, headDim, pos);
+        k = this._applyRoPE(k, kvH, 1, headDim, pos);
+        if (q.onGPU) await q.toCPU();
+        if (k.onGPU) await k.toCPU();
+        chk("layer" + l + ".q_rope", q.data); chk("layer" + l + ".k_rope", k.data);
 
         // Append k/v into the cache at position pos ([kvH, maxLen, headDim] layout)
         const kCache = state.kCaches[l], vCache = state.vCaches[l];
@@ -860,19 +887,30 @@
         // L stays maxLen (it doubles as the cache row stride in the kernels).
         const qT = Tensor.fromArray(q.data, [BH, headDim], false).toGPU();
         const y = kvAttention(qT, kCache, vCache, { causal: true, pos, kvH, H });
-        const yData = await y.toCPU();
+        // toCPU() returns the Tensor (data updated in place) — take .data
+        const yData = (await y.toCPU()).data;
+        chk("layer" + l + ".attn", yData);
 
         // Reshape back, output projection, residual
         const y3 = this._reshapeFromHeads(Tensor.fromArray(yData, [BH, 1, headDim], false), 1, 1, H, headDim);
+        if (debugNaN) {
+          if (!Number.isFinite(y3.data[0])) {
+            throw new Error(`NaN at pos=${pos} layer${l}.o y3[0..3]=${Array.from(y3.data.slice(0, 4))} yData[0..3]=${Array.from(yData.slice(0, 4))} yDataLen=${yData.length} bh=${BH} hd=${headDim} y3len=${y3.data.length}`);
+          }
+        }
         const o = (ternarize ? this._bitlinear(y3.reshape([1, D]), bl.o.weight) : y3.reshape([1, D]).matmul(bl.o.weight)).reshape([1, 1, D]);
         if (o.onGPU) await o.toCPU();
+        chk("layer" + l + ".o", o.data);
         x = x.add(o);
+        chk("layer" + l + ".x", x.data);
 
         // FFN + residual
         let h2 = bl.norm2.forward(x);
         h2 = await this._swiGLU(h2, 1, 1, bl.gateUp.weight, bl.down.weight, ternarize);
         if (h2.onGPU) await h2.toCPU();
+        chk("layer" + l + ".h2", h2.data);
         x = x.add(h2);
+        chk("layer" + l + ".x2", x.data);
       }
 
       // Final norm + LM head
@@ -881,6 +919,7 @@
       const logitsW = this.tieWeights ? this.tokEmb.weight.transpose2d() : this.lmHead.weight;
       const logitsT = x2d.matmul(logitsW);
       if (logitsT.onGPU) await logitsT.toCPU();
+      chk("final.logits", logitsT.data);
       state.pos = pos + 1;
       return { logits: Float32Array.from(logitsT.data), state };
     }
@@ -930,11 +969,11 @@
       // generation starts (the last prompt token is consumed by the first step).
       for (let i = 0; i < tokens.length - 1; i++) {
         if (state.pos >= state.maxLen) break; // context full
-        await this.decodeStep(tokens[i], state, ternarize);
+        await this.decodeStep(tokens[i], state, ternarize, !!opts.debugNaN);
       }
       for (let i = 0; i < maxNew; i++) {
         if (state.pos >= state.maxLen) break; // context full
-        const { logits, state: st } = await this.decodeStep(tokens[tokens.length - 1], state, ternarize);
+        const { logits, state: st } = await this.decodeStep(tokens[tokens.length - 1], state, ternarize, !!opts.debugNaN);
         const next = this._sample(logits, temperature, topK);
         tokens.push(next);
         logitsList.push(logits);

@@ -26,7 +26,7 @@ def _write_st(path, tensors: dict):
 
 
 def _write_hf_dir(tmp_path, *, D=8, heads=2, kv=2, L=2, d_ff=16, vocab=8,
-                  tied=True, dtype="F32", sharded=False):
+                  tied=True, dtype="F32", sharded=False, bias=False):
     """Build a tiny llama-family checkpoint dir; returns the tensor dict."""
     tensors = {}
     rng = np.random.default_rng(1234)
@@ -42,6 +42,10 @@ def _write_hf_dir(tmp_path, *, D=8, heads=2, kv=2, L=2, d_ff=16, vocab=8,
         tensors[f"model.layers.{i}.mlp.gate_proj.weight"] = rng.standard_normal((d_ff, D)).astype(dt)
         tensors[f"model.layers.{i}.mlp.up_proj.weight"] = rng.standard_normal((d_ff, D)).astype(dt)
         tensors[f"model.layers.{i}.mlp.down_proj.weight"] = rng.standard_normal((D, d_ff)).astype(dt)
+        if bias:
+            tensors[f"model.layers.{i}.self_attn.q_proj.bias"] = rng.standard_normal(D).astype(dt)
+            tensors[f"model.layers.{i}.self_attn.k_proj.bias"] = rng.standard_normal(kv * (D // heads)).astype(dt)
+            tensors[f"model.layers.{i}.self_attn.v_proj.bias"] = rng.standard_normal(kv * (D // heads)).astype(dt)
     tensors["model.norm.weight"] = rng.standard_normal(D).astype(dt)
     if not tied:
         tensors["lm_head.weight"] = rng.standard_normal((vocab, D)).astype(dt)
@@ -164,6 +168,23 @@ def test_export_hf_specials_and_chat_template(tmp_path):
     (tmp_path / "tokenizer.json").write_text(json.dumps(tok3))
     out3 = export_hf(tmp_path)
     assert out3["chat_template"] == "fallback"
+
+
+def test_export_hf_attention_bias(tmp_path):
+    t = _write_hf_dir(tmp_path, D=8, heads=2, kv=2, L=2, d_ff=16, vocab=8, bias=True)
+    out = export_hf(tmp_path)
+    assert len(out["q_bias"]) == 2 and len(out["k_bias"]) == 2 and len(out["v_bias"]) == 2
+    assert len(out["q_bias"][0]) == 8 and len(out["k_bias"][0]) == 8  # q: [D], k/v: [kv*hd]
+    np.testing.assert_allclose(out["q_bias"][0], t["model.layers.0.self_attn.q_proj.bias"], atol=1e-6)
+    np.testing.assert_allclose(out["k_bias"][1], t["model.layers.1.self_attn.k_proj.bias"], atol=1e-6)
+    assert out["config"]["attention_bias"] is True
+
+
+def test_export_hf_no_bias_by_default(tmp_path):
+    _write_hf_dir(tmp_path)
+    out = export_hf(tmp_path)
+    assert "q_bias" not in out
+    assert out["config"].get("attention_bias") is False
 
 
 def test_export_hf_f16(tmp_path):

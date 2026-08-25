@@ -14,6 +14,9 @@
       kvHeads: c.n_kv_heads || c.n_heads, nLayers: c.n_layers,
       seqLen: c.seq_len, dFF: c.d_ff,
       tieWeights: c.tie_weights, actQuant: c.act_quant, ropeBase: c.rope_base,
+      qBiases: data.q_bias ? data.q_bias.map(a => new Float32Array(a)) : null,
+      kBiases: data.k_bias ? data.k_bias.map(a => new Float32Array(a)) : null,
+      vBiases: data.v_bias ? data.v_bias.map(a => new Float32Array(a)) : null,
     });
     const consumed = model.loadFlatWeights(weights, false);
     if (consumed !== weights.length) {

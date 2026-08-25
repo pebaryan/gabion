@@ -870,6 +870,21 @@ def export_hf(path: Path, config: dict | None = None) -> dict:
     flat16 = build_flat()
     wire = {"config": cfg,
             "weights_b64": base64.b64encode(flat16.view("<u2").tobytes()).decode("ascii")}
+    # Attention biases (q/k/v per layer) — Qwen2.5-Instruct trains with them.
+    # Separate wire fields (not in the flat) so the weight cursor stays untouched.
+    qb, kb, vb = [], [], []
+    for i in range(cfg["n_layers"]):
+        qb.append(np.asarray(get(f"model.layers.{i}.self_attn.q_proj.bias"), dtype=np.float32).tolist()
+                  if get(f"model.layers.{i}.self_attn.q_proj.bias") is not None else None)
+        kb.append(np.asarray(get(f"model.layers.{i}.self_attn.k_proj.bias"), dtype=np.float32).tolist()
+                  if get(f"model.layers.{i}.self_attn.k_proj.bias") is not None else None)
+        vb.append(np.asarray(get(f"model.layers.{i}.self_attn.v_proj.bias"), dtype=np.float32).tolist()
+                  if get(f"model.layers.{i}.self_attn.v_proj.bias") is not None else None)
+    if any(qb) or any(kb) or any(vb):
+        wire["q_bias"] = qb
+        wire["k_bias"] = kb
+        wire["v_bias"] = vb
+    cfg["attention_bias"] = bool(any(qb) or any(kb) or any(vb))
     tokdata = _hf_tokenizer(path)
     if tokdata is not None:
         vocab, merges, toktype, special, chat_template = tokdata
