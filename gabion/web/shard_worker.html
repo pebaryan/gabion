@@ -17,11 +17,11 @@
 <div id="s">booting…</div>
 <div id="e"></div>
 
-<script src="/gabion/web/tinygrad_v0.js?v=14"></script>
-<script src="/gabion/web/webgpu_backend.js?v=14"></script>
-<script src="/gabion/web/tokenizer.js?v=14"></script>
-<script src="/gabion/web/bbt_forward.js?v=14"></script>
-<script src="/gabion/web/model_loader.js?v=14"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=19"></script>
+<script src="/gabion/web/webgpu_backend.js?v=19"></script>
+<script src="/gabion/web/tokenizer.js?v=19"></script>
+<script src="/gabion/web/bbt_forward.js?v=19"></script>
+<script src="/gabion/web/model_loader.js?v=19"></script>
 <script>
 "use strict";
 // Kernel set the decode path can dispatch (KV attention + matmuls + silu).
@@ -72,7 +72,7 @@ async function initGPU() {
     const model = await gabionLoader.loadShard(manifest, `${dir}/${spec.file}`, myIndex);
  // GPU-resident FFN: upload gate_up/down (the dominant per-layer matmuls);
  // forwardHidden pushes the FFN input to GPU and _swiGLU stays on GPU.
- for (const l of model.layers) { l.gateUp.weight.toGPU(); l.down.weight.toGPU(); }
+ for (const l of model.layers) { l.gateUp.weight.toGPU(); l.down.weight.toGPU(); if (l.inProj) { l.inProj.weight.toGPU(); l.outProj.weight.toGPU(); } }
     const state = model.initKVCache(model.T);
     status(`WebGPU ready · shard ${myIndex} loaded: layers ${spec.layers[0]}..${spec.layers[1] - 1} ` +
            `(${spec.n_layers} layers, ${model.D} dim, kv ${model.kvH}), KV maxLen ${state.maxLen}`);

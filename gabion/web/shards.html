@@ -50,11 +50,11 @@
 <div id="stats"></div>
 <pre id="resultJson" hidden>{}</pre>
 
-<script src="/gabion/web/tinygrad_v0.js?v=16"></script>
-<script src="/gabion/web/webgpu_backend.js?v=16"></script>
-<script src="/gabion/web/tokenizer.js?v=16"></script>
-<script src="/gabion/web/bbt_forward.js?v=16"></script>
-<script src="/gabion/web/model_loader.js?v=16"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=19"></script>
+<script src="/gabion/web/webgpu_backend.js?v=19"></script>
+<script src="/gabion/web/tokenizer.js?v=19"></script>
+<script src="/gabion/web/bbt_forward.js?v=19"></script>
+<script src="/gabion/web/model_loader.js?v=19"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -142,11 +142,12 @@ async function generate() {
       f.style.cssText = "width:100%;height:110px;border:1px solid #2d3748;border-radius:6px;margin:.2rem 0;background:#161c24";
       $("shards").appendChild(f);
     }
-    // Wait for all shards to report ready (timeout 300s)
+    // Wait for all shards to report ready (timeout 600s — 6 workers each
+    // LUT-convert ~800MB f16 under CPU contention)
     const ready = new Array(specs.length).fill(false);
     const readyWait = new Promise((resolve) => {
       const iv = setInterval(() => { if (ready.every(Boolean)) { clearInterval(iv); resolve(); } }, 250);
-      setTimeout(() => { clearInterval(iv); resolve(); }, 300000);
+      setTimeout(() => { clearInterval(iv); resolve(); }, 600000);
     });
     const prevOn = chan.onmessage;
     const log = (s) => { $("shardlog").textContent = s; };

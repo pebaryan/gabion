@@ -24,7 +24,10 @@
       seqLen: c.seq_len, dFF: c.d_ff,
       tieWeights: c.tie_weights, actQuant: c.act_quant, ropeBase: c.rope_base,
       lean: !!layerRange,
-      arch: c.arch || "llama", layerTypes: c.layer_types || null,
+      arch: c.arch || "llama",
+      // Shard models slice layer_types to their range — the heterogeneous
+      // lfm2 layout is per-layer; the global list would misbuild every shard.
+      layerTypes: c.layer_types ? c.layer_types.slice(start, start + L) : null,
       convLCache: c.conv_l_cache || 3, normEps: c.norm_eps,
       headDim: c.head_dim,
       qBiases: data.q_bias ? data.q_bias.slice(start, start + L).map(a => new Float32Array(a)) : null,
