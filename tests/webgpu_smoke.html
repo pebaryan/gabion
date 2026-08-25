@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>gabion WebGPU smoke</title>
+<style>
+  body { font-family: ui-monospace, Consolas, monospace; background: #0b0f1a; color: #e8eeff; margin: 20px; }
+  h1 { font-size: 16px; }
+  table { border-collapse: collapse; margin-top: 10px; }
+  td, th { border: 1px solid #253552; padding: 4px 10px; font-size: 13px; text-align: left; }
+  .ok { color: #38d39f; } .err { color: #ff7a7a; }
+  pre { background: #121a2a; padding: 10px; border-radius: 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>gabion WebGPU real-browser smoke</h1>
+<div id="adapter">adapter: n/a</div>
+<table id="results"><thead><tr><th>check</th><th>max_abs</th><th>verdict</th></tr></thead><tbody></tbody></table>
+<pre id="resultJson">{}</pre>
+<script src="/gabion/web/tinygrad_v0.js"></script>
+<script src="/gabion/web/webgpu_backend.js"></script>
+<script src="/gabion/web/bbt_forward.js"></script>
+<script>
+"use strict";
+const KERNELS = ["matmul","elementwise","reduce","softmax","rope","batched_matmul","fused_attention",
+  "softmax_backward","rope_backward","batched_transpose","rmsnorm_backward","adam_update","adamw_update",
+  "sgd_update","cross_entropy_forward","cross_entropy_backward","embedding_forward","silu_mul",
+  "silu_mul_backward","layernorm","layernorm_backward","dropout_fwd","dropout_bwd","conv2d_fwd",
+  "conv2d_bwd_dx","conv2d_bwd_dw","conv_bwd_db","convtranspose2d_fwd","convtranspose2d_bwd_dx",
+  "convtranspose2d_bwd_dw","batchnorm_stats","batchnorm_fwd","batchnorm_bwd_stats","batchnorm_bwd_dx",
+  "affine_channel","affine_channel_bwd_dw","affine_last","affine_last_bwd_dw","lstm_cell","lstm_cell_bwd",
+  "lstm_cell_bwd_dx","lstm_cell_bwd_dh","lstm_cell_bwd_dwih","lstm_cell_bwd_dwhh","kv_attention_scores",
+  "kv_attention_apply","kv_group_sum"];
+
+const THRESHOLD = 1e-4;
+const out = { adapter: null, compile: { ok: [], fail: [] }, checks: [], pass: false };
+const resultsTbody = document.querySelector("#results tbody");
+
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t += 0x6D2B79F5;
+    let x = Math.imul(t ^ (t >>> 15), 1 | t);
+    x ^= x + Math.imul(x ^ (x >>> 7), 61 | x);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function randF32(rng, n, lo = -1, hi = 1) {
+  const a = new Float32Array(n);
+  for (let i = 0; i < n; i++) a[i] = lo + (hi - lo) * rng();
+  return a;
+}
+function maxAbs(a, b) {
+  let m = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) m = Math.max(m, Math.abs(a[i] - b[i]));
+  return m;
+}
+function addRow(name, ma, pass) {
+  out.checks.push({ name, max_abs: ma, pass });
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td>${name}</td><td>${ma.toExponential(3)}</td><td class="${pass ? "ok" : "err"}">${pass ? "PASS" : "FAIL"}</td>`;
+  resultsTbody.appendChild(tr);
+}
+
+// ---- CPU references ----
+function refMatmul(A, B, M, K, N) {
+  const C = new Float32Array(M * N);
+  for (let i = 0; i < M; i++)
+    for (let j = 0; j < N; j++) {
+      let s = 0;
+      for (let k = 0; k < K; k++) s += A[i * K + k] * B[k * N + j];
+      C[i * N + j] = s;
+    }
+  return C;
+}
+function refSilu(x) {
+  const y = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i++) y[i] = x[i] / (1 + Math.exp(-x[i]));
+  return y;
+}
+function refSoftmax(x, rows, cols) {
+  const y = new Float32Array(x.length);
+  for (let r = 0; r < rows; r++) {
+    let mx = -Infinity;
+    for (let c = 0; c < cols; c++) mx = Math.max(mx, x[r * cols + c]);
+    let s = 0;
+    for (let c = 0; c < cols; c++) { y[r * cols + c] = Math.exp(x[r * cols + c] - mx); s += y[r * cols + c]; }
+    for (let c = 0; c < cols; c++) y[r * cols + c] /= s;
+  }
+  return y;
+}
+function refRope(x, cosT, sinT, BH, T, hd) {
+  const y = new Float32Array(x.length);
+  const half = hd >> 1;
+  for (let bh = 0; bh < BH; bh++)
+    for (let t = 0; t < T; t++) {
+      const off = (bh * T + t) * hd;
+      const to = t * hd;
+      for (let i = 0; i < half; i++) {
+        const x1 = x[off + i], x2 = x[off + half + i];
+        const c = cosT[to + i], s = sinT[to + i];
+        y[off + i] = x1 * c - x2 * s;
+        y[off + half + i] = x2 * c + x1 * s;
+      }
+    }
+  return y;
+}
+function refKvScores(q, kcache, BH, kvH, H, L, hd, scale, causal, pos) {
+  const s = new Float32Array(BH * L);
+  for (let bh = 0; bh < BH; bh++) {
+    const kv = Math.floor((bh * kvH) / H);
+    for (let j = 0; j < L; j++) {
+      if (causal && j > pos) { s[bh * L + j] = -3.402823e38; continue; }
+      let dot = 0;
+      for (let d = 0; d < hd; d++) dot += q[bh * hd + d] * kcache[(kv * L + j) * hd + d];
+      s[bh * L + j] = dot * scale;
+    }
+  }
+  return s;
+}
+function refKvApply(scores, vcache, BH, kvH, H, L, hd) {
+  const y = new Float32Array(BH * hd);
+  for (let bh = 0; bh < BH; bh++) {
+    const kv = Math.floor((bh * kvH) / H);
+    let mx = -Infinity;
+    for (let j = 0; j < L; j++) mx = Math.max(mx, scores[bh * L + j]);
+    let sm = 0;
+    const p = new Float32Array(L);
+    for (let j = 0; j < L; j++) { p[j] = Math.exp(scores[bh * L + j] - mx); sm += p[j]; }
+    for (let d = 0; d < hd; d++) {
+      let acc = 0;
+      for (let j = 0; j < L; j++) acc += (p[j] / sm) * vcache[(kv * L + j) * hd + d];
+      y[bh * hd + d] = acc;
+    }
+  }
+  return y;
+}
+function refGroupSum(input, B, H, kvH, T, hd) {
+  const group = H / kvH, TD = T * hd;
+  const y = new Float32Array(B * kvH * TD);
+  for (let b = 0; b < B; b++)
+    for (let kvh = 0; kvh < kvH; kvh++) {
+      const g0 = kvh * group;
+      for (let i = 0; i < TD; i++) {
+        let acc = 0;
+        for (let g = 0; g < group; g++) acc += input[(b * H + g0 + g) * TD + i];
+        y[(b * kvH + kvh) * TD + i] = acc;
+      }
+    }
+  return y;
+}
+function refSiluMul(A, N, dFF) {
+  const y = new Float32Array(N * dFF);
+  for (let r = 0; r < N; r++) {
+    const stride = 2 * dFF;
+    for (let c = 0; c < dFF; c++) {
+      const gate = A[r * stride + c], up = A[r * stride + dFF + c];
+      y[r * dFF + c] = gate / (1 + Math.exp(-gate)) * up;
+    }
+  }
+  return y;
+}
+function refLayernorm(x, rows, d, eps, w, b) {
+  const y = new Float32Array(x.length);
+  for (let r = 0; r < rows; r++) {
+    let mean = 0;
+    for (let j = 0; j < d; j++) mean += x[r * d + j];
+    mean /= d;
+    let varr = 0;
+    for (let j = 0; j < d; j++) { const v = x[r * d + j] - mean; varr += v * v; }
+    varr /= d;
+    const inv = 1 / Math.sqrt(varr + eps);
+    for (let j = 0; j < d; j++) y[r * d + j] = (x[r * d + j] - mean) * inv * w[j] + b[j];
+  }
+  return y;
+}
+function refEmbedding(emb, idx, BT, D) {
+  const y = new Float32Array(BT * D);
+  for (let bt = 0; bt < BT; bt++)
+    for (let d = 0; d < D; d++) y[bt * D + d] = emb[idx[bt] * D + d];
+  return y;
+}
+function refReduceSum(x, rows, cols) {
+  const y = new Float32Array(rows);
+  for (let r = 0; r < rows; r++) {
+    let s = 0;
+    for (let c = 0; c < cols; c++) s += x[r * cols + c];
+    y[r] = s;
+  }
+  return y;
+}
+
+function createU32Buffer(device, data) {
+  const buf = device.createBuffer({
+    size: data.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Uint32Array(buf.getMappedRange()).set(data);
+  buf.unmap();
+  return buf;
+}
+
+// ---- main ----
+async function run() {
+  const rng = mulberry32(20260825);
+  let backend;
+  let device;
+  try {
+    if (!navigator.gpu) { out.adapter = "NO navigator.gpu"; finalize(); return; }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) { out.adapter = "adapter request returned null"; finalize(); return; }
+    out.adapter = adapter.name + " | " + (adapter.info ? adapter.info.description : "") + " | " + (adapter.info ? adapter.info.vendor : "");
+    device = await adapter.requestDevice();
+    backend = WebGPUBackend.init(device);
+  } catch (e) {
+    out.adapter = "init failed: " + e.message;
+    finalize();
+    return;
+  }
+  document.getElementById("adapter").textContent = "adapter: " + out.adapter;
+
+  // 1) load + compile every kernel (real shader validation)
+  const loaded = [];
+  for (const name of KERNELS) {
+    try {
+      const r = await fetch(`/gabion/web/kernels/${name}.wgsl`, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      WebGPUBackend.registerShader(name, await r.text());
+      loaded.push(name);
+    } catch (e) { out.compile.fail.push(name + ": " + e.message); }
+  }
+  for (const name of loaded) {
+    try { backend.getPipeline(name); out.compile.ok.push(name); }
+    catch (e) { out.compile.fail.push(name + ": " + e.message); }
+  }
+
+  // 2) dispatch checks
+  const runCheck = async (name, fn) => {
+    try {
+      const res = await fn();
+      const ma = (typeof res === "number") ? res : res.ma;
+      addRow(name, ma, ma < THRESHOLD);
+      if (typeof res === "object" && res.detail) out.checks[out.checks.length - 1].detail = res.detail;
+    } catch (e) {
+      addRow(name, NaN, false);
+      out.checks[out.checks.length - 1].error = e.message;
+    }
+  };
+
+  // matmul 48x64x32
+  await runCheck("matmul", async () => {
+    const A = randF32(rng, 48 * 64), B = randF32(rng, 64 * 32);
+    const ref = refMatmul(A, B, 48, 64, 32);
+    const aBuf = backend.createBufferFromData(A), bBuf = backend.createBufferFromData(B);
+    const cBuf = backend.matmul(aBuf, bBuf, 48, 64, 32, false);
+    const got = await backend.readBuffer(cBuf, 48 * 32);
+    return maxAbs(got, ref);
+  });
+
+  // elementwise silu
+  await runCheck("elementwise_silu", async () => {
+    const x = randF32(rng, 1024);
+    const ref = refSilu(x);
+    const aBuf = backend.createBufferFromData(x), dummy = backend.createEmptyBuffer(4);
+    const oBuf = backend.elementwise(aBuf, dummy, 1024, 2, 0);
+    const got = await backend.readBuffer(oBuf, 1024);
+    return maxAbs(got, ref);
+  });
+
+  // softmax 8x128
+  await runCheck("softmax", async () => {
+    const x = randF32(rng, 8 * 128);
+    const ref = refSoftmax(x, 8, 128);
+    const iBuf = backend.createBufferFromData(x);
+    const oBuf = backend.softmax(iBuf, 8, 128, 0);
+    const got = await backend.readBuffer(oBuf, 8 * 128);
+    return maxAbs(got, ref);
+  });
+
+  // rope BH=2 T=8 hd=16
+  await runCheck("rope", async () => {
+    const BH = 2, T = 8, hd = 16, half = 8;
+    const x = randF32(rng, BH * T * hd);
+    const cosT = new Float32Array(T * hd), sinT = new Float32Array(T * hd);
+    for (let t = 0; t < T; t++)
+      for (let i = 0; i < half; i++) {
+        const th = t / Math.pow(10000, (2 * i) / hd);
+        cosT[t * hd + i] = Math.cos(th); sinT[t * hd + i] = Math.sin(th);
+      }
+    const ref = refRope(x, cosT, sinT, BH, T, hd);
+    const xBuf = backend.createBufferFromData(x), cBuf = backend.createBufferFromData(cosT), sBuf = backend.createBufferFromData(sinT);
+    const oBuf = backend.rope(xBuf, cBuf, sBuf, BH, T, hd);
+    const got = await backend.readBuffer(oBuf, BH * T * hd);
+    return maxAbs(got, ref);
+  });
+
+  // GQA kv-attention: B=1 H=4 kvH=2 T=8 hd=16 (causal, pos=L-1)
+  await runCheck("kv_attention_scores", async () => {
+    const BH = 4, kvH = 2, H = 4, L = 8, hd = 16;
+    const q = randF32(rng, BH * hd), kc = randF32(rng, 1 * kvH * L * hd);
+    const ref = refKvScores(q, kc, BH, kvH, H, L, hd, 1 / Math.sqrt(hd), 1, L - 1);
+    const qBuf = backend.createBufferFromData(q), kB = backend.createBufferFromData(kc);
+    const sBuf = backend.kvAttentionScores(qBuf, kB, { BH, L, headDim: hd, scale: 1 / Math.sqrt(hd), causal: 1, pos: L - 1, kvH, H });
+    const got = await backend.readBuffer(sBuf, BH * L);
+    return maxAbs(got, ref);
+  });
+  await runCheck("kv_attention_apply", async () => {
+    const BH = 4, kvH = 2, H = 4, L = 8, hd = 16;
+    const q = randF32(rng, BH * hd), kc = randF32(rng, 1 * kvH * L * hd), vc = randF32(rng, 1 * kvH * L * hd);
+    const scores = refKvScores(q, kc, BH, kvH, H, L, hd, 1 / Math.sqrt(hd), 1, L - 1);
+    const ref = refKvApply(scores, vc, BH, kvH, H, L, hd);
+    const sBuf = backend.createBufferFromData(scores), vBuf = backend.createBufferFromData(vc);
+    const oBuf = backend.kvAttentionApply(sBuf, vBuf, { BH, L, headDim: hd, scale: 1 / Math.sqrt(hd), causal: 1, pos: L - 1, kvH, H });
+    const got = await backend.readBuffer(oBuf, BH * hd);
+    return maxAbs(got, ref);
+  });
+
+  // kv_group_sum B=1 H=4 kvH=2 T=8 hd=16
+  await runCheck("kv_group_sum", async () => {
+    const B = 1, H = 4, kvH = 2, T = 8, hd = 16;
+    const x = randF32(rng, B * H * T * hd);
+    const ref = refGroupSum(x, B, H, kvH, T, hd);
+    const iBuf = backend.createBufferFromData(x);
+    const oBuf = backend.kvGroupSum(iBuf, B, H, kvH, T, hd);
+    const got = await backend.readBuffer(oBuf, B * kvH * T * hd);
+    return maxAbs(got, ref);
+  });
+
+  // silu_mul N=6 dFF=32 (SwiGLU)
+  await runCheck("silu_mul", async () => {
+    const N = 6, dFF = 32;
+    const A = randF32(rng, N * 2 * dFF);
+    const ref = refSiluMul(A, N, dFF);
+    const aBuf = backend.createBufferFromData(A);
+    const oBuf = backend.siluMul(aBuf, N, dFF);
+    const got = await backend.readBuffer(oBuf, N * dFF);
+    return maxAbs(got, ref);
+  });
+
+  // layernorm 8x64
+  await runCheck("layernorm", async () => {
+    const rows = 8, d = 64;
+    const x = randF32(rng, rows * d), w = randF32(rng, d, 0.5, 1.5), b = randF32(rng, d, -0.5, 0.5);
+    const ref = refLayernorm(x, rows, d, 1e-5, w, b);
+    const xBuf = backend.createBufferFromData(x), wBuf = backend.createBufferFromData(w), bBuf = backend.createBufferFromData(b);
+    const oBuf = backend.layernorm(xBuf, rows, d, 1e-5, wBuf, bBuf);
+    const got = await backend.readBuffer(oBuf, rows * d);
+    return maxAbs(got, ref);
+  });
+
+  // embedding BT=4 D=32 V=128 (indices must be u32!)
+  await runCheck("embedding_forward", async () => {
+    const BT = 4, D = 32, V = 128;
+    const emb = randF32(rng, V * D), idx = Uint32Array.from([3, 7, 127, 0]);
+    const ref = refEmbedding(emb, idx, BT, D);
+    const eBuf = backend.createBufferFromData(emb), iBuf = createU32Buffer(device, idx);
+    const oBuf = backend.embeddingForward(eBuf, iBuf, BT, D, V);
+    const got = await backend.readBuffer(oBuf, BT * D);
+    return maxAbs(got, ref);
+  });
+
+  // reduce: op=0 sum, op=1 max, op=2 sumSquares — 16x256
+  const refMax = (x) => { const r = new Float32Array(16); for (let i = 0; i < 16; i++) { let m = -Infinity; for (let j = 0; j < 256; j++) m = Math.max(m, x[i * 256 + j]); r[i] = m; } return r; };
+  const refSumSq = (x) => { const r = new Float32Array(16); for (let i = 0; i < 16; i++) { let s = 0; for (let j = 0; j < 256; j++) s += x[i * 256 + j] * x[i * 256 + j]; r[i] = s; } return r; };
+  for (const [op, refFn, label] of [
+    [0, (x) => refReduceSum(x, 16, 256), "reduce_sum"],
+    [1, refMax, "reduce_max"],
+    [2, refSumSq, "reduce_sum_sq"],
+  ]) {
+    await runCheck(label, async () => {
+      const rows = 16, cols = 256;
+      const x = randF32(rng, rows * cols);
+      const ref = refFn(x);
+      const iBuf = backend.createBufferFromData(x);
+      const oBuf = backend.reduce(iBuf, rows, cols, op);
+      const got = await backend.readBuffer(oBuf, rows);
+      return maxAbs(got, ref);
+    });
+  }
+
+  finalize();
+}
+
+function finalize() {
+  out.pass = out.checks.length > 0 && out.checks.every(c => c.pass) && out.compile.fail.length === 0;
+  document.getElementById("resultJson").textContent = JSON.stringify(out, null, 2);
+  document.title = "WebGPU SMOKE " + (out.pass ? "PASS" : "FAIL");
+  console.log("WEBGPU_SMOKE_RESULT " + JSON.stringify(out));
+}
+
+run().catch(e => { out.adapter = "run failed: " + e.message; finalize(); });
+</script>
+</body>
+</html>

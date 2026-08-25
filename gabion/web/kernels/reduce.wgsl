@@ -15,7 +15,10 @@ struct Params {
 
 const WG_SIZE: u32 = 256u;
 
-var<workgroup> shared: array<f32, 256>;
+// NOTE: the workgroup variable must NOT be named `shared` — it is a reserved
+// word in WGSL. Tint compiles it anyway, but the resulting shader silently
+// produces wrong results on real GPUs (observed on NVIDIA/D3D12). Use sdata.
+var<workgroup> sdata: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
@@ -49,7 +52,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     i += WG_SIZE;
   }
 
-  shared[tid] = acc;
+  sdata[tid] = acc;
   workgroupBarrier();
 
   // Tree reduction in shared memory
@@ -58,8 +61,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     if (stride == 0u) { break; }
     if (tid < stride) {
       switch params.op {
-        case 1u: { shared[tid] = max(shared[tid], shared[tid + stride]); }
-        default: { shared[tid] = shared[tid] + shared[tid + stride]; }
+        case 1u: { sdata[tid] = max(sdata[tid], sdata[tid + stride]); }
+        default: { sdata[tid] = sdata[tid] + sdata[tid + stride]; }
       }
     }
     workgroupBarrier();
@@ -67,6 +70,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   }
 
   if (tid == 0u) {
-    output[row] = shared[0];
+    output[row] = sdata[0];
   }
 }
