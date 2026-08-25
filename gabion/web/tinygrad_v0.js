@@ -13,6 +13,57 @@
     return !!(window.tinygradV0 && window.tinygradV0.training);
   }
 
+  function _matmul2d(A, ar, ac, B, br, bc) {
+    const C = new Float32Array(ar * bc);
+    for (let i = 0; i < ar; i++) {
+      for (let k = 0; k < ac; k++) {
+        const aik = A[i * ac + k];
+        if (aik === 0) continue;
+        const brow = k * bc;
+        const crow = i * bc;
+        for (let j = 0; j < bc; j++) C[crow + j] += aik * B[brow + j];
+      }
+    }
+    return C;
+  }
+
+  function _transpose2d(A, r, c) {
+    const T = new Float32Array(r * c);
+    for (let i = 0; i < r; i++) for (let j = 0; j < c; j++) T[j * r + i] = A[i * c + j];
+    return T;
+  }
+
+  /** Newton–Schulz odd polynomial, matching tinygrad Tensor.newton_schulz. */
+  function newtonSchulz(data, rows, cols, steps, params, eps = 1e-7) {
+    let G = data;
+    let r = rows, c = cols;
+    let transposed = false;
+    if (r > c) {
+      G = _transpose2d(G, r, c);
+      const tmp = r; r = c; c = tmp;
+      transposed = true;
+    }
+    let nrm = 0;
+    for (let i = 0; i < G.length; i++) nrm += G[i] * G[i];
+    nrm = Math.sqrt(nrm) + eps;
+    const Gn = new Float32Array(G.length);
+    for (let i = 0; i < G.length; i++) Gn[i] = G[i] / nrm;
+    G = Gn;
+    for (let s = 0; s < steps; s++) {
+      const GT = _transpose2d(G, r, c);
+      const GGT = _matmul2d(G, r, c, GT, c, r);
+      const acc = new Float32Array(G.length);
+      let X = G;
+      for (let i = 0; i < params.length; i++) {
+        if (i > 0) X = _matmul2d(GGT, r, r, X, r, c);
+        const p = params[i];
+        for (let k = 0; k < acc.length; k++) acc[k] += p * X[k];
+      }
+      G = acc;
+    }
+    return transposed ? _transpose2d(G, r, c) : G;
+  }
+
   class Tensor {
     /**
      * @param {Float32Array} data - CPU data
@@ -577,47 +628,51 @@
     }
 
     /**
-     * NCHW conv2d, groups=1, dilation=1. weight [Cout,Cin,kH,kW], bias [Cout] optional.
-     * padding/stride: number or [h,w].
+     * NCHW conv2d. weight [Cout, Cin/groups, kH, kW], bias [Cout] optional.
+     * padding/stride/dilation: number or [h,w].
      */
     conv2d(weight, bias = null, groups = 1, stride = 1, dilation = 1, padding = 0) {
       if (this.shape.length !== 4) throw new Error(`conv2d input must be NCHW, got ${this.shape}`);
       if (weight.shape.length !== 4) throw new Error(`conv2d weight must be OIHW, got ${weight.shape}`);
-      if (groups !== 1) throw new Error("conv2d groups!=1 not implemented");
-      const dilH = Array.isArray(dilation) ? dilation[0] : dilation;
-      const dilW = Array.isArray(dilation) ? dilation[1] : dilation;
-      if (dilH !== 1 || dilW !== 1) throw new Error("conv2d dilation!=1 not implemented");
       const [N, Cin, H, W] = this.shape;
-      const [Cout, CinW, kH, kW] = weight.shape;
-      if (CinW !== Cin) throw new Error(`conv2d Cin mismatch ${Cin} vs ${CinW}`);
+      const [Cout, CinG, kH, kW] = weight.shape;
+      if (Cin % groups !== 0 || Cout % groups !== 0) throw new Error("conv2d groups must divide Cin and Cout");
+      if (CinG !== Cin / groups) throw new Error(`conv2d Cin/groups mismatch ${Cin}/${groups} vs ${CinG}`);
       const sH = Array.isArray(stride) ? stride[0] : stride;
       const sW = Array.isArray(stride) ? stride[1] : stride;
+      const dH = Array.isArray(dilation) ? dilation[0] : dilation;
+      const dW = Array.isArray(dilation) ? dilation[1] : dilation;
       const pH = Array.isArray(padding) ? padding[0] : padding;
       const pW = Array.isArray(padding) ? padding[1] : padding;
-      const Ho = Math.floor((H + 2 * pH - kH) / sH) + 1;
-      const Wo = Math.floor((W + 2 * pW - kW) / sW) + 1;
+      const Ho = Math.floor((H + 2 * pH - dH * (kH - 1) - 1) / sH) + 1;
+      const Wo = Math.floor((W + 2 * pW - dW * (kW - 1) - 1) / sW) + 1;
       if (Ho <= 0 || Wo <= 0) throw new Error(`conv2d empty output H=${H} W=${W} k=${kH}x${kW}`);
+      const cinPerG = Cin / groups;
+      const coutPerG = Cout / groups;
       const x = this.data, w = weight.data, b = bias ? bias.data : null;
       const out = new Float32Array(N * Cout * Ho * Wo);
       const xStr = [Cin * H * W, H * W, W, 1];
-      const wStr = [Cin * kH * kW, kH * kW, kW, 1];
+      const wStr = [cinPerG * kH * kW, kH * kW, kW, 1];
       const oStr = [Cout * Ho * Wo, Ho * Wo, Wo, 1];
       for (let n = 0; n < N; n++) {
         for (let oc = 0; oc < Cout; oc++) {
+          const g = Math.floor(oc / coutPerG);
+          const ic0 = g * cinPerG;
           for (let oh = 0; oh < Ho; oh++) {
             for (let ow = 0; ow < Wo; ow++) {
               let acc = b ? b[oc] : 0;
               const ih0 = oh * sH - pH;
               const iw0 = ow * sW - pW;
-              for (let ic = 0; ic < Cin; ic++) {
+              for (let icL = 0; icL < cinPerG; icL++) {
+                const ic = ic0 + icL;
                 for (let kh = 0; kh < kH; kh++) {
-                  const ih = ih0 + kh;
+                  const ih = ih0 + kh * dH;
                   if (ih < 0 || ih >= H) continue;
                   for (let kw = 0; kw < kW; kw++) {
-                    const iw = iw0 + kw;
+                    const iw = iw0 + kw * dW;
                     if (iw < 0 || iw >= W) continue;
                     acc += x[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw] *
-                           w[oc * wStr[0] + ic * wStr[1] + kh * wStr[2] + kw];
+                           w[oc * wStr[0] + icL * wStr[1] + kh * wStr[2] + kw];
                   }
                 }
               }
@@ -632,36 +687,46 @@
         if (this.requiresGrad) {
           if (!this.grad) this.grad = new Float32Array(this.numel);
           const dx = this.grad;
-          for (let n = 0; n < N; n++) for (let oc = 0; oc < Cout; oc++)
+          for (let n = 0; n < N; n++) for (let oc = 0; oc < Cout; oc++) {
+            const g = Math.floor(oc / coutPerG), ic0 = g * cinPerG;
             for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++) {
-              const g = gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
+              const gv = gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
               const ih0 = oh * sH - pH, iw0 = ow * sW - pW;
-              for (let ic = 0; ic < Cin; ic++) for (let kh = 0; kh < kH; kh++) {
-                const ih = ih0 + kh; if (ih < 0 || ih >= H) continue;
-                for (let kw = 0; kw < kW; kw++) {
-                  const iw = iw0 + kw; if (iw < 0 || iw >= W) continue;
-                  dx[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw] +=
-                    g * w[oc * wStr[0] + ic * wStr[1] + kh * wStr[2] + kw];
+              for (let icL = 0; icL < cinPerG; icL++) {
+                const ic = ic0 + icL;
+                for (let kh = 0; kh < kH; kh++) {
+                  const ih = ih0 + kh * dH; if (ih < 0 || ih >= H) continue;
+                  for (let kw = 0; kw < kW; kw++) {
+                    const iw = iw0 + kw * dW; if (iw < 0 || iw >= W) continue;
+                    dx[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw] +=
+                      gv * w[oc * wStr[0] + icL * wStr[1] + kh * wStr[2] + kw];
+                  }
                 }
               }
             }
+          }
         }
         if (weight.requiresGrad) {
           if (!weight.grad) weight.grad = new Float32Array(weight.numel);
           const dw = weight.grad;
-          for (let n = 0; n < N; n++) for (let oc = 0; oc < Cout; oc++)
+          for (let n = 0; n < N; n++) for (let oc = 0; oc < Cout; oc++) {
+            const g = Math.floor(oc / coutPerG), ic0 = g * cinPerG;
             for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++) {
-              const g = gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
+              const gv = gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
               const ih0 = oh * sH - pH, iw0 = ow * sW - pW;
-              for (let ic = 0; ic < Cin; ic++) for (let kh = 0; kh < kH; kh++) {
-                const ih = ih0 + kh; if (ih < 0 || ih >= H) continue;
-                for (let kw = 0; kw < kW; kw++) {
-                  const iw = iw0 + kw; if (iw < 0 || iw >= W) continue;
-                  dw[oc * wStr[0] + ic * wStr[1] + kh * wStr[2] + kw] +=
-                    g * x[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw];
+              for (let icL = 0; icL < cinPerG; icL++) {
+                const ic = ic0 + icL;
+                for (let kh = 0; kh < kH; kh++) {
+                  const ih = ih0 + kh * dH; if (ih < 0 || ih >= H) continue;
+                  for (let kw = 0; kw < kW; kw++) {
+                    const iw = iw0 + kw * dW; if (iw < 0 || iw >= W) continue;
+                    dw[oc * wStr[0] + icL * wStr[1] + kh * wStr[2] + kw] +=
+                      gv * x[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw];
+                  }
                 }
               }
             }
+          }
         }
         if (bias && bias.requiresGrad) {
           if (!bias.grad) bias.grad = new Float32Array(Cout);
@@ -669,6 +734,68 @@
             for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++)
               bias.grad[oc] += gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
         }
+      });
+    }
+
+    /**
+     * NCHW conv_transpose2d. weight [Cin, Cout/groups, kH, kW] (tinygrad ConvTranspose2d layout).
+     */
+    convTranspose2d(weight, bias = null, groups = 1, stride = 1, dilation = 1, padding = 0, outputPadding = 0) {
+      if (this.shape.length !== 4) throw new Error(`conv_transpose2d input must be NCHW, got ${this.shape}`);
+      if (weight.shape.length !== 4) throw new Error(`conv_transpose2d weight must be [Cin,Cout/g,kH,kW], got ${weight.shape}`);
+      const [N, Cin, H, W] = this.shape;
+      const [CinW, CoutG, kH, kW] = weight.shape;
+      if (CinW !== Cin) throw new Error("conv_transpose2d Cin mismatch");
+      if (Cin % groups !== 0) throw new Error("conv_transpose2d groups must divide Cin");
+      const sH = Array.isArray(stride) ? stride[0] : stride;
+      const sW = Array.isArray(stride) ? stride[1] : stride;
+      const dH = Array.isArray(dilation) ? dilation[0] : dilation;
+      const dW = Array.isArray(dilation) ? dilation[1] : dilation;
+      const pH = Array.isArray(padding) ? padding[0] : padding;
+      const pW = Array.isArray(padding) ? padding[1] : padding;
+      const oH = Array.isArray(outputPadding) ? outputPadding[0] : outputPadding;
+      const oW = Array.isArray(outputPadding) ? outputPadding[1] : outputPadding;
+      const Cout = CoutG * groups;
+      const cinPerG = Cin / groups;
+      const Ho = (H - 1) * sH - 2 * pH + dH * (kH - 1) + oH + 1;
+      const Wo = (W - 1) * sW - 2 * pW + dW * (kW - 1) + oW + 1;
+      const x = this.data, wgt = weight.data, b = bias ? bias.data : null;
+      const out = new Float32Array(N * Cout * Ho * Wo);
+      if (b) {
+        for (let n = 0; n < N; n++) for (let oc = 0; oc < Cout; oc++)
+          for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++)
+            out[((n * Cout + oc) * Ho + oh) * Wo + ow] = b[oc];
+      }
+      const xStr = [Cin * H * W, H * W, W, 1];
+      const wStr = [CoutG * kH * kW, kH * kW, kW, 1];
+      const oStr = [Cout * Ho * Wo, Ho * Wo, Wo, 1];
+      for (let n = 0; n < N; n++) {
+        for (let ic = 0; ic < Cin; ic++) {
+          const g = Math.floor(ic / cinPerG);
+          const oc0 = g * CoutG;
+          for (let ih = 0; ih < H; ih++) for (let iw = 0; iw < W; iw++) {
+            const xv = x[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw];
+            for (let ocL = 0; ocL < CoutG; ocL++) {
+              const oc = oc0 + ocL;
+              for (let kh = 0; kh < kH; kh++) {
+                const oh = ih * sH - pH + kh * dH;
+                if (oh < 0 || oh >= Ho) continue;
+                for (let kw = 0; kw < kW; kw++) {
+                  const ow = iw * sW - pW + kw * dW;
+                  if (ow < 0 || ow >= Wo) continue;
+                  // spatial index as-is (tinygrad flips weight then conv; we scatter without extra flip)
+                  out[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow] +=
+                    xv * wgt[ic * wStr[0] + ocL * wStr[1] + kh * wStr[2] + kw];
+                }
+              }
+            }
+          }
+        }
+      }
+      const req = this.requiresGrad || weight.requiresGrad || !!(bias && bias.requiresGrad);
+      const parents = bias ? [this, weight, bias] : [this, weight];
+      return new Tensor(out, [N, Cout, Ho, Wo], req, parents, () => {
+        throw new Error("conv_transpose2d backward not implemented");
       });
     }
 
@@ -1798,6 +1925,10 @@
       this.momentum = opts.momentum || 0.0;
       this.nesterov = !!opts.nesterov;
       this.tcoef = opts.tcoef != null ? opts.tcoef : (opts.optimizer === "lars" ? 0.001 : 0.0);
+      this.nsSteps = opts.nsSteps || 0;
+      this.nsCoeffs = opts.nsCoeffs || null;
+      this.preWd = opts.preWd !== undefined ? !!opts.preWd : true;
+      this.classic = opts.classic !== undefined ? !!opts.classic : true;
       this.maxNorm = opts.gradClipNorm != null ? opts.gradClipNorm : 1.0;
       this.warmupSteps = Math.max(1, opts.warmupSteps || 10);
       this._step = window._adamStep || 0;
@@ -1937,33 +2068,47 @@
             }
             if (typeof p.markCPUDirty === "function") p.markCPUDirty();
           }
-        } else if (this.type === "lars") {
+        } else if (this.type === "lars" || this.type === "muon") {
           for (const p of this.params) {
             if (!p.grad) continue;
-            const g = p.grad;
-            if (this.weightDecay > 0) {
+            const g = Float32Array.from(p.grad);
+            if (this.preWd && this.weightDecay > 0) {
               for (let i = 0; i < p.data.length; i++) g[i] += this.weightDecay * p.data[i];
             }
-            let r1 = 0, r2 = 0;
-            for (let i = 0; i < p.data.length; i++) {
-              r1 += p.data[i] * p.data[i];
-              r2 += g[i] * g[i];
-            }
-            r1 = Math.sqrt(r1); r2 = Math.sqrt(r2);
             let r = 1;
-            if (this.tcoef !== 0 && r1 > 0 && r2 > 0) r = this.tcoef * r1 / (r2 + this.weightDecay * r1);
+            if (this.tcoef !== 0) {
+              let r1 = 0, r2 = 0;
+              for (let i = 0; i < p.data.length; i++) {
+                r1 += p.data[i] * p.data[i];
+                r2 += g[i] * g[i];
+              }
+              r1 = Math.sqrt(r1); r2 = Math.sqrt(r2);
+              if (r1 > 0 && r2 > 0) r = this.tcoef * r1 / (r2 + this.weightDecay * r1);
+            }
+            if (this.classic) {
+              for (let i = 0; i < g.length; i++) g[i] *= r * this.lr;
+            }
             if (this.momentum > 0) {
               if (!p._sgd_b) p._sgd_b = new Float32Array(p.data.length);
               const b = p._sgd_b;
-              for (let i = 0; i < p.data.length; i++) {
-                const gi = g[i] * r * this.lr;
-                b[i] = this.momentum * b[i] + gi;
-                const step = this.nesterov ? (gi + this.momentum * b[i]) : b[i];
-                p.data[i] -= step;
+              for (let i = 0; i < g.length; i++) {
+                b[i] = this.momentum * b[i] + g[i];
+                g[i] = this.nesterov ? (g[i] + this.momentum * b[i]) : b[i];
               }
-            } else {
-              for (let i = 0; i < p.data.length; i++) p.data[i] -= this.lr * r * g[i];
             }
+            if (this.nsCoeffs && this.nsSteps > 0 && p.shape.length >= 1) {
+              const rows = p.shape[0];
+              const cols = p.numel / rows;
+              const ns = newtonSchulz(g, rows, cols, this.nsSteps, this.nsCoeffs);
+              g.set(ns);
+            }
+            if (!this.classic) {
+              for (let i = 0; i < g.length; i++) g[i] *= r * this.lr;
+            }
+            if (!this.preWd && this.weightDecay > 0) {
+              for (let i = 0; i < g.length; i++) g[i] += this.weightDecay * this.lr * p.data[i];
+            }
+            for (let i = 0; i < p.data.length; i++) p.data[i] -= g[i];
             if (typeof p.markCPUDirty === "function") p.markCPUDirty();
           }
         } else {
@@ -2021,6 +2166,20 @@
   }
   function LARS(params, opts = {}) {
     return new Optimizer(params, Object.assign({ optimizer: "lars", momentum: 0.9, weightDecay: 1e-4, tcoef: 0.001 }, opts));
+  }
+  function Muon(params, opts = {}) {
+    return new Optimizer(params, Object.assign({
+      optimizer: "muon",
+      lr: 0.001,
+      momentum: 0.95,
+      weightDecay: 0.1,
+      nesterov: true,
+      classic: false,
+      preWd: false,
+      tcoef: 0,
+      nsSteps: 5,
+      nsCoeffs: [3.4445, -4.775, 2.0315],
+    }, opts));
   }
 
   class OptimizerGroup {
@@ -2243,7 +2402,7 @@
       this.padding = padding;
       this.dilation = dilation;
       this.groups = groups;
-      this.weight = new Tensor(new Float32Array(outChannels * inChannels * kH * kW), [outChannels, inChannels, kH, kW], true);
+      this.weight = new Tensor(new Float32Array(outChannels * (inChannels / groups) * kH * kW), [outChannels, inChannels / groups, kH, kW], true);
       this.bias = bias ? Tensor.zeros([outChannels], true) : null;
     }
     forward(x) {
@@ -2256,6 +2415,36 @@
     const orig = conv.forward.bind(conv);
     conv.forward = (x) => {
       if (x.shape.length !== 3) throw new Error("Conv1d expects [N,C,W]");
+      const [N, C, W] = x.shape;
+      const y = orig(x.reshape([N, C, 1, W]));
+      return y.reshape([y.shape[0], y.shape[1], y.shape[3]]);
+    };
+    return conv;
+  }
+
+  class ConvTranspose2d extends Module {
+    constructor(inChannels, outChannels, kernelSize, { stride = 1, padding = 0, outputPadding = 0, dilation = 1, groups = 1, bias = true } = {}) {
+      super();
+      const kH = Array.isArray(kernelSize) ? kernelSize[0] : kernelSize;
+      const kW = Array.isArray(kernelSize) ? kernelSize[1] || kernelSize[0] : kernelSize;
+      this.stride = stride;
+      this.padding = padding;
+      this.outputPadding = outputPadding;
+      this.dilation = dilation;
+      this.groups = groups;
+      this.weight = new Tensor(new Float32Array(inChannels * (outChannels / groups) * kH * kW), [inChannels, outChannels / groups, kH, kW], true);
+      this.bias = bias ? Tensor.zeros([outChannels], true) : null;
+    }
+    forward(x) {
+      return x.convTranspose2d(this.weight, this.bias, this.groups, this.stride, this.dilation, this.padding, this.outputPadding);
+    }
+  }
+
+  function ConvTranspose1d(inChannels, outChannels, kernelSize, opts = {}) {
+    const conv = new ConvTranspose2d(inChannels, outChannels, [1, kernelSize], opts);
+    const orig = conv.forward.bind(conv);
+    conv.forward = (x) => {
+      if (x.shape.length !== 3) throw new Error("ConvTranspose1d expects [N,C,W]");
       const [N, C, W] = x.shape;
       const y = orig(x.reshape([N, C, 1, W]));
       return y.reshape([y.shape[0], y.shape[1], y.shape[3]]);
@@ -2435,9 +2624,9 @@
 
   const nn = {
     Module, Linear, Embedding, RMSNorm, LayerNorm, Dropout,
-    Conv2d, Conv1d, GroupNorm, BatchNorm, BatchNorm2d: BatchNorm, LSTMCell,
+    Conv2d, Conv1d, ConvTranspose2d, ConvTranspose1d, GroupNorm, BatchNorm, BatchNorm2d: BatchNorm, LSTMCell,
   };
-  const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD, LAMB, LARS };
+  const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD, LAMB, LARS, Muon };
 
   window.tinygradV0 = {
     Tensor,
@@ -2451,6 +2640,7 @@
     SGD,
     LAMB,
     LARS,
+    Muon,
     training: false,
     crossEntropy,
     crossEntropyGPU,

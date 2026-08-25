@@ -97,6 +97,25 @@ const lamb = tg.LAMB([lp], {
 });
 await lamb.step();
 
+const convg = new tg.nn.Conv2d(4, 4, 3, { groups: 2, padding: 1, bias: true });
+convg.weight.data.set(Float32Array.from(fixture.convg_w));
+convg.bias.data.set(Float32Array.from(fixture.convg_b));
+const convgY = convg.forward(Tensor.fromArray(fixture.convg_x, fixture.convg_x_shape, false));
+
+const convd = new tg.nn.Conv2d(1, 1, 3, { dilation: 2, padding: 2, bias: false });
+convd.weight.data.set(Float32Array.from(fixture.convd_w));
+const convdY = convd.forward(Tensor.fromArray(fixture.convd_x, fixture.convd_x_shape, false));
+
+const ct = new tg.nn.ConvTranspose2d(1, 1, 3, { bias: true });
+ct.weight.data.set(Float32Array.from(fixture.ct_w));
+ct.bias.data.set(Float32Array.from(fixture.ct_b));
+const ctY = ct.forward(Tensor.fromArray(fixture.ct_x, fixture.ct_x_shape, false));
+
+const mp = Tensor.fromArray(fixture.muon_p, [4, 4], true);
+mp.grad = Float32Array.from(fixture.muon_g);
+const muon = tg.Muon([mp], { lr: 1e-3, warmupSteps: 1, gradClipNorm: 0 });
+await muon.step();
+
 const report = {
   nn_modules: Object.keys(tg.nn).sort(),
   optim_exports: Object.keys(tg.optim).sort(),
@@ -112,6 +131,10 @@ const report = {
   lstm_h_max_abs: maxAbs(lh.data, fixture.lstm_h),
   lstm_c_max_abs: maxAbs(lc.data, fixture.lstm_c),
   lamb_max_abs: maxAbs(lp.data, fixture.lamb_after),
+  convg_max_abs: maxAbs(convgY.data, fixture.convg_y),
+  convd_max_abs: maxAbs(convdY.data, fixture.convd_y),
+  ct_max_abs: maxAbs(ctY.data, fixture.ct_y),
+  muon_max_abs: maxAbs(mp.data, fixture.muon_after),
 };
 const outPath = fixturePath.replace(/\.json$/, "_js.json");
 fs.writeFileSync(outPath, JSON.stringify(report, null, 2));

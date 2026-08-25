@@ -14,7 +14,7 @@ FIXTURE = Path(__file__).resolve().parent / "_js_nn_optim_fixture.json"
 
 def build_fixture() -> dict:
     from tinygrad import Tensor, nn, Context
-    from tinygrad.nn.optim import AdamW, LAMB
+    from tinygrad.nn.optim import AdamW, LAMB, Muon
 
     rng = np.random.default_rng(0)
     x = rng.normal(0, 1, size=(6,)).astype(np.float32)
@@ -76,6 +76,27 @@ def build_fixture() -> dict:
         lamb.step()
     lamb_after = lpt.numpy().astype(np.float64).reshape(-1)
 
+    convg = nn.Conv2d(4, 4, 3, groups=2, padding=1, bias=True)
+    convg_x = rng.normal(0, 1, size=(1, 4, 5, 5)).astype(np.float32)
+    convg_y = convg(Tensor(convg_x.tolist())).numpy().astype(np.float64).reshape(-1)
+
+    convd = nn.Conv2d(1, 1, 3, dilation=2, padding=2, bias=False)
+    convd_x = rng.normal(0, 1, size=(1, 1, 6, 6)).astype(np.float32)
+    convd_y = convd(Tensor(convd_x.tolist())).numpy().astype(np.float64).reshape(-1)
+
+    ct = nn.ConvTranspose2d(1, 1, 3, bias=True)
+    ct_x = rng.normal(0, 1, size=(1, 1, 3, 3)).astype(np.float32)
+    ct_y = ct(Tensor(ct_x.tolist())).numpy().astype(np.float64).reshape(-1)
+
+    mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
+    mg = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
+    mpt = Tensor(mp.tolist())
+    mpt.grad = Tensor(mg.tolist())
+    muon = Muon([mpt], lr=1e-3, momentum=0.95, weight_decay=0.1, ns_steps=5)
+    with Context(TRAINING=1):
+        muon.step()
+    muon_after = mpt.numpy().astype(np.float64).reshape(-1)
+
     return {
         "x": x.astype(float).tolist(),
         "x_shape": [6],
@@ -118,6 +139,26 @@ def build_fixture() -> dict:
         "lamb_p": lp.astype(float).tolist(),
         "lamb_g": lg.astype(float).tolist(),
         "lamb_after": lamb_after.tolist(),
+        "convg_x": convg_x.astype(float).reshape(-1).tolist(),
+        "convg_x_shape": list(convg_x.shape),
+        "convg_w": convg.weight.numpy().astype(float).reshape(-1).tolist(),
+        "convg_w_shape": list(convg.weight.shape),
+        "convg_b": convg.bias.numpy().astype(float).reshape(-1).tolist(),
+        "convg_y": convg_y.tolist(),
+        "convd_x": convd_x.astype(float).reshape(-1).tolist(),
+        "convd_x_shape": list(convd_x.shape),
+        "convd_w": convd.weight.numpy().astype(float).reshape(-1).tolist(),
+        "convd_w_shape": list(convd.weight.shape),
+        "convd_y": convd_y.tolist(),
+        "ct_x": ct_x.astype(float).reshape(-1).tolist(),
+        "ct_x_shape": list(ct_x.shape),
+        "ct_w": ct.weight.numpy().astype(float).reshape(-1).tolist(),
+        "ct_w_shape": list(ct.weight.shape),
+        "ct_b": ct.bias.numpy().astype(float).reshape(-1).tolist(),
+        "ct_y": ct_y.tolist(),
+        "muon_p": mp.astype(float).reshape(-1).tolist(),
+        "muon_g": mg.astype(float).reshape(-1).tolist(),
+        "muon_after": muon_after.tolist(),
     }
 
 
@@ -143,6 +184,10 @@ def main() -> int:
         "batchnorm": report["bn_max_abs"] < 1e-5,
         "lstm": report["lstm_h_max_abs"] < 1e-5 and report["lstm_c_max_abs"] < 1e-5,
         "lamb": report["lamb_max_abs"] < 1e-5,
+        "conv_groups": report["convg_max_abs"] < 1e-5,
+        "conv_dilate": report["convd_max_abs"] < 1e-5,
+        "conv_transpose": report["ct_max_abs"] < 1e-4,
+        "muon": report["muon_max_abs"] < 1e-4,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])
