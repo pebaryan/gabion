@@ -16,8 +16,7 @@ class _FakeLoss:
 
 
 class _FakeParam:
-    def __init__(self) -> None:
-        self.requires_grad = True
+    pass
 
 
 class _FakeAdapter:

@@ -17,21 +17,22 @@ logger = logging.getLogger(__name__)
 
 
 def apply_worker_device_flags(args: argparse.Namespace) -> None:
-    backend_vars = ("CPU", "CUDA", "METAL", "CL", "WEBGPU")
+    # tinygrad >=0.13 selects the default backend with DEV=, not CPU=1 / CUDA=1.
+    backend_vars = ("DEV", "CPU", "CUDA", "METAL", "CL", "WEBGPU", "AMD", "NV")
     if args.device != "auto":
         for key in backend_vars:
             os.environ.pop(key, None)
 
     if args.device == "cpu":
-        os.environ["CPU"] = "1"
+        os.environ["DEV"] = "CPU"
     elif args.device == "cuda":
-        os.environ["CUDA"] = "1"
+        os.environ["DEV"] = "CUDA"
     elif args.device == "metal":
-        os.environ["METAL"] = "1"
+        os.environ["DEV"] = "METAL"
     elif args.device == "cl":
-        os.environ["CL"] = "1"
+        os.environ["DEV"] = "CL"
     elif args.device == "webgpu":
-        os.environ["WEBGPU"] = "1"
+        os.environ["DEV"] = "WEBGPU"
 
     if args.visible_devices:
         os.environ["HCQ_VISIBLE_DEVICES"] = args.visible_devices

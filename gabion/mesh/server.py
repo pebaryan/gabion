@@ -263,11 +263,12 @@ class MeshServer:
 
     async def asset_handler(self, request: web.Request) -> web.StreamResponse:
         name = str(request.match_info.get("name", ""))
-        allowed = {"tinygrad_v0.js", "webgpu_backend.js", "bbt_forward.js"}
-        if name not in allowed:
+        # Allow any .js file from gabion/web/ (model-agnostic)
+        if Path(name).name != name or not name.endswith(".js"):
             raise web.HTTPNotFound()
-        asset_path = Path(__file__).resolve().parents[1] / "web" / name
-        if not asset_path.exists():
+        web_dir = (Path(__file__).resolve().parents[1] / "web").resolve()
+        asset_path = (web_dir / name).resolve()
+        if asset_path.parent != web_dir or not asset_path.exists():
             raise web.HTTPNotFound()
         return web.FileResponse(asset_path)
 
@@ -817,8 +818,6 @@ class MeshServer:
                 runtime.eval_template_params = runtime.eval_adapter.init_params(seed=0)
 
             params = unflatten_to_tensors(runtime.weights, runtime.eval_template_params, Tensor)
-            for p in params:
-                p.requires_grad = False
 
             x, y = runtime.eval_adapter.sample_batch(
                 batch_size=max(1, int(self.config.eval_batch_size)),

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Protocol, Tuple
 
 from gabion.pebble.adapters import flatten_tensors, load_adapter, unflatten_to_tensors
+from gabion.pebble.autograd import parameter_grads, training_mode
 
 
 class Trainer(Protocol):
@@ -73,8 +74,6 @@ class TinygradTrainer(SyntheticTrainer):
         adapter = load_adapter(adapter_ref)
         template_params = adapter.init_params(seed=self.seed)
         trainable_params = unflatten_to_tensors(weights, template_params, Tensor)
-        for param in trainable_params:
-            param.requires_grad = True
 
         work_scale = 1.0
         if job is not None:
@@ -112,28 +111,20 @@ class TinygradTrainer(SyntheticTrainer):
         batch_size = max(8, int(round(max(8, self.sample_count) * work_scale)))
         loss_value = 0.0
         round_seed_base = self.seed + (round_id * 1_000_003)
-        with Tensor.train():
+        with training_mode():
             for epoch in range(epochs):
                 x, y = adapter.sample_batch(batch_size=batch_size, seed=round_seed_base + epoch)
-                for param in trainable_params:
-                    param.grad = None
                 logits = adapter.forward(trainable_params, x)
                 loss = adapter.loss(logits, y)
-                loss.backward()
+                grads = parameter_grads(loss, trainable_params)
 
-                # Gradient clipping (global norm)
+                numpy_grads = [g.numpy() for g in grads]
                 if grad_clip_norm > 0:
-                    total_norm_sq = 0.0
-                    for param in trainable_params:
-                        if param.grad is not None:
-                            g = param.grad.numpy()
-                            total_norm_sq += float((g * g).sum())
+                    total_norm_sq = sum(float((g * g).sum()) for g in numpy_grads)
                     total_norm = math.sqrt(total_norm_sq)
                     if total_norm > grad_clip_norm:
                         clip_scale = grad_clip_norm / total_norm
-                        for param in trainable_params:
-                            if param.grad is not None:
-                                param.grad = (param.grad * clip_scale).realize()
+                        numpy_grads = [g * clip_scale for g in numpy_grads]
 
                 if optimizer == "adam":
                     # Adam with bias correction + warmup
@@ -143,9 +134,7 @@ class TinygradTrainer(SyntheticTrainer):
                     bc1 = 1 - beta1 ** t
                     bc2 = 1 - beta2 ** t
                     for idx, param in enumerate(trainable_params):
-                        if param.grad is None:
-                            continue
-                        g = param.grad.numpy()
+                        g = numpy_grads[idx]
                         if idx not in self._adam_m:
                             self._adam_m[idx] = np.zeros_like(g)
                             self._adam_v[idx] = np.zeros_like(g)
@@ -155,10 +144,8 @@ class TinygradTrainer(SyntheticTrainer):
                         update = eff_lr * (m / bc1) / (np.sqrt(v / bc2) + 1e-8)
                         param.assign(Tensor(param.numpy() - update).realize())
                 else:
-                    # SGD fallback
-                    for param in trainable_params:
-                        if param.grad is not None:
-                            param.assign((param - param.grad * lr).realize())
+                    for param, g in zip(trainable_params, numpy_grads):
+                        param.assign(Tensor(param.numpy() - lr * g).realize())
 
                 loss_value = float(loss.item())
 
