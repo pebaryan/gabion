@@ -1054,6 +1054,157 @@ def _export_gguf_lfm2(meta: dict, by_name: dict, buf: bytes, data_base: int,
     return wire
 
 
+def _export_gguf_qwen35(meta: dict, by_name: dict, buf: bytes, data_base, config: dict | None = None) -> dict:
+    """Qwen3.5 hybrid (GatedDeltaNet). 32 layers; layers where (i+1) % 4 == 0
+    are full attention (q+gate fused, per-head q/k RMSNorm, 64-dim Neox rope,
+    softmax GQA), the rest are GatedDeltaNet linear layers (causal conv1d over
+    q/k/v + delta-rule recurrence with a per-head [V,K] state). lm_head is tied.
+
+    Flat layout (MUST match model_loader.js `_qwen35LayerSize`):
+      token_embd [V, D]
+      per layer i (layer_types[i]):
+        "full":  norm [D], q [D, 2*D] (q+gate fused), q_norm [hd], k [D, kvD],
+                 k_norm [hd], v [D, kvD], o [H*hd, D], ffn_norm [D],
+                 gate_up [D, 2*dff], down [dff, D]
+        "linear": norm [D], qkv [D, kd*2+vd] (q,k,v), gate [D, vd] (z),
+                  ssm_a [dt_rank], alpha [D, dt_rank], beta [D, dt_rank],
+                  dt [dt_rank], conv1d [kd*2+vd, conv_kernel], ssm_norm [hv],
+                  ssm_out [vd, D], ffn_norm [D], gate_up [D, 2*dff], down [dff, D]
+    """
+    arch = "qwen35"
+
+    def kv(key: str):
+        return meta.get(f"{arch}.{key}")
+
+    def get(name: str) -> np.ndarray | None:
+        if name not in by_name:
+            return None
+        dims, gtype, off = by_name[name]
+        return _tensor_data(buf, name, dims, gtype, off, data_base)
+
+    def as_linear(name: str, want: tuple) -> np.ndarray:
+        t = get(name)
+        if t is None:
+            raise ValueError(f"GGUF is missing required tensor '{name}'")
+        t = t.T
+        if t.shape != want:
+            raise ValueError(f"GGUF tensor '{name}': shape {t.shape} vs expected {want}")
+        return t
+
+    L = int(kv("block_count"))
+    D = int(kv("embedding_length"))
+    heads = int(kv("attention.head_count"))
+    kv_heads = int(kv("attention.head_count_kv") or heads)
+    head_dim = int(kv("attention.key_length") or (D // heads))
+    d_ff = int(kv("feed_forward_length") or 4 * D)
+    rope_base = float(kv("rope.freq_base") or 10000.0)
+    rope_dim = int(kv("rope.dimension_count") or head_dim)
+    ctx = int(kv("context_length") or 2048)
+    eps = float(kv("attention.layer_norm_rms_epsilon") or 1e-5)
+    interval = int(kv("full_attention_interval") or 4)
+
+    # ssm (linear attention) hyperparameters
+    d_conv = int(kv("ssm.conv_kernel"))
+    d_inner = int(kv("ssm.inner_size"))
+    d_state = int(kv("ssm.state_size"))
+    dt_rank = int(kv("ssm.time_step_rank"))
+    n_group = int(kv("ssm.group_count"))
+    head_k_dim, num_k_heads = d_state, n_group
+    num_v_heads, head_v_dim = dt_rank, d_inner // dt_rank
+    kd, vd = head_k_dim * num_k_heads, head_v_dim * num_v_heads
+    conv_dim = kd * 2 + vd
+
+    tok_dims = by_name["token_embd.weight"][0] if "token_embd.weight" in by_name else ()
+    if len(tok_dims) == 2:
+        n_vocab = int(tok_dims[1])
+    else:
+        raise ValueError("cannot determine vocab size: token_embd.weight missing")
+
+    layer_types = []
+    for i in range(L):
+        layer_types.append("full" if (i + 1) % interval == 0 else "linear")
+
+    tensors = [get("token_embd.weight")]
+    for i in range(L):
+        norm = get(f"blk.{i}.attn_norm.weight").reshape(-1)
+        n2 = get(f"blk.{i}.post_attention_norm.weight").reshape(-1)
+        gate = as_linear(f"blk.{i}.ffn_gate.weight", (D, d_ff))
+        up = as_linear(f"blk.{i}.ffn_up.weight", (D, d_ff))
+        gate_up = np.concatenate([gate, up], axis=1)
+        down = as_linear(f"blk.{i}.ffn_down.weight", (d_ff, D))
+        if layer_types[i] == "full":
+            q = as_linear(f"blk.{i}.attn_q.weight", (D, 2 * heads * head_dim))
+            qn = get(f"blk.{i}.attn_q_norm.weight").reshape(-1)
+            k = as_linear(f"blk.{i}.attn_k.weight", (D, kv_heads * head_dim))
+            kn = get(f"blk.{i}.attn_k_norm.weight").reshape(-1)
+            v = as_linear(f"blk.{i}.attn_v.weight", (D, kv_heads * head_dim))
+            o = as_linear(f"blk.{i}.attn_output.weight", (heads * head_dim, D))
+            tensors += [norm, q, qn, k, kn, v, o, n2, gate_up, down]
+        else:
+            qkv = as_linear(f"blk.{i}.attn_qkv.weight", (D, conv_dim))
+            zg = as_linear(f"blk.{i}.attn_gate.weight", (D, vd))
+            sa = get(f"blk.{i}.ssm_a").reshape(-1)
+            al = as_linear(f"blk.{i}.ssm_alpha.weight", (D, num_v_heads))
+            be = as_linear(f"blk.{i}.ssm_beta.weight", (D, num_v_heads))
+            dt = get(f"blk.{i}.ssm_dt.bias").reshape(-1)
+            cv = get(f"blk.{i}.ssm_conv1d.weight")  # ne (channels, kernel)
+            if cv.shape != (conv_dim, d_conv):
+                raise ValueError(f"blk.{i}.ssm_conv1d.weight: shape {cv.shape} vs ({conv_dim},{d_conv})")
+            sn = get(f"blk.{i}.ssm_norm.weight").reshape(-1)
+            so = as_linear(f"blk.{i}.ssm_out.weight", (vd, D))
+            tensors += [norm, qkv, zg, sa, al, be, dt, cv, sn, so, n2, gate_up, down]
+
+    if "output.weight" in by_name:
+        raise ValueError("qwen35 wire assumes tied embeddings; unexpected output.weight")
+    tie = True
+
+    if config is None:
+        cfg = {
+            "arch": "qwen35", "vocab_size": n_vocab, "d_model": D,
+            "n_heads": heads, "n_kv_heads": kv_heads, "head_dim": head_dim,
+            "n_layers": L, "layer_types": layer_types,
+            "norm_eps": eps, "seq_len": min(ctx, 8192), "d_ff": d_ff,
+            "tie_weights": tie, "act_quant": True, "rope_base": rope_base,
+            "rope_dim": rope_dim,
+            "ssm": {"conv_kernel": d_conv, "inner_size": d_inner,
+                    "state_size": d_state, "dt_rank": dt_rank,
+                    "group_count": n_group, "head_k_dim": head_k_dim,
+                    "num_k_heads": num_k_heads, "head_v_dim": head_v_dim,
+                    "num_v_heads": num_v_heads, "q_dim": kd, "v_dim": vd,
+                    "conv_dim": conv_dim},
+        }
+    else:
+        cfg = dict(config)
+        cfg["arch"] = "qwen35"
+        cfg["layer_types"] = list(layer_types)
+        cfg["norm_eps"] = eps
+        cfg["head_dim"] = head_dim
+        cfg["n_kv_heads"] = kv_heads
+        cfg["tie_weights"] = tie
+        cfg["rope_dim"] = rope_dim
+        cfg["ssm"] = {"conv_kernel": d_conv, "inner_size": d_inner,
+                      "state_size": d_state, "dt_rank": dt_rank,
+                      "group_count": n_group, "head_k_dim": head_k_dim,
+                      "num_k_heads": num_k_heads, "head_v_dim": head_v_dim,
+                      "num_v_heads": num_v_heads, "q_dim": kd, "v_dim": vd,
+                      "conv_dim": conv_dim}
+    flat = np.concatenate([np.asarray(t, dtype=np.float32).reshape(-1) for t in tensors])
+    wire = {"config": cfg, "weights_b64": f16_base64(flat)}
+
+    tokens = meta.get("tokenizer.ggml.tokens")
+    if tokens and meta.get("tokenizer.ggml.merges"):
+        wire["vocab"] = {t: i for i, t in enumerate(tokens)}
+        wire["merges"] = [ln for ln in meta["tokenizer.ggml.merges"] if ln]
+        ttypes = meta.get("tokenizer.ggml.token_type")
+        if ttypes:
+            wire["special"] = [t for i, t in enumerate(tokens)
+                               if i < len(ttypes) and ttypes[i] in (3, 4)]
+        if meta.get("tokenizer.chat_template"):
+            wire["chat_template"] = meta["tokenizer.chat_template"]
+        cfg["tokenizer"] = f"qwen2:{meta.get('tokenizer.ggml.pre', 'bpe')}"
+    return wire
+
+
 def export_gguf(path: Path, config: dict | None = None) -> dict:
     buf = Path(path).read_bytes()
     meta, infos, data_base = parse_gguf(path)
@@ -1063,6 +1214,8 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
     arch = str(meta.get("general.architecture", "llama"))
     if arch == "lfm2":
         return _export_gguf_lfm2(meta, by_name, buf, data_base, config)
+    if arch == "qwen35":
+        return _export_gguf_qwen35(meta, by_name, buf, data_base, config)
 
     def kv(key: str):
         return meta.get(f"{arch}.{key}") if f"{arch}.{key}" in meta else meta.get(f"llama.{key}")

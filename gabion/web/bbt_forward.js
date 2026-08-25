@@ -55,6 +55,18 @@
       this.layerTypes = config.layerTypes || null;
       this.convLCache = config.convLCache || 3;
       this.headDim = config.headDim || (this.D / this.H);
+      // Qwen3.5 rotates only the first ropeDim dims of each head (MRoPE, 64 of 256).
+      this.ropeDim = config.ropeDim || this.headDim;
+      // GatedDeltaNet (linear attention) hyperparameters — qwen35 arch.
+      this.q35 = null;
+      if (config.ssm) {
+        const s = config.ssm;
+        this.q35 = {
+          dConv: s.conv_kernel || 4, kd: s.q_dim || 0, vd: s.v_dim || 0,
+          convDim: s.conv_dim || 0, hk: s.head_k_dim || 0, nk: s.num_k_heads || 0,
+          hv: s.head_v_dim || 0, nv: s.num_v_heads || 0,
+        };
+      }
       // Optional attention biases (q/k/v per-layer; Qwen2.5-Instruct has them)
       this._qBiases = config.qBiases || null;
       this._kBiases = config.kBiases || null;
@@ -79,11 +91,37 @@
             bl.qn = new Tensor(new Float32Array(this.headDim), [this.headDim], false);
             bl.kn = new Tensor(new Float32Array(this.headDim), [this.headDim], false);
           }
+        } else if (this.arch === "qwen35" && this.q35) {
+          const S = this.q35;
+          if (this.layerTypes[l] === "linear") {
+            bl.isLinear = true;
+            bl.qkv = new nn.Linear(this.D, S.convDim);
+            bl.zg = new nn.Linear(this.D, S.vd);
+            bl.sa = new Tensor(new Float32Array(S.nv), [S.nv], false);
+            bl.sAlpha = new nn.Linear(this.D, S.nv);
+            bl.sBeta = new nn.Linear(this.D, S.nv);
+            bl.sDt = new Tensor(new Float32Array(S.nv), [S.nv], false);
+            bl.convW = new Tensor(new Float32Array(S.convDim * S.dConv), [S.convDim, S.dConv], false);
+            bl.sNorm = new Tensor(new Float32Array(S.hv), [S.hv], false);
+            bl.sOut = new nn.Linear(S.vd, this.D);
+          } else {
+            // full attention: q+gate fused (2*H*hd), o (H*hd -> D); per-head q/k norms
+            bl.q = new nn.Linear(this.D, 2 * this.H * this.headDim);
+            bl.o = new nn.Linear(this.H * this.headDim, this.D);
+            bl.qn = new Tensor(new Float32Array(this.headDim), [this.headDim], false);
+            bl.kn = new Tensor(new Float32Array(this.headDim), [this.headDim], false);
+          }
         }
         this.layers.push(bl);
       }
       // Shortconv rolling state per layer: [L, D, convLCache] most-recent-first
       this._convStates = new Float32Array(this.L * this.D * this.convLCache);
+      // Qwen3.5 linear layers: rolling conv window [L, dConv-1, convDim] and
+      // the delta-rule recurrent state [L, nv, hv, hk] (per v-head matrix).
+      this._q35ConvStates = this.q35
+        ? new Float32Array(this.L * (this.q35.dConv - 1) * this.q35.convDim) : null;
+      this._q35RecStates = this.q35
+        ? new Float32Array(this.L * this.q35.nv * this.q35.hv * this.q35.hk) : null;
       this.normF = this.lean ? new nn.RMSNorm(1) : new nn.RMSNorm(this.D);
       if (!this.tieWeights && !this.lean) {
         this.lmHead = new nn.Linear(this.D, this.V);
@@ -97,25 +135,26 @@
       }
       this.normF.eps = this.eps;
 
-      // Precompute RoPE inverse frequencies: [headDim/2]
-      const halfDim = this.headDim / 2;
+      // Precompute RoPE inverse frequencies: [ropeDim/2] (ropeDim = headDim unless
+      // the arch rotates only part of each head, e.g. qwen35 rotates 64 of 256).
+      const halfDim = this.ropeDim / 2;
       this._invFreq = new Float32Array(halfDim);
       for (let i = 0; i < halfDim; i++) {
-        this._invFreq[i] = Math.exp(-(Math.log(this.ropeBase) / this.headDim) * (i * 2));
+        this._invFreq[i] = Math.exp(-(Math.log(this.ropeBase) / this.ropeDim) * (i * 2));
       }
 
-      // Precompute cos/sin tables for max seq_len: [T, headDim]
-      this._cosTable = new Float32Array(this.T * this.headDim);
-      this._sinTable = new Float32Array(this.T * this.headDim);
+      // Precompute cos/sin tables for max seq_len: [T, ropeDim]
+      this._cosTable = new Float32Array(this.T * this.ropeDim);
+      this._sinTable = new Float32Array(this.T * this.ropeDim);
       for (let t = 0; t < this.T; t++) {
         for (let i = 0; i < halfDim; i++) {
           const freq = t * this._invFreq[i];
           const c = Math.cos(freq);
           const s = Math.sin(freq);
-          this._cosTable[t * this.headDim + i] = c;
-          this._cosTable[t * this.headDim + halfDim + i] = c;
-          this._sinTable[t * this.headDim + i] = s;
-          this._sinTable[t * this.headDim + halfDim + i] = s;
+          this._cosTable[t * this.ropeDim + i] = c;
+          this._cosTable[t * this.ropeDim + halfDim + i] = c;
+          this._sinTable[t * this.ropeDim + i] = s;
+          this._sinTable[t * this.ropeDim + halfDim + i] = s;
         }
       }
 
@@ -224,6 +263,27 @@
             take(bl.kn);
             take(bl.o.weight, uploadToGPU);
           }
+        } else if (this.arch === "qwen35" && bl.isLinear) {
+          // linear: [norm1,qkv,zg,sa,alpha,beta,dt,convW,sNorm,sOut, norm2,gate_up,down]
+          take(bl.norm1.weight);
+          take(bl.qkv.weight, uploadToGPU);
+          take(bl.zg.weight, uploadToGPU);
+          take(bl.sa);
+          take(bl.sAlpha.weight, uploadToGPU);
+          take(bl.sBeta.weight, uploadToGPU);
+          take(bl.sDt);
+          take(bl.convW, uploadToGPU);
+          take(bl.sNorm);
+          take(bl.sOut.weight, uploadToGPU);
+        } else if (this.arch === "qwen35") {
+          // full: [norm1,q(q+gate),qn,k,kn,v,o, norm2,gate_up,down]
+          take(bl.norm1.weight);
+          take(bl.q.weight, uploadToGPU);
+          take(bl.qn);
+          take(bl.k.weight, uploadToGPU);
+          take(bl.kn);
+          take(bl.v.weight, uploadToGPU);
+          take(bl.o.weight, uploadToGPU);
         } else {
           take(bl.q.weight, uploadToGPU);
           take(bl.k.weight, uploadToGPU);
@@ -269,6 +329,25 @@
             take(bl.kn);
             take(bl.o.weight, uploadToGPU);
           }
+        } else if (this.arch === "qwen35" && bl.isLinear) {
+          take(bl.norm1.weight);
+          take(bl.qkv.weight, uploadToGPU);
+          take(bl.zg.weight, uploadToGPU);
+          take(bl.sa);
+          take(bl.sAlpha.weight, uploadToGPU);
+          take(bl.sBeta.weight, uploadToGPU);
+          take(bl.sDt);
+          take(bl.convW, uploadToGPU);
+          take(bl.sNorm);
+          take(bl.sOut.weight, uploadToGPU);
+        } else if (this.arch === "qwen35") {
+          take(bl.norm1.weight);
+          take(bl.q.weight, uploadToGPU);
+          take(bl.qn);
+          take(bl.k.weight, uploadToGPU);
+          take(bl.kn);
+          take(bl.v.weight, uploadToGPU);
+          take(bl.o.weight, uploadToGPU);
         } else {
           take(bl.q.weight, uploadToGPU);
           take(bl.k.weight, uploadToGPU);
@@ -793,8 +872,9 @@
      * Apply Rotary Position Embeddings.
      * x: [BH, T, headDim] -> [BH, T, headDim]
      */
-    _applyRoPE(x, BH, T, headDim, startPos = 0) {
-      const halfDim = headDim / 2;
+    _applyRoPE(x, BH, T, headDim, startPos = 0, ropeDim = null) {
+      if (ropeDim == null) ropeDim = Math.min(this.ropeDim, headDim);
+      const halfDim = ropeDim / 2;
       const out = new Float32Array(x.data.length);
       const cosT = this._cosTable;
       const sinT = this._sinTable;
@@ -802,7 +882,7 @@
       for (let bh = 0; bh < BH; bh++) {
         for (let t = 0; t < T; t++) {
           const off = (bh * T + t) * headDim;
-          const tOff = (startPos + t) * headDim; // absolute position
+          const tOff = (startPos + t) * ropeDim; // absolute position
           for (let i = 0; i < halfDim; i++) {
             const x1 = x.data[off + i];
             const x2 = x.data[off + halfDim + i];
@@ -813,6 +893,8 @@
             out[off + i] = x1 * c - x2 * s;
             out[off + halfDim + i] = x2 * c + x1 * s;
           }
+          // copy the unrotated tail (head_dim > rope_dim)
+          for (let i = ropeDim; i < headDim; i++) out[off + i] = x.data[off + i];
         }
       }
 
@@ -822,7 +904,7 @@
         for (let bh = 0; bh < BH; bh++) {
           for (let t = 0; t < T; t++) {
             const off = (bh * T + t) * headDim;
-            const tOff = t * headDim;
+            const tOff = t * ropeDim;
             for (let i = 0; i < halfDim; i++) {
               const c = cosT[tOff + i];
               const s = sinT[tOff + i];
@@ -833,6 +915,7 @@
               x.grad[off + i] += g1 * c + g2 * s;
               x.grad[off + halfDim + i] += -g1 * s + g2 * c;
             }
+            for (let i = ropeDim; i < headDim; i++) x.grad[off + i] += gout[off + i];
           }
         }
       });
@@ -957,12 +1040,127 @@
         }
       };
       const outData = new Float32Array(B * T * D);
+      // Reset the qwen35 linear-layer states at the start of a run (position 0).
+      if (startPos === 0) {
+        if (this._q35ConvStates) this._q35ConvStates.fill(0);
+        if (this._q35RecStates) this._q35RecStates.fill(0);
+      }
       for (let r = 0; r < T; r++) {
         const pos = startPos + r;
         let x = Tensor.fromArray(h.data.subarray(r * D, (r + 1) * D), [B, 1, D], false);
         for (let l = 0; l < this.L; l++) {
           const bl = this.layers[l];
-          if (this.arch === "lfm2" && bl.isConv) {
+          if (this.arch === "qwen35" && bl.isLinear) {
+            // ---- Qwen3.5 GatedDeltaNet linear-attention layer ----
+            // norm -> qkv (q,k,v) -> causal conv1d+silu -> l2norm q/k, repeat to
+            // nv heads -> gated delta rule over the [nv, hv, hk] recurrent state
+            // -> gated RMSNorm (silu(z)) -> ssm_out. State persists across decode.
+            const S = this.q35;
+            const hh = bl.norm1.forward(x);
+            const h2d = hh.reshape([1, D]);
+            const qkv = (await h2d.matmul(bl.qkv.weight).toCPU()).data;  // [convDim]
+            const z = (await h2d.matmul(bl.zg.weight).toCPU()).data;     // [vd]
+            const betaRaw = (await h2d.matmul(bl.sBeta.weight).toCPU()).data;   // [nv]
+            const alphaRaw = (await h2d.matmul(bl.sAlpha.weight).toCPU()).data; // [nv]
+            chk("layer" + l + ".qkv", qkv); chk("layer" + l + ".z", z);
+
+            // causal conv1d (kernel dConv): y[c] = w0*qkv[c] + w1*prev1 + w2*prev2...
+            const st = this._q35ConvStates.subarray(
+              l * (S.dConv - 1) * S.convDim, (l + 1) * (S.dConv - 1) * S.convDim);
+            const cv = bl.convW.data;  // [convDim, dConv]
+            const y = new Float32Array(S.convDim);
+            for (let c = 0; c < S.convDim; c++) {
+              let acc = cv[c * S.dConv] * qkv[c];
+              for (let i = 1; i < S.dConv; i++) acc += cv[c * S.dConv + i] * st[(i - 1) * S.convDim + c];
+              const silu = acc / (1 + Math.exp(-acc));
+              y[c] = silu;
+            }
+            // roll the conv state: [t-1, t-2, ...] <- [t, t-1, ...]
+            for (let c = 0; c < S.convDim; c++) {
+              for (let i = S.dConv - 2; i >= 0; i--) st[(i + 1) * S.convDim + c] = st[i * S.convDim + c];
+              st[c] = qkv[c];
+            }
+            chk("layer" + l + ".conv", y);
+
+            // decay alpha = exp(softplus(alpha + dt) * sa), beta = sigmoid(beta)
+            const alpha = new Float32Array(S.nv), beta = new Float32Array(S.nv);
+            for (let h = 0; h < S.nv; h++) {
+              beta[h] = 1 / (1 + Math.exp(-betaRaw[h]));
+              const sp = Math.log1p(Math.exp(alphaRaw[h] + bl.sDt.data[h]));
+              alpha[h] = Math.exp(sp * bl.sa.data[h]);
+            }
+
+            // split q/k/v; q/k per-head l2norm (eps 1e-6) + repeat nv/nk; scale q
+            const kd = S.kd, vd = S.vd;
+            const rep = S.nv / S.nk;
+            const qScale = 1 / Math.sqrt(S.hk);
+            const q2 = new Float32Array(S.nv * S.hk), k2 = new Float32Array(S.nv * S.hk);
+            for (let h = 0; h < S.nk; h++) {
+              let sq = 0, sk = 0;
+              for (let j = 0; j < S.hk; j++) {
+                sq += qkv[h * S.hk + j] ** 2;
+                sk += y[kd + h * S.hk + j] ** 2;
+              }
+              const iq = 1 / Math.sqrt(sq + 1e-6) * qScale;
+              const ik = 1 / Math.sqrt(sk + 1e-6);
+              for (let r = 0; r < rep; r++) {
+                for (let j = 0; j < S.hk; j++) {
+                  q2[(h * rep + r) * S.hk + j] = qkv[h * S.hk + j] * iq;
+                  k2[(h * rep + r) * S.hk + j] = y[kd + h * S.hk + j] * ik;
+                }
+              }
+            }
+            const vv = y.subarray(2 * kd, 2 * kd + vd);  // [nv, hv]
+
+            // gated delta rule recurrence over the per-v-head [hv, hk] state
+            const rec = this._q35RecStates.subarray(
+              l * S.nv * S.hv * S.hk, (l + 1) * S.nv * S.hv * S.hk);
+            const out = new Float32Array(vd);
+            for (let h = 0; h < S.nv; h++) {
+              const stR = rec.subarray(h * S.hv * S.hk, (h + 1) * S.hv * S.hk);
+              const a = alpha[h], b = beta[h];
+              const qBase = h * S.hk, kBase = h * S.hk, vBase = h * S.hv;
+              // s1 = state * a; dot[v] = sum_k s1[v,k]*k[k]
+              const dot = new Float32Array(S.hv);
+              for (let v = 0; v < S.hv; v++) {
+                let acc = 0;
+                for (let k = 0; k < S.hk; k++) {
+                  const s1 = stR[v * S.hk + k] * a;
+                  acc += s1 * k2[kBase + k];
+                  stR[v * S.hk + k] = s1;
+                }
+                dot[v] = acc;
+              }
+              // delta = (v - dot) * beta; state += delta (x) k; out = sum_k state*q
+              for (let v = 0; v < S.hv; v++) {
+                const delta = (vv[vBase + v] - dot[v]) * b;
+                let acc = 0;
+                for (let k = 0; k < S.hk; k++) {
+                  stR[v * S.hk + k] += delta * k2[kBase + k];
+                  acc += stR[v * S.hk + k] * q2[qBase + k];
+                }
+                out[vBase + v] = acc;
+              }
+            }
+            chk("layer" + l + ".delta", out);
+
+            // gated norm: RMSNorm over each v-head (w) * silu(z)
+            const sn = bl.sNorm.data;
+            for (let h = 0; h < S.nv; h++) {
+              const oBase = h * S.hv;
+              let ss = 0;
+              for (let j = 0; j < S.hv; j++) ss += out[oBase + j] * out[oBase + j];
+              const inv = 1 / Math.sqrt(ss / S.hv + this.eps);
+              for (let j = 0; j < S.hv; j++) {
+                const zv = z[oBase + j];
+                const silu = zv / (1 + Math.exp(-zv));
+                out[oBase + j] = out[oBase + j] * inv * sn[j] * silu;
+              }
+            }
+            const o = (await Tensor.fromArray(out, [1, vd], false).matmul(bl.sOut.weight).toCPU()).data;
+            chk("layer" + l + ".ssm_out", o);
+            x = x.add(Tensor.fromArray(o, [1, 1, D], false));
+          } else if (this.arch === "lfm2" && bl.isConv) {
             // ---- LFM2 shortconv block (gated depthwise causal conv1d) ----
             const hh = bl.norm1.forward(x);
             const h2d = hh.reshape([1, D]);
@@ -987,6 +1185,7 @@
           let hh2 = bl.norm1.forward(x);
           const h2d = hh2.reshape([1, D]);
           let q, k, v;
+          let qGate = null;
           if (ternarize) {
             q = this._bitlinear(h2d, bl.q.weight);
             k = this._bitlinear(h2d, bl.k.weight);
@@ -1000,8 +1199,15 @@
           if (k.onGPU) await k.toCPU();
           if (v.onGPU) await v.toCPU();
           chk("layer" + l + ".q", q.data); chk("layer" + l + ".k", k.data); chk("layer" + l + ".v", v.data);
-          // LFM2: per-head RMSNorm on q/k (before any bias — lfm2 has none)
-          if (this.arch === "lfm2") {
+          // Qwen3.5 full attention: the q projection outputs q+gate fused — split
+          // the gate now (per-head sigmoid applied after the attention).
+          if (this.arch === "qwen35") {
+            const hdq = this.H * headDim;
+            qGate = q.data.slice(hdq, 2 * hdq);
+            q = Tensor.fromArray(q.data.subarray(0, hdq), [1, hdq], false);
+          }
+          // LFM2 / Qwen3.5: per-head RMSNorm on q/k (before any bias — none here)
+          if (this.arch === "lfm2" || this.arch === "qwen35") {
             this._rmsNormHeads(q.data, bl.qn.data, H, headDim, this.eps);
             this._rmsNormHeads(k.data, bl.kn.data, kvH, headDim, this.eps);
           }
@@ -1046,6 +1252,10 @@
           chk("layer" + l + ".attn", yData);
 
           // Reshape back, output projection, residual
+          if (qGate) {
+            // Qwen3.5 full attention: attn_output * sigmoid(gate) per head
+            for (let i = 0; i < yData.length; i++) yData[i] *= 1 / (1 + Math.exp(-qGate[i]));
+          }
           const y3 = this._reshapeFromHeads(Tensor.fromArray(yData, [BH, 1, headDim], false), 1, 1, H, headDim);
           const o = (ternarize ? this._bitlinear(y3.reshape([1, D]), bl.o.weight) : y3.reshape([1, D]).matmul(bl.o.weight)).reshape([1, 1, D]);
           if (o.onGPU) await o.toCPU();
@@ -1093,10 +1303,10 @@
       };
 
       // CPU fallback: prefix forward, last predicted row (exact reference semantics)
-      // LFM2 (hybrid conv layers) always uses the forwardHidden path — the llama
-      // forward() has no shortconv branch and would run conv layers with zeroed
-      // q/k/v weights. forwardHidden's attention has its own CPU fallback.
-      if (!backend && this.arch !== "lfm2") {
+      // LFM2/Qwen3.5 (hybrid/recurrent layers) always use the forwardHidden path —
+      // the llama forward() has no branch for them and would run their layers with
+      // zeroed weights. forwardHidden's attention has its own CPU fallback.
+      if (!backend && this.arch !== "lfm2" && this.arch !== "qwen35") {
         if (!state._prefix) state._prefix = [];
         state._prefix.push(tokenId);
         const T = pos + 2;
