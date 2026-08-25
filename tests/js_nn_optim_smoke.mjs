@@ -271,6 +271,12 @@ unet.outConv.bias.data.set(Float32Array.from(fixture.unet_out_cb));
 const unetX = Tensor.fromArray(fixture.unet_x, fixture.unet_x_shape, true);
 const unetT = Tensor.fromArray(fixture.unet_t, [2, 16], false);
 const unetY = unet.forward(unetX, unetT);
+const sampBetas = Float32Array.from(fixture.samp_betas);
+const sampSampler = new tg.DDPMSampler(sampBetas);
+const sampX = Tensor.fromArray(fixture.samp_x, [2,2,2,2], false);
+const sampEps = Tensor.fromArray(fixture.samp_eps, [2,2,2,2], false);
+const sampOut = sampSampler.step(sampX, fixture.samp_t, sampEps);
+
 const unetNoise = Tensor.fromArray(fixture.unet_noise, [2,2,8,8], false);
 const unetDiff = unetY.sub(unetNoise);
 const unetLoss = unetDiff.mul(unetDiff).mean();
@@ -311,6 +317,7 @@ const report = {
   ct2_grad_x: maxAbs(ct2x.grad, fixture.ct2_x_grad),
   ct2_grad_w: maxAbs(ct2.weight.grad, fixture.ct2_w_grad),
   ct2_grad_b: maxAbs(ct2.bias.grad, fixture.ct2_b_grad),
+  samp_fwd: maxAbs(sampOut.data, fixture.samp_out),
   unet_fwd: maxAbs(unetY.data, fixture.unet_y),
   unet_loss: unetLoss.data[0],
   unet_loss_err: Math.abs(unetLoss.data[0] - fixture.unet_loss),

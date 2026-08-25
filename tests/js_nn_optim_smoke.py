@@ -342,6 +342,28 @@ def build_fixture() -> dict:
     unet_loss = ((unet_yt - unet_noise_t) * (unet_yt - unet_noise_t)).mean()
     unet_loss_val = float(unet_loss.numpy())
     unet_loss_grads = unet_loss.gradient(unet_stem.weight, unet_out_c.weight)
+    # DDPM sampler single step reference (t=1)
+    samp_betas = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+    samp_alphas = np.float32(1.0) - samp_betas
+    samp_alphaBars = np.empty_like(samp_betas)
+    prod = np.float32(1.0)
+    for i, a in enumerate(samp_alphas):
+        prod = np.float32(prod * np.float32(a))
+        samp_alphaBars[i] = prod
+    samp_x = rng.normal(0, 1, size=(2,2,2,2)).astype(np.float32)
+    samp_eps = rng.normal(0, 1, size=(2,2,2,2)).astype(np.float32)
+    samp_t = 1
+    samp_beta = np.float32(samp_betas[samp_t])
+    samp_alpha = np.float32(samp_alphas[samp_t])
+    samp_alphaBar = np.float32(samp_alphaBars[samp_t])
+    samp_coef1 = np.float32(1.0 / np.sqrt(float(samp_alpha)))
+    samp_coef2 = np.float32(float(samp_beta) / np.sqrt(float(np.float32(1.0) - samp_alphaBar)))
+    samp_scaled = (samp_eps.astype(np.float64) * float(samp_coef2)).astype(np.float32)
+    samp_sub = (samp_x.astype(np.float64) - samp_scaled.astype(np.float64)).astype(np.float32)
+    samp_out = (samp_sub.astype(np.float64) * float(samp_coef1)).astype(np.float32)
+    # alternative direct float32 via numpy: ensure same as JS scale/add
+    # recompute via same float32 path as JS does (scale then sub then scale)
+    # The above already mimics JS float32
     unet_loss_g_stem, unet_loss_g_out = [g.numpy().astype(np.float64).reshape(-1) for g in unet_loss_grads]
 
     mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
@@ -568,6 +590,11 @@ def build_fixture() -> dict:
         "unet_loss": float(unet_loss_val),
         "unet_loss_g_stem": unet_loss_g_stem.tolist(),
         "unet_loss_g_out": unet_loss_g_out.tolist(),
+        "samp_betas": samp_betas.astype(float).tolist(),
+        "samp_x": samp_x.astype(float).reshape(-1).tolist(),
+        "samp_eps": samp_eps.astype(float).reshape(-1).tolist(),
+        "samp_t": int(samp_t),
+        "samp_out": samp_out.astype(float).reshape(-1).tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -618,6 +645,7 @@ def main() -> int:
             report["sa_grad_x"], report["sa_gnw"], report["sa_gnb"], report["sa_qkv"], report["sa_proj"]) < 1e-4,
         "unet": report["unet_fwd"] < 1e-4,
         "unet_loss": report["unet_loss_err"] < 1e-4 and report["unet_loss_g_stem"] < 1e-4 and report["unet_loss_g_out"] < 1e-4,
+        "sampler": report["samp_fwd"] < 1e-5,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])

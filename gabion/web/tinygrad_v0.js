@@ -3117,6 +3117,42 @@
     }
   }
 
+  class DDPMSampler {
+    constructor(betas) {
+      this.betas = Float32Array.from(betas);
+      this.alphas = this.betas.map((b) => 1 - b);
+      this.alphaBars = new Float32Array(this.betas.length);
+      let prod = 1;
+      for (let i = 0; i < this.alphas.length; i++) {
+        prod *= this.alphas[i];
+        this.alphaBars[i] = prod;
+      }
+    }
+    /** One DDPM step: x_{t-1} = (1/sqrt(alpha_t))*(x_t - beta_t/sqrt(1-alphaBar_t)*eps) (+ sigma*z if t>0, z=0 for deterministic test) */
+    step(x, t, eps) {
+      const beta = this.betas[t];
+      const alpha = this.alphas[t];
+      const alphaBar = this.alphaBars[t];
+      const coef1 = 1 / Math.sqrt(alpha);
+      const coef2 = beta / Math.sqrt(1 - alphaBar);
+      // x - coef2*eps
+      const scaledEps = eps.scale(coef2);
+      const sub = x.sub(scaledEps);
+      return sub.scale(coef1);
+    }
+    /** Full sample loop: x_T -> x_0 using unet predictions. Deterministic (z=0). */
+    sample(unet, xT, timesteps, tEmbs) {
+      let x = xT;
+      for (let i = timesteps.length - 1; i >= 0; i--) {
+        const t = timesteps[i];
+        const tEmb = tEmbs ? tEmbs[i] : null;
+        const eps = unet.forward(x, tEmb);
+        x = this.step(x, t, eps);
+      }
+      return x;
+    }
+  }
+
   class BatchNorm extends Module {
     constructor(sz, { eps = 1e-5, affine = true, momentum = 0.1 } = {}) {
       super();
@@ -3390,6 +3426,7 @@
     LAMB,
     LARS,
     Muon,
+    DDPMSampler,
     training: false,
     crossEntropy,
     crossEntropyGPU,
