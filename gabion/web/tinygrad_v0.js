@@ -727,7 +727,8 @@
       }
       const req = this.requiresGrad || weight.requiresGrad || !!(bias && bias.requiresGrad);
       const parents = bias ? [this, weight, bias] : [this, weight];
-      return new Tensor(out, [N, Cout, Ho, Wo], req, parents, (gout) => {
+      const P = { N, Cin, H, W, Cout, Ho, Wo, kH, kW, groups, cinPerG, coutPerG, sH, sW, dH, dW, pH, pW, hasBias: bias ? 1 : 0 };
+      const cpuBackward = (gout) => {
         if (this.requiresGrad) {
           if (!this.grad) this.grad = new Float32Array(this.numel);
           const dx = this.grad;
@@ -778,7 +779,21 @@
             for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++)
               bias.grad[oc] += gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
         }
-      });
+      };
+      const backend = gpu();
+      if (backend && this.onGPU && weight.onGPU && (!bias || bias.onGPU)) {
+        const outBuf = backend.conv2d(this.gpuBuffer, weight.gpuBuffer, bias ? bias.gpuBuffer : null, P);
+        return new Tensor(new Float32Array(N * Cout * Ho * Wo), [N, Cout, Ho, Wo], req, parents, (gout, goutBuf) => {
+          if (goutBuf && backend) {
+            if (this.requiresGrad) this._pendingGradBuf = backend.conv2dBwdDx(weight.gpuBuffer, goutBuf, P);
+            if (weight.requiresGrad) weight._pendingGradBuf = backend.conv2dBwdDw(this.gpuBuffer, goutBuf, P);
+            if (bias && bias.requiresGrad) bias._pendingGradBuf = backend.convBwdDb(goutBuf, P);
+          } else {
+            cpuBackward(gout);
+          }
+        }, outBuf, "gpu");
+      }
+      return new Tensor(out, [N, Cout, Ho, Wo], req, parents, cpuBackward);
     }
 
     /**
@@ -838,7 +853,8 @@
       }
       const req = this.requiresGrad || weight.requiresGrad || !!(bias && bias.requiresGrad);
       const parents = bias ? [this, weight, bias] : [this, weight];
-      return new Tensor(out, [N, Cout, Ho, Wo], req, parents, (gout) => {
+      const P = { N, Cin, H, W, Cout, Ho, Wo, kH, kW, groups, cinPerG, coutPerG: CoutG, sH, sW, dH, dW, pH, pW, hasBias: bias ? 1 : 0 };
+      const cpuBackward = (gout) => {
         // ConvTranspose2d backward: mirrors the forward scatter as a gather.
         // dx: each input element sums gout at every output position it wrote to.
         // dw: each weight element accumulates x * gout over the same (oh, ow) hits.
@@ -898,7 +914,21 @@
             for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++)
               bias.grad[oc] += gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
         }
-      });
+      };
+      const backend = gpu();
+      if (backend && this.onGPU && weight.onGPU && (!bias || bias.onGPU)) {
+        const outBuf = backend.convTranspose2d(this.gpuBuffer, weight.gpuBuffer, bias ? bias.gpuBuffer : null, P);
+        return new Tensor(new Float32Array(N * Cout * Ho * Wo), [N, Cout, Ho, Wo], req, parents, (gout, goutBuf) => {
+          if (goutBuf && backend) {
+            if (this.requiresGrad) this._pendingGradBuf = backend.convTranspose2dBwdDx(weight.gpuBuffer, goutBuf, P);
+            if (weight.requiresGrad) weight._pendingGradBuf = backend.convTranspose2dBwdDw(this.gpuBuffer, goutBuf, P);
+            if (bias && bias.requiresGrad) bias._pendingGradBuf = backend.convBwdDb(goutBuf, P);
+          } else {
+            cpuBackward(gout);
+          }
+        }, outBuf, "gpu");
+      }
+      return new Tensor(out, [N, Cout, Ho, Wo], req, parents, cpuBackward);
     }
 
     /** Affine on NCHW channel dim (axis=1). */

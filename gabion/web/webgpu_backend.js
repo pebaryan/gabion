@@ -427,6 +427,169 @@
       return outBuf;
     }
 
+    // --- Conv family kernels ---
+
+    /** Pack the shared conv Params struct (20 u32) for conv/convtranspose kernels. */
+    _convUniform(P) {
+      return new Uint32Array([
+        P.N, P.Cin, P.H, P.W, P.Cout, P.Ho, P.Wo, P.kH, P.kW, P.groups,
+        P.cinPerG, P.coutPerG, P.sH, P.sW, P.dH, P.dW, P.pH, P.pW, P.hasBias, 0,
+      ]);
+    }
+
+    /**
+     * NCHW conv2d forward. x: [N*Cin*H*W], w: [Cout*cinPerG*kH*kW], b: [Cout] or null.
+     * Returns GPUBuffer [N*Cout*Ho*Wo].
+     */
+    conv2d(xBuf, wBuf, bBuf, P) {
+      const pipeline = this.getPipeline("conv2d_fwd");
+      const uniformBuf = this.createUniformBuffer(this._convUniform(P));
+      const outBuf = this.createEmptyBuffer(P.N * P.Cout * P.Ho * P.Wo * 4);
+      const dummy = this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: wBuf } },
+          { binding: 3, resource: { buffer: bBuf || dummy } },
+          { binding: 4, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.N * P.Cout * P.Ho * P.Wo / 256), 1, 1, uniformBuf);
+      if (!bBuf) dummy.destroy();
+      return outBuf;
+    }
+
+    /**
+     * Conv2d input gradient. w: [Cout*cinPerG*kH*kW], gout: [N*Cout*Ho*Wo].
+     * Returns GPUBuffer dx [N*Cin*H*W].
+     */
+    conv2dBwdDx(wBuf, goutBuf, P) {
+      const pipeline = this.getPipeline("conv2d_bwd_dx");
+      const uniformBuf = this.createUniformBuffer(this._convUniform(P));
+      const dxBuf = this.createEmptyBuffer(P.N * P.Cin * P.H * P.W * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: wBuf } },
+          { binding: 2, resource: { buffer: goutBuf } },
+          { binding: 3, resource: { buffer: dxBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.N * P.Cin * P.H * P.W / 256), 1, 1, uniformBuf);
+      return dxBuf;
+    }
+
+    /**
+     * Conv2d weight gradient. x: [N*Cin*H*W], gout: [N*Cout*Ho*Wo].
+     * Returns GPUBuffer dw [Cout*cinPerG*kH*kW].
+     */
+    conv2dBwdDw(xBuf, goutBuf, P) {
+      const pipeline = this.getPipeline("conv2d_bwd_dw");
+      const uniformBuf = this.createUniformBuffer(this._convUniform(P));
+      const dwBuf = this.createEmptyBuffer(P.Cout * P.cinPerG * P.kH * P.kW * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: goutBuf } },
+          { binding: 3, resource: { buffer: dwBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.Cout * P.cinPerG * P.kH * P.kW / 256), 1, 1, uniformBuf);
+      return dwBuf;
+    }
+
+    /**
+     * Conv / conv_transpose bias gradient. gout: [N*Cout*Ho*Wo].
+     * Returns GPUBuffer db [Cout].
+     */
+    convBwdDb(goutBuf, P) {
+      const pipeline = this.getPipeline("conv_bwd_db");
+      const uniformBuf = this.createUniformBuffer(this._convUniform(P));
+      const dbBuf = this.createEmptyBuffer(P.Cout * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: goutBuf } },
+          { binding: 2, resource: { buffer: dbBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.Cout / 256), 1, 1, uniformBuf);
+      return dbBuf;
+    }
+
+    /**
+     * NCHW conv_transpose2d forward (gather formulation).
+     * x: [N*Cin*H*W], w: [Cin*coutPerG*kH*kW] (tinygrad layout), b: [Cout] or null.
+     * Returns GPUBuffer [N*Cout*Ho*Wo].
+     */
+    convTranspose2d(xBuf, wBuf, bBuf, P) {
+      const pipeline = this.getPipeline("convtranspose2d_fwd");
+      const uniformBuf = this.createUniformBuffer(this._convUniform(P));
+      const outBuf = this.createEmptyBuffer(P.N * P.Cout * P.Ho * P.Wo * 4);
+      const dummy = this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: wBuf } },
+          { binding: 3, resource: { buffer: bBuf || dummy } },
+          { binding: 4, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.N * P.Cout * P.Ho * P.Wo / 256), 1, 1, uniformBuf);
+      if (!bBuf) dummy.destroy();
+      return outBuf;
+    }
+
+    /**
+     * Conv_transpose2d input gradient. w: [Cin*coutPerG*kH*kW], gout: [N*Cout*Ho*Wo].
+     * Returns GPUBuffer dx [N*Cin*H*W].
+     */
+    convTranspose2dBwdDx(wBuf, goutBuf, P) {
+      const pipeline = this.getPipeline("convtranspose2d_bwd_dx");
+      const uniformBuf = this.createUniformBuffer(this._convUniform(P));
+      const dxBuf = this.createEmptyBuffer(P.N * P.Cin * P.H * P.W * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: wBuf } },
+          { binding: 2, resource: { buffer: goutBuf } },
+          { binding: 3, resource: { buffer: dxBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.N * P.Cin * P.H * P.W / 256), 1, 1, uniformBuf);
+      return dxBuf;
+    }
+
+    /**
+     * Conv_transpose2d weight gradient. x: [N*Cin*H*W], gout: [N*Cout*Ho*Wo].
+     * Returns GPUBuffer dw [Cin*coutPerG*kH*kW].
+     */
+    convTranspose2dBwdDw(xBuf, goutBuf, P) {
+      const pipeline = this.getPipeline("convtranspose2d_bwd_dw");
+      const uniformBuf = this.createUniformBuffer(this._convUniform(P));
+      const dwBuf = this.createEmptyBuffer(P.Cin * P.coutPerG * P.kH * P.kW * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: goutBuf } },
+          { binding: 3, resource: { buffer: dwBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.Cin * P.coutPerG * P.kH * P.kW / 256), 1, 1, uniformBuf);
+      return dwBuf;
+    }
+
     /**
      * Dispatch row-wise reduction.
      * op: 0=sum, 1=max, 2=sumSquares
