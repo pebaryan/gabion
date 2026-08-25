@@ -17,11 +17,11 @@
 <div id="s">booting…</div>
 <div id="e"></div>
 
-<script src="/gabion/web/tinygrad_v0.js?v=6"></script>
-<script src="/gabion/web/webgpu_backend.js?v=6"></script>
-<script src="/gabion/web/tokenizer.js?v=6"></script>
-<script src="/gabion/web/bbt_forward.js?v=6"></script>
-<script src="/gabion/web/model_loader.js?v=6"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=7"></script>
+<script src="/gabion/web/webgpu_backend.js?v=7"></script>
+<script src="/gabion/web/tokenizer.js?v=7"></script>
+<script src="/gabion/web/bbt_forward.js?v=7"></script>
+<script src="/gabion/web/model_loader.js?v=7"></script>
 <script>
 "use strict";
 // Kernel set the decode path can dispatch (KV attention + matmuls + silu).
@@ -86,6 +86,10 @@ async function initGPU() {
     status(`shard ${myIndex} READY — layers ${spec.layers[0]}..${spec.layers[1] - 1}, listening on channel`);
   } catch (e) {
     err(String(e && e.stack || e));
+    try {
+      new BroadcastChannel("gabion-shards").postMessage(
+        { cmd: "ready-error", shard: myIndex, error: String(e && e.message || e) });
+    } catch (_) { /* no coordinator listening */ }
   }
 })();
 </script>
