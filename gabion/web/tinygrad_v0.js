@@ -1174,6 +1174,83 @@
       return t;
     }
 
+    /**
+     * Sum over reduced axes. axes: null (all) or array of axis indices.
+     * keepdim: keep reduced dims as size-1.
+     */
+    sum(axes = null, keepdim = false) {
+      const shape = this.shape;
+      const nd = shape.length;
+      let ax;
+      if (axes === null || axes.length === 0) {
+        ax = Array.from({ length: nd }, (_, i) => i);
+      } else {
+        ax = axes.map((a) => (a < 0 ? a + nd : a)).sort((a, b) => a - b);
+        for (const a of ax) {
+          if (a < 0 || a >= nd) throw new Error(`sum: axis ${a} out of range for shape ${shape}`);
+        }
+        if (new Set(ax).size !== ax.length) throw new Error("sum: duplicate axes");
+      }
+      const isReduced = Array.from({ length: nd }, (_, i) => ax.includes(i));
+      const outShape = shape.filter((_, i) => !isReduced[i]);
+      if (keepdim) {
+        // interleave back as ones
+        const kd = [];
+        let oi = 0;
+        for (let i = 0; i < nd; i++) kd.push(isReduced[i] ? 1 : shape[i]);
+        void oi;
+        return this.sum(ax, false).reshape(kd);
+      }
+      const outNumel = outShape.reduce((a, b) => a * b, 1);
+      // strides
+      const inStride = [];
+      let acc = 1;
+      for (let i = nd - 1; i >= 0; i--) { inStride[i] = acc; acc *= shape[i]; }
+      // out strides over non-reduced dims
+      const outDims = [];
+      for (let i = 0; i < nd; i++) if (!isReduced[i]) outDims.push({ size: shape[i], stride: inStride[i] });
+      const outStride = [];
+      acc = 1;
+      for (let i = outDims.length - 1; i >= 0; i--) { outStride[i] = acc; acc *= outDims[i].size; }
+
+      const out = new Float32Array(outNumel);
+      const nIn = this.numel;
+      // iterate input linearly, decompose index -> out index via cached mapping
+      const idxMap = new Int32Array(nIn); // out element per input element
+      {
+        const coord = new Int32Array(nd);
+        for (let lin = 0; lin < nIn; lin++) {
+          let o = 0;
+          let rem = lin;
+          for (let d = 0; d < nd; d++) { coord[d] = rem / inStride[d] | 0; rem -= coord[d] * inStride[d]; }
+          let k = 0;
+          for (let d = 0; d < nd; d++) if (!isReduced[d]) o += coord[d] * outStride[k++];
+          idxMap[lin] = o;
+          out[o] += this.data[lin];
+        }
+      }
+      const xData = this.data;
+      return new Tensor(out, outShape, this.requiresGrad, [this], (gout) => {
+        if (!this.requiresGrad) return;
+        if (!this.grad) this.grad = new Float32Array(xData.length);
+        for (let lin = 0; lin < nIn; lin++) this.grad[lin] += gout[idxMap[lin]];
+      });
+    }
+
+    /** Mean over reduced axes (null = all). */
+    mean(axes = null, keepdim = false) {
+      const shape = this.shape;
+      const nd = shape.length;
+      let ax;
+      if (axes === null || axes.length === 0) {
+        ax = Array.from({ length: nd }, (_, i) => i);
+      } else {
+        ax = axes.map((a) => (a < 0 ? a + nd : a));
+      }
+      const redN = ax.reduce((a, i) => a * shape[i], 1);
+      return this.sum(axes, keepdim).scale(1 / redN);
+    }
+
     /** Softmax along last axis. Input shape [..., C]. Auto-dispatches to GPU. */
     softmax() {
       const shape = this.shape;

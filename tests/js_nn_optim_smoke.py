@@ -105,6 +105,16 @@ def build_fixture() -> dict:
         ct2.weight, ct2.bias, ct2_xt
     )
 
+    # Tensor sum/mean reductions
+    red_x = rng.normal(0, 1, size=(2, 3, 4, 5)).astype(np.float32)
+    red_xt = Tensor(red_x.tolist())
+    ysum = red_xt.sum(axis=[2, 3])
+    ymean = red_xt.mean(axis=1)
+    red_g1 = rng.normal(0, 1, size=tuple(ysum.shape)).astype(np.float32)
+    red_g2 = rng.normal(0, 1, size=tuple(ymean.shape)).astype(np.float32)
+    sum_x_grad, = (ysum * Tensor(red_g1.tolist())).sum().gradient(red_xt)
+    mean_x_grad, = (ymean * Tensor(red_g2.tolist())).sum().gradient(red_xt)
+
     mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mg = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mpt = Tensor(mp.tolist())
@@ -187,6 +197,16 @@ def build_fixture() -> dict:
         "ct2_x_grad": ct2_x_grad.numpy().astype(np.float64).reshape(-1).tolist(),
         "ct2_w_grad": ct2_w_grad.numpy().astype(np.float64).reshape(-1).tolist(),
         "ct2_b_grad": ct2_b_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "red_x": red_x.astype(float).reshape(-1).tolist(),
+        "red_x_shape": list(red_x.shape),
+        "sum_y": ysum.numpy().astype(np.float64).reshape(-1).tolist(),
+        "sum_y_shape": list(ysum.shape),
+        "sum_g": red_g1.astype(float).reshape(-1).tolist(),
+        "sum_x_grad": sum_x_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "mean_y": ymean.numpy().astype(np.float64).reshape(-1).tolist(),
+        "mean_y_shape": list(ymean.shape),
+        "mean_g": red_g2.astype(float).reshape(-1).tolist(),
+        "mean_x_grad": mean_x_grad.numpy().astype(np.float64).reshape(-1).tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -222,6 +242,8 @@ def main() -> int:
         "ct2_forward": report["ct2_max_abs"] < 1e-4,
         "ct2_backward": report["ct2_grad_x"] < 1e-4 and report["ct2_grad_w"] < 1e-4 and report["ct2_grad_b"] < 1e-4,
         "muon": report["muon_max_abs"] < 1e-4,
+        "reduce_sum": report["sum_fwd"] < 1e-5 and report["sum_grad"] < 1e-5,
+        "reduce_mean": report["mean_fwd"] < 1e-5 and report["mean_grad"] < 1e-5,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])

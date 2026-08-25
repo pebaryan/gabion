@@ -127,6 +127,18 @@ const ct2Yg = ct2x.convTranspose2d(ct2.weight, ct2.bias, 2, 2, 1, 1, 1);
 ct2Yg.grad = Float32Array.from(fixture.ct2_g);
 ct2Yg._backward(ct2Yg.grad);
 
+// Tensor sum/mean reductions
+const redx = Tensor.fromArray(fixture.red_x, fixture.red_x_shape, true);
+const sumY = redx.sum([2, 3]);
+sumY.grad = Float32Array.from(fixture.sum_g);
+sumY._backward(sumY.grad);
+const meanX = Tensor.fromArray(fixture.red_x, fixture.red_x_shape, true);
+const meanY = meanX.mean([1]);
+meanY.grad = Float32Array.from(fixture.mean_g);
+meanY._backward(meanY.grad);
+const meanSumNode = meanY._parents[0]; // sum -> scale composition
+meanSumNode._backward(meanSumNode.grad);
+
 const mp = Tensor.fromArray(fixture.muon_p, [4, 4], true);
 mp.grad = Float32Array.from(fixture.muon_g);
 const muon = tg.Muon([mp], { lr: 1e-3, warmupSteps: 1, gradClipNorm: 0 });
@@ -158,6 +170,10 @@ const report = {
   ct2_grad_w: maxAbs(ct2.weight.grad, fixture.ct2_w_grad),
   ct2_grad_b: maxAbs(ct2.bias.grad, fixture.ct2_b_grad),
   muon_max_abs: maxAbs(mp.data, fixture.muon_after),
+  sum_fwd: maxAbs(sumY.data, fixture.sum_y),
+  sum_grad: maxAbs(redx.grad.slice(), fixture.sum_x_grad),
+  mean_fwd: maxAbs(meanY.data, fixture.mean_y),
+  mean_grad: maxAbs(meanX.grad.slice(), fixture.mean_x_grad),
 };
 const outPath = fixturePath.replace(/\.json$/, "_js.json");
 fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
