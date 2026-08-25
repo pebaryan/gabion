@@ -115,6 +115,35 @@ def build_fixture() -> dict:
     sum_x_grad, = (ysum * Tensor(red_g1.tolist())).sum().gradient(red_xt)
     mean_x_grad, = (ymean * Tensor(red_g2.tolist())).sum().gradient(red_xt)
 
+    # Tensor pad/concat
+    pad_x = rng.normal(0, 1, size=(2, 3, 4, 4)).astype(np.float32)
+    pad_xt = Tensor(pad_x.tolist())
+    pad_y = pad_xt.pad([(0, 0), (0, 0), (1, 1), (1, 1)])
+    pad_g = rng.normal(0, 1, size=tuple(pad_y.shape)).astype(np.float32)
+    pad_x_grad, = (pad_y * Tensor(pad_g.tolist())).sum().gradient(pad_xt)
+    # hard asymmetric
+    pad2_x = rng.normal(0, 1, size=(2, 3, 4, 5)).astype(np.float32)
+    pad2_xt = Tensor(pad2_x.tolist())
+    pad2_y = pad2_xt.pad([(0, 0), (0, 0), (1, 2), (0, 3)])
+    pad2_g = rng.normal(0, 1, size=tuple(pad2_y.shape)).astype(np.float32)
+    pad2_x_grad, = (pad2_y * Tensor(pad2_g.tolist())).sum().gradient(pad2_xt)
+
+    cat_a = rng.normal(0, 1, size=(2, 4, 3, 3)).astype(np.float32)
+    cat_b = rng.normal(0, 1, size=(2, 6, 3, 3)).astype(np.float32)
+    cat_at = Tensor(cat_a.tolist())
+    cat_bt = Tensor(cat_b.tolist())
+    cat_y = cat_at.cat(cat_bt, dim=1)
+    cat_g = rng.normal(0, 1, size=tuple(cat_y.shape)).astype(np.float32)
+    cat_a_grad, cat_b_grad = (cat_y * Tensor(cat_g.tolist())).sum().gradient(cat_at, cat_bt)
+    # hard axis=3
+    cat2_a = rng.normal(0, 1, size=(2, 3, 4, 3)).astype(np.float32)
+    cat2_b = rng.normal(0, 1, size=(2, 3, 4, 5)).astype(np.float32)
+    cat2_at = Tensor(cat2_a.tolist())
+    cat2_bt = Tensor(cat2_b.tolist())
+    cat2_y = cat2_at.cat(cat2_bt, dim=3)
+    cat2_g = rng.normal(0, 1, size=tuple(cat2_y.shape)).astype(np.float32)
+    cat2_a_grad, cat2_b_grad = (cat2_y * Tensor(cat2_g.tolist())).sum().gradient(cat2_at, cat2_bt)
+
     mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mg = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mpt = Tensor(mp.tolist())
@@ -207,6 +236,36 @@ def build_fixture() -> dict:
         "mean_y_shape": list(ymean.shape),
         "mean_g": red_g2.astype(float).reshape(-1).tolist(),
         "mean_x_grad": mean_x_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "pad_x": pad_x.astype(float).reshape(-1).tolist(),
+        "pad_x_shape": list(pad_x.shape),
+        "pad_pads": [[0, 0], [0, 0], [1, 1], [1, 1]],
+        "pad_y": pad_y.numpy().astype(np.float64).reshape(-1).tolist(),
+        "pad_g": pad_g.astype(float).reshape(-1).tolist(),
+        "pad_x_grad": pad_x_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "pad2_x": pad2_x.astype(float).reshape(-1).tolist(),
+        "pad2_x_shape": list(pad2_x.shape),
+        "pad2_pads": [[0, 0], [0, 0], [1, 2], [0, 3]],
+        "pad2_y": pad2_y.numpy().astype(np.float64).reshape(-1).tolist(),
+        "pad2_g": pad2_g.astype(float).reshape(-1).tolist(),
+        "pad2_x_grad": pad2_x_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "cat_a": cat_a.astype(float).reshape(-1).tolist(),
+        "cat_a_shape": list(cat_a.shape),
+        "cat_b": cat_b.astype(float).reshape(-1).tolist(),
+        "cat_b_shape": list(cat_b.shape),
+        "cat_axis": 1,
+        "cat_y": cat_y.numpy().astype(np.float64).reshape(-1).tolist(),
+        "cat_g": cat_g.astype(float).reshape(-1).tolist(),
+        "cat_a_grad": cat_a_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "cat_b_grad": cat_b_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "cat2_a": cat2_a.astype(float).reshape(-1).tolist(),
+        "cat2_a_shape": list(cat2_a.shape),
+        "cat2_b": cat2_b.astype(float).reshape(-1).tolist(),
+        "cat2_b_shape": list(cat2_b.shape),
+        "cat2_axis": 3,
+        "cat2_y": cat2_y.numpy().astype(np.float64).reshape(-1).tolist(),
+        "cat2_g": cat2_g.astype(float).reshape(-1).tolist(),
+        "cat2_a_grad": cat2_a_grad.numpy().astype(np.float64).reshape(-1).tolist(),
+        "cat2_b_grad": cat2_b_grad.numpy().astype(np.float64).reshape(-1).tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -244,6 +303,10 @@ def main() -> int:
         "muon": report["muon_max_abs"] < 1e-4,
         "reduce_sum": report["sum_fwd"] < 1e-5 and report["sum_grad"] < 1e-5,
         "reduce_mean": report["mean_fwd"] < 1e-5 and report["mean_grad"] < 1e-5,
+        "pad": report["pad_fwd"] < 1e-5 and report["pad_grad"] < 1e-5,
+        "pad_asym": report["pad2_fwd"] < 1e-5 and report["pad2_grad"] < 1e-5,
+        "concat": report["cat_fwd"] < 1e-5 and report["cat_a_grad"] < 1e-5 and report["cat_b_grad"] < 1e-5,
+        "concat_last_axis": report["cat2_fwd"] < 1e-5 and report["cat2_a_grad"] < 1e-5 and report["cat2_b_grad"] < 1e-5,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])

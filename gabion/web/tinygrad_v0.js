@@ -1175,6 +1175,100 @@
     }
 
     /**
+     * Zero-pad. paddings: array of [before, after] per dim, length === ndim.
+     */
+    pad(paddings) {
+      const shape = this.shape;
+      const nd = shape.length;
+      if (paddings.length !== nd) throw new Error(`pad: expected ${nd} pairs, got ${paddings.length}`);
+      const outShape = shape.map((s, i) => s + paddings[i][0] + paddings[i][1]);
+      const outNumel = outShape.reduce((a, b) => a * b, 1);
+      const out = new Float32Array(outNumel);
+      // in strides
+      const inStride = [];
+      let acc = 1;
+      for (let i = nd - 1; i >= 0; i--) { inStride[i] = acc; acc *= shape[i]; }
+      // iterate input, compute out coords
+      const nIn = this.numel;
+      const coord = new Int32Array(nd);
+      for (let lin = 0; lin < nIn; lin++) {
+        let rem = lin, o = 0, ok = true;
+        for (let d = 0; d < nd; d++) {
+          coord[d] = rem / inStride[d] | 0; rem -= coord[d] * inStride[d];
+        }
+        for (let d = 0; d < nd; d++) {
+          const c = coord[d] + paddings[d][0];
+          if (c < 0 || c >= outShape[d]) { ok = false; break; } // can't happen (c>=before)
+          o += c * (() => {
+            let s = 1;
+            for (let k = d + 1; k < nd; k++) s *= outShape[k];
+            return s;
+          })();
+        }
+        if (ok) out[o] = this.data[lin];
+      }
+      const pads = paddings.map((p) => [p[0], p[1]]);
+      return new Tensor(out, outShape, this.requiresGrad, [this], (gout) => {
+        if (!this.requiresGrad) return;
+        if (!this.grad) this.grad = new Float32Array(this.data.length);
+        // gout coords minus before-offset
+        const gStride = [];
+        acc = 1;
+        for (let i = nd - 1; i >= 0; i--) { gStride[i] = acc; acc *= outShape[i]; }
+        for (let lin = 0; lin < nIn; lin++) {
+          let rem = lin, o = 0;
+          for (let d = 0; d < nd; d++) {
+            coord[d] = rem / inStride[d] | 0; rem -= coord[d] * inStride[d];
+            o += (coord[d] + pads[d][0]) * gStride[d];
+          }
+          this.grad[lin] += gout[o];
+        }
+      });
+    }
+
+    /** Concat with another tensor along axis (negative allowed). Same shapes except axis. */
+    concat(other, axis) {
+      const nd = this.shape.length;
+      if (other.shape.length !== nd) throw new Error(`concat: ndim mismatch ${this.shape} vs ${other.shape}`);
+      const ax = axis < 0 ? axis + nd : axis;
+      for (let d = 0; d < nd; d++) {
+        if (d !== ax && this.shape[d] !== other.shape[d])
+          throw new Error(`concat: non-axis dims differ (${this.shape} vs ${other.shape})`);
+      }
+      const outShape = this.shape.slice();
+      outShape[ax] += other.shape[ax];
+      const nA = this.numel, nB = other.numel;
+      let rowsOuter = 1, inner = 1;
+      for (let d = 0; d < ax; d++) rowsOuter *= this.shape[d];
+      for (let d = ax + 1; d < nd; d++) inner *= this.shape[d];
+      const axA = this.shape[ax], axB = other.shape[ax], axOut = axA + axB;
+      const out = new Float32Array(nA + nB);
+      // copy A rows then B rows per outer row
+      for (let r = 0; r < rowsOuter; r++) {
+        out.set(this.data.subarray(r * axA * inner, (r + 1) * axA * inner), r * axOut * inner);
+        out.set(other.data.subarray(r * axB * inner, (r + 1) * axB * inner),
+                r * axOut * inner + axA * inner);
+      }
+      const req = this.requiresGrad || other.requiresGrad;
+      const t = new Tensor(out, outShape, req, [this, other], () => {});
+      t._backward = (gout) => {
+        if (this.requiresGrad) {
+          if (!this.grad) this.grad = new Float32Array(nA);
+          for (let r = 0; r < rowsOuter; r++)
+            for (let i = 0; i < axA * inner; i++)
+              this.grad[r * axA * inner + i] += gout[r * axOut * inner + i];
+        }
+        if (other.requiresGrad) {
+          if (!other.grad) other.grad = new Float32Array(nB);
+          for (let r = 0; r < rowsOuter; r++)
+            for (let i = 0; i < axB * inner; i++)
+              other.grad[r * axB * inner + i] += gout[r * axOut * inner + axA * inner + i];
+        }
+      };
+      return t;
+    }
+
+    /**
      * Sum over reduced axes. axes: null (all) or array of axis indices.
      * keepdim: keep reduced dims as size-1.
      */

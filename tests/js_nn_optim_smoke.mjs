@@ -139,6 +139,26 @@ meanY._backward(meanY.grad);
 const meanSumNode = meanY._parents[0]; // sum -> scale composition
 meanSumNode._backward(meanSumNode.grad);
 
+// Tensor pad/concat
+const padX = Tensor.fromArray(fixture.pad_x, fixture.pad_x_shape, true);
+const padY = padX.pad(fixture.pad_pads);
+padY.grad = Float32Array.from(fixture.pad_g);
+padY._backward(padY.grad);
+const pad2X = Tensor.fromArray(fixture.pad2_x, fixture.pad2_x_shape, true);
+const pad2Y = pad2X.pad(fixture.pad2_pads);
+pad2Y.grad = Float32Array.from(fixture.pad2_g);
+pad2Y._backward(pad2Y.grad);
+const catA = Tensor.fromArray(fixture.cat_a, fixture.cat_a_shape, true);
+const catB = Tensor.fromArray(fixture.cat_b, fixture.cat_b_shape, true);
+const catY = catA.concat(catB, fixture.cat_axis);
+catY.grad = Float32Array.from(fixture.cat_g);
+catY._backward(catY.grad);
+const cat2A = Tensor.fromArray(fixture.cat2_a, fixture.cat2_a_shape, true);
+const cat2B = Tensor.fromArray(fixture.cat2_b, fixture.cat2_b_shape, true);
+const cat2Y = cat2A.concat(cat2B, fixture.cat2_axis);
+cat2Y.grad = Float32Array.from(fixture.cat2_g);
+cat2Y._backward(cat2Y.grad);
+
 const mp = Tensor.fromArray(fixture.muon_p, [4, 4], true);
 mp.grad = Float32Array.from(fixture.muon_g);
 const muon = tg.Muon([mp], { lr: 1e-3, warmupSteps: 1, gradClipNorm: 0 });
@@ -174,6 +194,16 @@ const report = {
   sum_grad: maxAbs(redx.grad.slice(), fixture.sum_x_grad),
   mean_fwd: maxAbs(meanY.data, fixture.mean_y),
   mean_grad: maxAbs(meanX.grad.slice(), fixture.mean_x_grad),
+  pad_fwd: maxAbs(padY.data, fixture.pad_y),
+  pad_grad: maxAbs(padX.grad.slice(), fixture.pad_x_grad),
+  pad2_fwd: maxAbs(pad2Y.data, fixture.pad2_y),
+  pad2_grad: maxAbs(pad2X.grad.slice(), fixture.pad2_x_grad),
+  cat_fwd: maxAbs(catY.data, fixture.cat_y),
+  cat_a_grad: maxAbs(catA.grad.slice(), fixture.cat_a_grad),
+  cat_b_grad: maxAbs(catB.grad.slice(), fixture.cat_b_grad),
+  cat2_fwd: maxAbs(cat2Y.data, fixture.cat2_y),
+  cat2_a_grad: maxAbs(cat2A.grad.slice(), fixture.cat2_a_grad),
+  cat2_b_grad: maxAbs(cat2B.grad.slice(), fixture.cat2_b_grad),
 };
 const outPath = fixturePath.replace(/\.json$/, "_js.json");
 fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
