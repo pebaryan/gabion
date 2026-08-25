@@ -28,9 +28,15 @@
 <h1>gabion demo — a real llama model generating in your tab</h1>
 <div class="bar">
   <label>wire <input type="text" id="modelUrl" value="/gabion/web/models/qwen2.5-0.5b.gabion.json"></label>
-  <label>tokens <input type="text" id="tokens" value="64" style="width:4rem"></label>
-  <label>temp <input type="text" id="temp" value="0.8" style="width:4rem"></label>
+  <label>tokens <input type="text" id="tokens" value="128" style="width:4rem"></label>
+  <label>temp <input type="text" id="temp" value="0.7" style="width:4rem"></label>
+  <label>top-k <input type="text" id="topk" value="40" style="width:4rem"></label>
+  <label>top-p <input type="text" id="topp" value="0.9" style="width:4rem"></label>
+  <label>seed <input type="text" id="seed" value="" placeholder="random" style="width:6rem"></label>
+</div>
+<div class="bar">
   <label><input type="checkbox" id="chat" checked> chat format</label>
+  <label><input type="checkbox" id="stop" checked> stop at &lt;|endoftext|&gt;/&lt;|im_end|&gt;</label>
   <label><input type="checkbox" id="binary" checked> binary wire (fast)</label>
   <button id="go">Generate</button>
 </div>
@@ -43,11 +49,11 @@
 <div id="stats"></div>
 <pre id="resultJson" hidden>{}</pre>
 
-<script src="/gabion/web/tinygrad_v0.js?v=3"></script>
-<script src="/gabion/web/webgpu_backend.js?v=3"></script>
-<script src="/gabion/web/tokenizer.js?v=3"></script>
-<script src="/gabion/web/bbt_forward.js?v=3"></script>
-<script src="/gabion/web/model_loader.js?v=3"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=4"></script>
+<script src="/gabion/web/webgpu_backend.js?v=4"></script>
+<script src="/gabion/web/tokenizer.js?v=4"></script>
+<script src="/gabion/web/bbt_forward.js?v=4"></script>
+<script src="/gabion/web/model_loader.js?v=4"></script>
 <script>
 "use strict";
 // All kernels the engine can dispatch (decode path needs the KV-attention set).
@@ -99,6 +105,9 @@ async function generate() {
     const binary = $("binary").checked;
     const maxNew = Math.max(1, Math.min(512, parseInt($("tokens").value, 10) || 64));
     const temp = parseFloat($("temp").value);
+    const topK = Math.max(0, parseInt($("topk").value, 10) || 0);
+    const topP = parseFloat($("topp").value);
+    const seedTxt = $("seed").value.trim();
     status(binary ? "loading binary wire (weights.f16 + model.json)…" : "loading model wire…");
     const model = binary
       ? await gabionLoader.loadBBTModelBin(url.replace(/\.gabion\.json$/, ".json"), url.replace(/\.gabion\.json$/, ".f16"))
@@ -118,12 +127,35 @@ async function generate() {
     out.promptTokens = ids.length;
     status(`generating… (${out.model.n_layers} layers, ${maxNew} tokens, ${ids.length} prompt tokens)`);
 
+    // Stop tokens: EOS always; im_end when chat formatting is on.
+    let stopTokens = [];
+    if ($("stop").checked && model.tokenizer) {
+      const v = model.tokenizer.vocab;
+      if (v["<|endoftext|>"] !== undefined) stopTokens.push(v["<|endoftext|>"]);
+      if ($("chat").checked && v["<|im_end|>"] !== undefined) stopTokens.push(v["<|im_end|>"]);
+    }
+    // Seeded RNG (mulberry32) for reproducible runs; empty seed = Math.random.
+    let rng = null;
+    if (seedTxt !== "") {
+      let s = 0;
+      for (let i = 0; i < seedTxt.length; i++) s = (Math.imul(31, s) + seedTxt.charCodeAt(i)) | 0;
+      rng = () => {
+        s = (s + 0x6D2B79F5) | 0;
+        let t = Math.imul(s ^ (s >>> 15), 1 | s);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
     const t0 = performance.now();
     let streamed = "";
     const res = await model.decode(ids, {
       maxNewTokens: maxNew,
       temperature: Number.isFinite(temp) ? temp : 0.8,
-      topK: 40,
+      topK,
+      topP: Number.isFinite(topP) && topP > 0 ? topP : 0,
+      stopTokens,
+      rng,
       debugNaN: true,
       onToken: (tok, logits, tokens) => {
         const piece = model.tokenizer ? model.tokenizer.decode([tok]) : "";
@@ -136,7 +168,10 @@ async function generate() {
     });
     const ms = performance.now() - t0;
     const gen = res.tokens.slice(ids.length);
-    out.text = model.tokenizer ? model.tokenizer.decode(Array.from(gen)) : "";
+    // Trim a trailing stop token from the DISPLAYED text (it stays in tokenIds).
+    const display = gen.length && stopTokens.indexOf(gen[gen.length - 1]) !== -1 ? gen.slice(0, -1) : gen;
+    out.text = model.tokenizer ? model.tokenizer.decode(Array.from(display)) : "";
+    out.stopped = !!res.stopped;
     out.tokenIds = Array.from(gen).slice(0, 64);
     const lg = res.logits && res.logits.length ? res.logits[res.logits.length - 1] : null;
     if (lg) {
@@ -153,7 +188,7 @@ async function generate() {
     out.ms = ms;
     $("output").textContent = out.text;
     $("stats").textContent = `${out.generatedTokens} tokens in ${(ms / 1000).toFixed(1)}s · ` +
-      `${out.tokPerSec.toFixed(2)} tok/s · adapter: ${out.adapter || "CPU fallback"} · ` +
+      `${out.tokPerSec.toFixed(2)} tok/s · ${out.stopped ? "stopped at boundary · " : ""}adapter: ${out.adapter || "CPU fallback"} · ` +
       `prompt: ${out.promptTokens} tok`;
     status("done");
   } catch (e) {
@@ -208,7 +243,11 @@ async function generate() {
     if (p.get("prompt") != null) $("prompt").value = p.get("prompt");
     if (p.get("tokens")) $("tokens").value = p.get("tokens");
     if (p.get("temp")) $("temp").value = p.get("temp");
+    if (p.get("topk")) $("topk").value = p.get("topk");
+    if (p.get("topp")) $("topp").value = p.get("topp");
+    if (p.get("seed")) $("seed").value = p.get("seed");
     if (p.get("chat") === "0") $("chat").checked = false;
+    if (p.get("stop") === "0") $("stop").checked = false;
     if (p.get("binary") === "0") $("binary").checked = false;
     await generate();
   }

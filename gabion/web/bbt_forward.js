@@ -924,8 +924,9 @@
       return { logits: Float32Array.from(logitsT.data), state };
     }
 
-    /** Sample from logits with temperature + optional top-k (argmax when temperature <= 0). */
-    _sample(logits, temperature = 1.0, topK = 0) {
+    /** Sample from logits with temperature + optional top-k/top-p (argmax when temperature <= 0).
+     *  rng: () => [0,1); topP: nucleus threshold applied after top-k. */
+    _sample(logits, temperature = 1.0, topK = 0, topP = 0, rng = Math.random) {
       const n = logits.length;
       if (temperature <= 0 || n <= 1) {
         let best = 0;
@@ -941,6 +942,18 @@
         const cutoff = scaled[idx[topK - 1]];
         for (let i = 0; i < n; i++) if (scaled[i] < cutoff) scaled[i] = -Infinity;
       }
+      if (topP > 0 && topP < 1) {
+        // nucleus: keep the smallest set of tokens whose cumulative prob >= topP
+        const idx = Array.from({ length: n }, (_, i) => i).sort((a, b) => scaled[b] - scaled[a]);
+        let sumAll = 0;
+        for (let i = 0; i < n; i++) sumAll += Math.exp(scaled[i] - maxV);
+        let cum = 0;
+        for (let j = 0; j < n; j++) {
+          const e = Math.exp(scaled[idx[j]] - maxV);
+          cum += e / sumAll;
+          if (j > 0 && cum >= topP) { for (let jj = j; jj < n; jj++) scaled[idx[jj]] = -Infinity; break; }
+        }
+      }
       let sumE = 0;
       for (let i = 0; i < n; i++) sumE += Math.exp(scaled[i] - maxV);
       let r = Math.random() * sumE;
@@ -953,17 +966,23 @@
 
     /**
      * Autoregressive generation from a prompt.
-     * opts: { temperature=1.0, topK=0, maxNewTokens=64, maxLen, ternarize=false, state, onToken }
-     * Returns { tokens: number[], logits: Float32Array[], state }.
+     * opts: { temperature=1.0, topK=0, topP=0, stopTokens=[], maxNewTokens=64, maxLen,
+     *         ternarize=false, state, onToken, rng }
+     * Sampling stops when a token in stopTokens is sampled (it stays in `tokens`)
+     * or the context fills. Returns { tokens, logits, state, stopped }.
      */
     async decode(tokenIds, opts = {}) {
       const maxNew = opts.maxNewTokens != null ? opts.maxNewTokens : 64;
       const temperature = opts.temperature != null ? opts.temperature : 1.0;
       const topK = opts.topK || 0;
+      const topP = opts.topP || 0;
+      const stopTokens = opts.stopTokens || [];
+      const rng = opts.rng || Math.random;
       const ternarize = !!opts.ternarize;
       const state = opts.state || this.initKVCache(opts.maxLen);
       const tokens = [...tokenIds];
       const logitsList = [];
+      let stopped = false;
       // Prime the cache / prefix with the FULL prompt first: decodeStep sees one
       // token at a time, so every prompt token except the last must be fed before
       // generation starts (the last prompt token is consumed by the first step).
@@ -974,12 +993,13 @@
       for (let i = 0; i < maxNew; i++) {
         if (state.pos >= state.maxLen) break; // context full
         const { logits, state: st } = await this.decodeStep(tokens[tokens.length - 1], state, ternarize, !!opts.debugNaN);
-        const next = this._sample(logits, temperature, topK);
+        const next = this._sample(logits, temperature, topK, topP, rng);
         tokens.push(next);
         logitsList.push(logits);
         if (opts.onToken) opts.onToken(next, logits, tokens);
+        if (stopTokens.indexOf(next) !== -1) { stopped = true; break; }
       }
-      return { tokens, logits: logitsList, state };
+      return { tokens, logits: logitsList, state, stopped };
     }
   }
 
