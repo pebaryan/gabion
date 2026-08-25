@@ -88,6 +88,14 @@
       if (!this.tieWeights && !this.lean) {
         this.lmHead = new nn.Linear(this.D, this.V);
       }
+      // Norm eps: RMSNorm instances default to 1e-6; the model config (e.g.
+      // lfm2 norm_eps=1e-5) must win. A wrong eps is a small per-norm error
+      // that accumulates across layers.
+      for (let l = 0; l < this.L; l++) {
+        this.layers[l].norm1.eps = this.eps;
+        this.layers[l].norm2.eps = this.eps;
+      }
+      this.normF.eps = this.eps;
 
       // Precompute RoPE inverse frequencies: [headDim/2]
       const halfDim = this.headDim / 2;
@@ -114,6 +122,40 @@
       // GPU buffers for RoPE tables (lazy-initialized, non-parameter)
       this._ropeCosBuf = null;
       this._ropeSinBuf = null;
+    }
+
+    /**
+     * CPU kv-cache attention (no WebGPU): per query head bh, softmax over
+     * cache slots j <= pos of q·k·scale, weighted sum of v. GQA: query head
+     * bh uses kv head (bh * kvH) / H. Cache layout [kvH, maxLen, headDim].
+     */
+    _cpuKvAttention(q, kCache, vCache, pos, kvH, H, hd) {
+      const out = new Float32Array(H * hd);
+      const scale = 1 / Math.sqrt(hd);
+      const maxLen = kCache.length / (kvH * hd);
+      const scores = new Float32Array(maxLen);
+      for (let bh = 0; bh < H; bh++) {
+        const kv = Math.floor((bh * kvH) / H);
+        const qOff = bh * hd;
+        const kBase = kv * maxLen * hd;
+        let maxS = -Infinity;
+        for (let j = 0; j <= pos; j++) {
+          let s = 0;
+          const kb = kBase + j * hd;
+          for (let i = 0; i < hd; i++) s += q[qOff + i] * kCache[kb + i];
+          scores[j] = s * scale;
+          if (scores[j] > maxS) maxS = scores[j];
+        }
+        let sum = 0;
+        for (let j = 0; j <= pos; j++) { scores[j] = Math.exp(scores[j] - maxS); sum += scores[j]; }
+        const vBase = kv * maxLen * hd;
+        for (let i = 0; i < hd; i++) {
+          let acc = 0;
+          for (let j = 0; j <= pos; j++) acc += scores[j] * vCache[vBase + j * hd + i];
+          out[qOff + i] = acc / sum;
+        }
+      }
+      return out;
     }
 
     /**
@@ -167,8 +209,8 @@
       for (let l = 0; l < this.L; l++) {
         const bl = this.layers[l];
         if (this.arch === "lfm2") {
-          // layout: attn [norm1,q,k,v,qn,kn,o, gate_up,norm2,down]
-          //         conv [norm1,in_proj,convW,out_proj, gate_up,norm2,down]
+          // layout: attn [norm1,q,k,v,qn,kn,o, norm2,gate_up,down]
+          //         conv [norm1,in_proj,convW,out_proj, norm2,gate_up,down]
           take(bl.norm1.weight);
           if (bl.isConv) {
             take(bl.inProj.weight, uploadToGPU);
@@ -189,8 +231,8 @@
           take(bl.o.weight, uploadToGPU);
           take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
         }
+        take(bl.norm2.weight);          // CPU (1D) — exporter order: norm2 BEFORE gate_up
         take(bl.gateUp.weight, uploadToGPU);
-        take(bl.norm2.weight);          // CPU (1D)
         take(bl.down.weight, uploadToGPU);
       }
       take(this.normF.weight);
@@ -234,8 +276,8 @@
           take(bl.o.weight, uploadToGPU);
           take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
         }
+        take(bl.norm2.weight);          // CPU (1D) — exporter order: norm2 BEFORE gate_up
         take(bl.gateUp.weight, uploadToGPU);
-        take(bl.norm2.weight);          // CPU (1D)
         take(bl.down.weight, uploadToGPU);
       }
       return cursor;
@@ -981,8 +1023,14 @@
           // Append k/v into the cache at position pos ([kvH, maxLen, headDim] layout)
           const kCache = state.kCaches[l], vCache = state.vCaches[l];
           for (let kv = 0; kv < kvH; kv++) {
-            backend.writeBufferAt(kCache.gpuBuffer, k.data.subarray(kv * headDim, (kv + 1) * headDim), (kv * state.maxLen + pos) * headDim);
-            backend.writeBufferAt(vCache.gpuBuffer, v.data.subarray(kv * headDim, (kv + 1) * headDim), (kv * state.maxLen + pos) * headDim);
+            const kOff = (kv * state.maxLen + pos) * headDim;
+            if (backend) {
+              backend.writeBufferAt(kCache.gpuBuffer, k.data.subarray(kv * headDim, (kv + 1) * headDim), kOff);
+              backend.writeBufferAt(vCache.gpuBuffer, v.data.subarray(kv * headDim, (kv + 1) * headDim), kOff);
+            } else {
+              kCache.data.set(k.data.subarray(kv * headDim, (kv + 1) * headDim), kOff);
+              vCache.data.set(v.data.subarray(kv * headDim, (kv + 1) * headDim), kOff);
+            }
           }
 
           // Attend over the prefix (0..pos) via the KV-cache kernels (GQA: query
@@ -990,10 +1038,11 @@
           // The cache is [kvH, maxLen, headDim] with slots > pos uninitialized, so
           // causal=1 masks j > pos to -inf BEFORE any cache read (kernels do this);
           // L stays maxLen (it doubles as the cache row stride in the kernels).
-          const qT = Tensor.fromArray(q.data, [BH, headDim], false).toGPU();
-          const y = kvAttention(qT, kCache, vCache, { causal: true, pos, kvH, H });
-          // toCPU() returns the Tensor (data updated in place) — take .data
-          const yData = (await y.toCPU()).data;
+          const yData = backend
+            ? (await (await kvAttention(
+                Tensor.fromArray(q.data, [BH, headDim], false).toGPU(),
+                kCache, vCache, { causal: true, pos, kvH, H })).toCPU()).data
+            : this._cpuKvAttention(q.data, kCache.data, vCache.data, pos, kvH, H, headDim);
           chk("layer" + l + ".attn", yData);
 
           // Reshape back, output projection, residual
@@ -1014,6 +1063,7 @@
           chk("layer" + l + ".h2", h2.data);
           x = x.add(h2);
           chk("layer" + l + ".x2", x.data);
+          if (state.trace && state.trace[l]) state.trace[l](x.data);
         }
         outData.set(x.data, r * D);
       }
@@ -1043,7 +1093,10 @@
       };
 
       // CPU fallback: prefix forward, last predicted row (exact reference semantics)
-      if (!backend) {
+      // LFM2 (hybrid conv layers) always uses the forwardHidden path — the llama
+      // forward() has no shortconv branch and would run conv layers with zeroed
+      // q/k/v weights. forwardHidden's attention has its own CPU fallback.
+      if (!backend && this.arch !== "lfm2") {
         if (!state._prefix) state._prefix = [];
         state._prefix.push(tokenId);
         const T = pos + 2;
