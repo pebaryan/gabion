@@ -30,6 +30,7 @@
       layerTypes: c.layer_types ? c.layer_types.slice(start, start + L) : null,
       convLCache: c.conv_l_cache || 3, normEps: c.norm_eps,
       headDim: c.head_dim,
+      ropeDim: c.rope_dim, ssm: c.ssm,
       qBiases: data.q_bias ? data.q_bias.slice(start, start + L).map(a => new Float32Array(a)) : null,
       kBiases: data.k_bias ? data.k_bias.slice(start, start + L).map(a => new Float32Array(a)) : null,
       vBiases: data.v_bias ? data.v_bias.slice(start, start + L).map(a => new Float32Array(a)) : null,
