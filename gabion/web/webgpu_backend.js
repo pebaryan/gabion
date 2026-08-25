@@ -590,6 +590,155 @@
       return dwBuf;
     }
 
+    // --- Normalization kernels ---
+
+    /** Pack the shared norm Params struct (N, C, rest u32 + eps f32 + 2 flags), 24 bytes. */
+    _normUniform(P) {
+      const ab = new ArrayBuffer(24);
+      new Uint32Array(ab, 0, 3).set([P.N, P.C, P.rest]);
+      new Float32Array(ab, 12, 1).set([P.eps]);
+      new Uint32Array(ab, 16, 2).set([P.hasWeight, P.hasBias]);
+      return new Uint8Array(ab);
+    }
+
+    /** BatchNorm training stats: per-channel mean/var. x: [N*C*rest]. Returns {meanBuf, varBuf} [C]. */
+    batchnormStats(xBuf, P) {
+      const pipeline = this.getPipeline("batchnorm_stats");
+      const uniformBuf = this.createUniformBuffer(this._normUniform(P));
+      const meanBuf = this.createEmptyBuffer(P.C * 4);
+      const varBuf = this.createEmptyBuffer(P.C * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: meanBuf } },
+          { binding: 3, resource: { buffer: varBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.C / 256), 1, 1, uniformBuf);
+      return { meanBuf, varBuf };
+    }
+
+    /** BatchNorm apply. gamma/beta optional (hasWeight/hasBias). Returns outBuf [N*C*rest]. */
+    batchnormFwd(xBuf, meanBuf, varBuf, gammaBuf, betaBuf, P) {
+      const pipeline = this.getPipeline("batchnorm_fwd");
+      const uniformBuf = this.createUniformBuffer(this._normUniform(P));
+      const outBuf = this.createEmptyBuffer(P.N * P.C * P.rest * 4);
+      const dummy = this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: meanBuf } },
+          { binding: 3, resource: { buffer: varBuf } },
+          { binding: 4, resource: { buffer: gammaBuf || dummy } },
+          { binding: 5, resource: { buffer: betaBuf || dummy } },
+          { binding: 6, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.N * P.C * P.rest / 256), 1, 1, uniformBuf);
+      if (!gammaBuf || !betaBuf) dummy.destroy();
+      return outBuf;
+    }
+
+    /**
+     * BatchNorm backward stats: per-channel sumG, sumGY, dgamma, dbeta.
+     * Returns {sumGBuf, sumGYBuf, dgammaBuf, dbetaBuf}, all [C].
+     */
+    batchnormBwdStats(xBuf, goutBuf, gammaBuf, meanBuf, varBuf, P) {
+      const pipeline = this.getPipeline("batchnorm_bwd_stats");
+      const uniformBuf = this.createUniformBuffer(this._normUniform(P));
+      const sumGBuf = this.createEmptyBuffer(P.C * 4);
+      const sumGYBuf = this.createEmptyBuffer(P.C * 4);
+      const dgammaBuf = this.createEmptyBuffer(P.C * 4);
+      const dbetaBuf = this.createEmptyBuffer(P.C * 4);
+      const dummy = this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: goutBuf } },
+          { binding: 3, resource: { buffer: gammaBuf || dummy } },
+          { binding: 4, resource: { buffer: meanBuf } },
+          { binding: 5, resource: { buffer: varBuf } },
+          { binding: 6, resource: { buffer: sumGBuf } },
+          { binding: 7, resource: { buffer: sumGYBuf } },
+          { binding: 8, resource: { buffer: dgammaBuf } },
+          { binding: 9, resource: { buffer: dbetaBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.C / 256), 1, 1, uniformBuf);
+      if (!gammaBuf) dummy.destroy();
+      return { sumGBuf, sumGYBuf, dgammaBuf, dbetaBuf };
+    }
+
+    /** BatchNorm input gradient. Returns dxBuf [N*C*rest]. */
+    batchnormBwdDx(xBuf, goutBuf, gammaBuf, meanBuf, varBuf, sumGBuf, sumGYBuf, P) {
+      const pipeline = this.getPipeline("batchnorm_bwd_dx");
+      const uniformBuf = this.createUniformBuffer(this._normUniform(P));
+      const dxBuf = this.createEmptyBuffer(P.N * P.C * P.rest * 4);
+      const dummy = this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: goutBuf } },
+          { binding: 3, resource: { buffer: gammaBuf || dummy } },
+          { binding: 4, resource: { buffer: meanBuf } },
+          { binding: 5, resource: { buffer: varBuf } },
+          { binding: 6, resource: { buffer: sumGBuf } },
+          { binding: 7, resource: { buffer: sumGYBuf } },
+          { binding: 8, resource: { buffer: dxBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.N * P.C * P.rest / 256), 1, 1, uniformBuf);
+      if (!gammaBuf) dummy.destroy();
+      return dxBuf;
+    }
+
+    /** NCHW channel affine (GroupNorm tail). x: [N*C*rest], w: [C], b: [C] or null. Returns outBuf. */
+    affineChannel(xBuf, wBuf, bBuf, P) {
+      const pipeline = this.getPipeline("affine_channel");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.N, P.C, P.rest, P.hasBias]));
+      const outBuf = this.createEmptyBuffer(P.N * P.C * P.rest * 4);
+      const dummy = this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: wBuf } },
+          { binding: 3, resource: { buffer: bBuf || dummy } },
+          { binding: 4, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.N * P.C * P.rest / 256), 1, 1, uniformBuf);
+      if (!bBuf) dummy.destroy();
+      return outBuf;
+    }
+
+    /** Channel-affine weight gradient. Returns dwBuf [C]. */
+    affineChannelBwdDw(xBuf, goutBuf, P) {
+      const pipeline = this.getPipeline("affine_channel_bwd_dw");
+      const uniformBuf = this.createUniformBuffer(new Uint32Array([P.N, P.C, P.rest, P.hasBias]));
+      const dwBuf = this.createEmptyBuffer(P.C * 4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: goutBuf } },
+          { binding: 3, resource: { buffer: dwBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, Math.ceil(P.C / 256), 1, 1, uniformBuf);
+      return dwBuf;
+    }
+
     /**
      * Dispatch row-wise reduction.
      * op: 0=sum, 1=max, 2=sumSquares

@@ -296,7 +296,123 @@ const report = {};
   report.ct_db = maxAbs(dbK, bt.grad);
 }
 
+// ---- BatchNorm fwd + bwd (train mode) ----
+{
+  const rng = (() => { let s = 13579; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
+  const N = 2, C = 3, rest = 4, eps = 1e-5, cnt = N * rest;
+  const x = new Float32Array(N * C * rest), gout = new Float32Array(N * C * rest);
+  for (let i = 0; i < x.length; i++) x[i] = (rng() * 2 - 1) * 2;
+  for (let i = 0; i < gout.length; i++) gout[i] = rng() * 2 - 1;
+  const wArr = Float32Array.from([1.1, 0.9, 1.0]);
+  const bArr = Float32Array.from([0.1, -0.1, 0.05]);
+
+  // CPU reference via the engine module (train mode)
+  const prevTraining = tg.training;
+  tg.training = true;
+  const bn = new tg.nn.BatchNorm(C, { momentum: 0.1, eps });
+  bn.weight.data.set(wArr);
+  bn.bias.data.set(bArr);
+  const xt = Tensor.fromArray(x, [N, C, rest], true);
+  const bnRef = bn.forward(xt);
+  const cpuY = Float32Array.from(bnRef.data);
+  bnRef.grad = Float32Array.from(gout);
+  bnRef._backward(bnRef.grad);
+  tg.training = prevTraining;
+
+  // WGSL batchnorm_stats + batchnorm_fwd transpiled
+  const mean = new Float32Array(C), varv = new Float32Array(C);
+  for (let c = 0; c < C; c++) {
+    let s = 0;
+    for (let n = 0; n < N; n++) { const off = (n * C + c) * rest; for (let i = 0; i < rest; i++) s += x[off + i]; }
+    mean[c] = s / cnt;
+    let v = 0;
+    for (let n = 0; n < N; n++) { const off = (n * C + c) * rest; for (let i = 0; i < rest; i++) { const d = x[off + i] - mean[c]; v += d * d; } }
+    varv[c] = v / cnt;
+  }
+  const yK = new Float32Array(N * C * rest);
+  for (let idx = 0; idx < yK.length; idx++) {
+    const c = ((idx / rest) | 0) % C;
+    yK[idx] = (x[idx] - mean[c]) / Math.sqrt(varv[c] + eps) * wArr[c] + bArr[c];
+  }
+  report.bn_fwd = maxAbs(yK, cpuY);
+
+  // WGSL batchnorm_bwd_stats + batchnorm_bwd_dx transpiled
+  const sumG = new Float32Array(C), sumGY = new Float32Array(C), dg = new Float32Array(C), db = new Float32Array(C);
+  for (let c = 0; c < C; c++) {
+    const inv = 1 / Math.sqrt(varv[c] + eps), wc = wArr[c];
+    for (let n = 0; n < N; n++) {
+      const off = (n * C + c) * rest;
+      for (let i = 0; i < rest; i++) {
+        const yhat = (x[off + i] - mean[c]) * inv;
+        sumG[c] += gout[off + i] * wc;
+        sumGY[c] += gout[off + i] * wc * yhat;
+        dg[c] += gout[off + i] * yhat;
+        db[c] += gout[off + i];
+      }
+    }
+  }
+  const dxK = new Float32Array(N * C * rest);
+  for (let idx = 0; idx < dxK.length; idx++) {
+    const c = ((idx / rest) | 0) % C;
+    const inv = 1 / Math.sqrt(varv[c] + eps);
+    const yhat = (x[idx] - mean[c]) * inv;
+    dxK[idx] = inv * (gout[idx] * wArr[c] - sumG[c] / cnt - yhat * sumGY[c] / cnt);
+  }
+  report.bn_dx = maxAbs(dxK, xt.grad);
+  report.bn_dgamma = maxAbs(dg, bn.weight.grad);
+  report.bn_dbeta = maxAbs(db, bn.bias.grad);
+}
+
+// ---- Affine channel (GroupNorm tail) fwd + bwd ----
+{
+  const rng = (() => { let s = 24680; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
+  const N = 2, C = 4, rest = 6;
+  const x = new Float32Array(N * C * rest), gout = new Float32Array(N * C * rest);
+  const wArr = new Float32Array(C), bArr = new Float32Array(C);
+  for (let i = 0; i < x.length; i++) x[i] = rng() * 2 - 1;
+  for (let i = 0; i < gout.length; i++) gout[i] = rng() * 2 - 1;
+  for (let c = 0; c < C; c++) { wArr[c] = 0.5 + rng() * 0.5; bArr[c] = (rng() * 2 - 1) * 0.1; }
+
+  // CPU reference via the engine op
+  const xt = Tensor.fromArray(x, [N, C, rest], true);
+  const wt = Tensor.fromArray(wArr, [C], true);
+  const bt = Tensor.fromArray(bArr, [C], true);
+  const at = xt.affineChannel(wt, bt);
+  const cpuY = Float32Array.from(at.data);
+  at.grad = Float32Array.from(gout);
+  at._backward(at.grad);
+
+  // WGSL affine_channel transpiled
+  const yK = new Float32Array(N * C * rest);
+  for (let idx = 0; idx < yK.length; idx++) {
+    const c = ((idx / rest) | 0) % C;
+    yK[idx] = x[idx] * wArr[c] + bArr[c];
+  }
+  report.aff_fwd = maxAbs(yK, cpuY);
+
+  // WGSL affine_channel_bwd_dw transpiled + dx = gout*w + db = sum
+  const dwK = new Float32Array(C);
+  const dxK = new Float32Array(N * C * rest);
+  const dbK = new Float32Array(C);
+  for (let c = 0; c < C; c++) {
+    let s = 0;
+    for (let n = 0; n < N; n++) {
+      const off = (n * C + c) * rest;
+      for (let i = 0; i < rest; i++) {
+        s += gout[off + i] * x[off + i];
+        dxK[off + i] = gout[off + i] * wArr[c];
+        dbK[c] += gout[off + i];
+      }
+    }
+    dwK[c] = s;
+  }
+  report.aff_dx = maxAbs(dxK, xt.grad);
+  report.aff_dw = maxAbs(dwK, wt.grad);
+  report.aff_db = maxAbs(dbK, bt.grad);
+}
+
 const convChecks = [report.conv2d_fwd, report.conv2d_dx, report.conv2d_dw, report.conv2d_db, report.ct_fwd, report.ct_dx, report.ct_dw, report.ct_db];
-if (convChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
+const normChecks = [report.bn_fwd, report.bn_dx, report.bn_dgamma, report.bn_dbeta, report.aff_fwd, report.aff_dx, report.aff_dw, report.aff_db];
+if (convChecks.some((v) => !(v < 1e-4)) || normChecks.some((v) => !(v < 1e-4))) process.exitCode = 2;
 
 console.log(JSON.stringify(report, null, 2));

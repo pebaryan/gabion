@@ -947,7 +947,8 @@
       }
       const req = this.requiresGrad || weight.requiresGrad || !!(bias && bias.requiresGrad);
       const parents = bias ? [this, weight, bias] : [this, weight];
-      return new Tensor(out, [...this.shape], req, parents, (gout) => {
+      const P = { N, C, rest, hasBias: bias ? 1 : 0 };
+      const cpuBackward = (gout) => {
         if (this.requiresGrad) {
           if (!this.grad) this.grad = new Float32Array(this.numel);
           for (let n = 0; n < N; n++) for (let c = 0; c < C; c++) {
@@ -973,7 +974,25 @@
             bias.grad[c] += s;
           }
         }
-      });
+      };
+      const backend = gpu();
+      if (backend && this.onGPU && weight.onGPU && (!bias || bias.onGPU)) {
+        const outBuf = backend.affineChannel(this.gpuBuffer, weight.gpuBuffer, bias ? bias.gpuBuffer : null, P);
+        return new Tensor(new Float32Array(this.numel), [...this.shape], req, parents, (gout, goutBuf) => {
+          if (goutBuf && backend) {
+            if (this.requiresGrad) this._pendingGradBuf = backend.elementwise(goutBuf, weight.gpuBuffer, this.numel, 1);
+            if (weight.requiresGrad) weight._pendingGradBuf = backend.affineChannelBwdDw(this.gpuBuffer, goutBuf, P);
+            if (bias && bias.requiresGrad) {
+              // reuse conv_bwd_db: reduce gout over [N, C, rest] per channel (Ho=rest, Wo=1)
+              const dbP = { N, Cin: 1, H: 1, W: 1, Cout: C, Ho: rest, Wo: 1, kH: 1, kW: 1, groups: 1, cinPerG: 1, coutPerG: C, sH: 1, sW: 1, dH: 1, dW: 1, pH: 0, pW: 0, hasBias: 1 };
+              bias._pendingGradBuf = backend.convBwdDb(goutBuf, dbP);
+            }
+          } else {
+            cpuBackward(gout);
+          }
+        }, outBuf, "gpu");
+      }
+      return new Tensor(out, [...this.shape], req, parents, cpuBackward);
     }
 
     /** Elementwise absolute value. Backward: sign(x). */
@@ -2662,40 +2681,29 @@
       const parents = [x];
       if (this.weight) parents.push(this.weight);
       if (this.bias) parents.push(this.bias);
-      return new Tensor(out, [...x.shape], req, parents, (gout) => {
-        if (!x.requiresGrad) return;
-        if (!x.grad) x.grad = new Float32Array(x.numel);
-        for (let n = 0; n < N; n++) for (let c = 0; c < C; c++) {
-          const off = (n * C + c) * rest;
-          const wc = w ? w[c] : 1;
-          let sumG = 0, sumGY = 0;
-          for (let i = 0; i < rest; i++) {
-            const yhat = (xd[off + i] - mean[c]) * inv[c];
-            sumG += gout[off + i] * wc;
-            sumGY += gout[off + i] * wc * yhat;
-          }
-          const cnt = N * rest;
-          // Use per-channel reduction over all N later — first pass local only is wrong.
-          // Full channel reduction:
-        }
-        // proper channel-wide stats
-        for (let c = 0; c < C; c++) {
-          let sumG = 0, sumGY = 0;
-          const wc = w ? w[c] : 1;
-          for (let n = 0; n < N; n++) {
-            const off = (n * C + c) * rest;
-            for (let i = 0; i < rest; i++) {
-              const yhat = (xd[off + i] - mean[c]) * inv[c];
-              sumG += gout[off + i] * wc;
-              sumGY += gout[off + i] * wc * yhat;
+      const P = { N, C, rest, hasWeight: this.weight ? 1 : 0, hasBias: this.bias ? 1 : 0 };
+      const cpuBackward = (gout) => {
+        if (!x.requiresGrad && !(this.weight && this.weight.requiresGrad) && !(this.bias && this.bias.requiresGrad)) return;
+        const cnt = N * rest;
+        if (x.requiresGrad) {
+          if (!x.grad) x.grad = new Float32Array(x.numel);
+          for (let c = 0; c < C; c++) {
+            let sumG = 0, sumGY = 0;
+            const wc = w ? w[c] : 1;
+            for (let n = 0; n < N; n++) {
+              const off = (n * C + c) * rest;
+              for (let i = 0; i < rest; i++) {
+                const yhat = (xd[off + i] - mean[c]) * inv[c];
+                sumG += gout[off + i] * wc;
+                sumGY += gout[off + i] * wc * yhat;
+              }
             }
-          }
-          const cnt = N * rest;
-          for (let n = 0; n < N; n++) {
-            const off = (n * C + c) * rest;
-            for (let i = 0; i < rest; i++) {
-              const yhat = (xd[off + i] - mean[c]) * inv[c];
-              x.grad[off + i] += inv[c] * (gout[off + i] * wc - sumG / cnt - yhat * sumGY / cnt);
+            for (let n = 0; n < N; n++) {
+              const off = (n * C + c) * rest;
+              for (let i = 0; i < rest; i++) {
+                const yhat = (xd[off + i] - mean[c]) * inv[c];
+                x.grad[off + i] += inv[c] * (gout[off + i] * wc - sumG / cnt - yhat * sumGY / cnt);
+              }
             }
           }
         }
@@ -2721,7 +2729,46 @@
             this.bias.grad[c] += s;
           }
         }
-      });
+      };
+      const backend = gpu();
+      if (backend && x.onGPU) {
+        if (this.weight) this.weight.toGPU();
+        if (this.bias) this.bias.toGPU();
+        const gammaBuf = this.weight ? this.weight.gpuBuffer : null;
+        const betaBuf = this.bias ? this.bias.gpuBuffer : null;
+        let meanBuf, varBuf;
+        if (train) {
+          const st = backend.batchnormStats(x.gpuBuffer, P);
+          meanBuf = st.meanBuf;
+          varBuf = st.varBuf;
+          // fire-and-forget running-stats update (matches the CPU momentum formula)
+          Promise.all([backend.readBuffer(meanBuf, C), backend.readBuffer(varBuf, C)]).then(([m, v]) => {
+            for (let c = 0; c < C; c++) {
+              this.runningMean[c] = (1 - this.momentum) * this.runningMean[c] + this.momentum * m[c];
+              this.runningVar[c] = (1 - this.momentum) * this.runningVar[c] + this.momentum * v[c];
+            }
+          });
+        } else {
+          meanBuf = backend.createBufferFromData(Float32Array.from(this.runningMean));
+          varBuf = backend.createBufferFromData(Float32Array.from(this.runningVar));
+        }
+        const outBuf = backend.batchnormFwd(x.gpuBuffer, meanBuf, varBuf, gammaBuf, betaBuf, P);
+        return new Tensor(new Float32Array(x.numel), [...x.shape], req, parents, (gout, goutBuf) => {
+          if (goutBuf && backend) {
+            const st = backend.batchnormBwdStats(x.gpuBuffer, goutBuf, gammaBuf, meanBuf, varBuf, P);
+            if (x.requiresGrad) {
+              x._pendingGradBuf = backend.batchnormBwdDx(x.gpuBuffer, goutBuf, gammaBuf, meanBuf, varBuf, st.sumGBuf, st.sumGYBuf, P);
+            }
+            if (this.weight && this.weight.requiresGrad) this.weight._pendingGradBuf = st.dgammaBuf;
+            if (this.bias && this.bias.requiresGrad) this.bias._pendingGradBuf = st.dbetaBuf;
+            backend.releaseBuffer(st.sumGBuf);
+            backend.releaseBuffer(st.sumGYBuf);
+          } else {
+            cpuBackward(gout);
+          }
+        }, outBuf, "gpu");
+      }
+      return new Tensor(out, [...x.shape], req, parents, cpuBackward);
     }
   }
 
