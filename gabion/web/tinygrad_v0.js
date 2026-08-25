@@ -523,6 +523,200 @@
       });
     }
 
+    /** Add a 1D bias [C] onto [..., C]. */
+    addBroadcastLast(bias) {
+      const C = this.shape[this.shape.length - 1];
+      if (bias.numel !== C) throw new Error("addBroadcastLast bias mismatch");
+      const n = this.numel;
+      const rows = n / C;
+      const out = new Float32Array(n);
+      for (let r = 0; r < rows; r++) {
+        const off = r * C;
+        for (let j = 0; j < C; j++) out[off + j] = this.data[off + j] + bias.data[j];
+      }
+      const req = this.requiresGrad || bias.requiresGrad;
+      return new Tensor(out, [...this.shape], req, [this, bias], (gout) => {
+        if (this.requiresGrad) {
+          if (!this.grad) this.grad = new Float32Array(n);
+          for (let i = 0; i < n; i++) this.grad[i] += gout[i];
+        }
+        if (bias.requiresGrad) {
+          if (!bias.grad) bias.grad = new Float32Array(C);
+          for (let r = 0; r < rows; r++) {
+            const off = r * C;
+            for (let j = 0; j < C; j++) bias.grad[j] += gout[off + j];
+          }
+        }
+      });
+    }
+
+    /** Sigmoid. */
+    sigmoid() {
+      const n = this.numel;
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = 1 / (1 + Math.exp(-this.data[i]));
+      const s = out;
+      return new Tensor(out, [...this.shape], this.requiresGrad, [this], (gout) => {
+        if (!this.requiresGrad) return;
+        if (!this.grad) this.grad = new Float32Array(n);
+        for (let i = 0; i < n; i++) this.grad[i] += gout[i] * s[i] * (1 - s[i]);
+      });
+    }
+
+    /** Tanh. */
+    tanh() {
+      const n = this.numel;
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = Math.tanh(this.data[i]);
+      const y = out;
+      return new Tensor(out, [...this.shape], this.requiresGrad, [this], (gout) => {
+        if (!this.requiresGrad) return;
+        if (!this.grad) this.grad = new Float32Array(n);
+        for (let i = 0; i < n; i++) this.grad[i] += gout[i] * (1 - y[i] * y[i]);
+      });
+    }
+
+    /**
+     * NCHW conv2d, groups=1, dilation=1. weight [Cout,Cin,kH,kW], bias [Cout] optional.
+     * padding/stride: number or [h,w].
+     */
+    conv2d(weight, bias = null, groups = 1, stride = 1, dilation = 1, padding = 0) {
+      if (this.shape.length !== 4) throw new Error(`conv2d input must be NCHW, got ${this.shape}`);
+      if (weight.shape.length !== 4) throw new Error(`conv2d weight must be OIHW, got ${weight.shape}`);
+      if (groups !== 1) throw new Error("conv2d groups!=1 not implemented");
+      const dilH = Array.isArray(dilation) ? dilation[0] : dilation;
+      const dilW = Array.isArray(dilation) ? dilation[1] : dilation;
+      if (dilH !== 1 || dilW !== 1) throw new Error("conv2d dilation!=1 not implemented");
+      const [N, Cin, H, W] = this.shape;
+      const [Cout, CinW, kH, kW] = weight.shape;
+      if (CinW !== Cin) throw new Error(`conv2d Cin mismatch ${Cin} vs ${CinW}`);
+      const sH = Array.isArray(stride) ? stride[0] : stride;
+      const sW = Array.isArray(stride) ? stride[1] : stride;
+      const pH = Array.isArray(padding) ? padding[0] : padding;
+      const pW = Array.isArray(padding) ? padding[1] : padding;
+      const Ho = Math.floor((H + 2 * pH - kH) / sH) + 1;
+      const Wo = Math.floor((W + 2 * pW - kW) / sW) + 1;
+      if (Ho <= 0 || Wo <= 0) throw new Error(`conv2d empty output H=${H} W=${W} k=${kH}x${kW}`);
+      const x = this.data, w = weight.data, b = bias ? bias.data : null;
+      const out = new Float32Array(N * Cout * Ho * Wo);
+      const xStr = [Cin * H * W, H * W, W, 1];
+      const wStr = [Cin * kH * kW, kH * kW, kW, 1];
+      const oStr = [Cout * Ho * Wo, Ho * Wo, Wo, 1];
+      for (let n = 0; n < N; n++) {
+        for (let oc = 0; oc < Cout; oc++) {
+          for (let oh = 0; oh < Ho; oh++) {
+            for (let ow = 0; ow < Wo; ow++) {
+              let acc = b ? b[oc] : 0;
+              const ih0 = oh * sH - pH;
+              const iw0 = ow * sW - pW;
+              for (let ic = 0; ic < Cin; ic++) {
+                for (let kh = 0; kh < kH; kh++) {
+                  const ih = ih0 + kh;
+                  if (ih < 0 || ih >= H) continue;
+                  for (let kw = 0; kw < kW; kw++) {
+                    const iw = iw0 + kw;
+                    if (iw < 0 || iw >= W) continue;
+                    acc += x[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw] *
+                           w[oc * wStr[0] + ic * wStr[1] + kh * wStr[2] + kw];
+                  }
+                }
+              }
+              out[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow] = acc;
+            }
+          }
+        }
+      }
+      const req = this.requiresGrad || weight.requiresGrad || !!(bias && bias.requiresGrad);
+      const parents = bias ? [this, weight, bias] : [this, weight];
+      return new Tensor(out, [N, Cout, Ho, Wo], req, parents, (gout) => {
+        if (this.requiresGrad) {
+          if (!this.grad) this.grad = new Float32Array(this.numel);
+          const dx = this.grad;
+          for (let n = 0; n < N; n++) for (let oc = 0; oc < Cout; oc++)
+            for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++) {
+              const g = gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
+              const ih0 = oh * sH - pH, iw0 = ow * sW - pW;
+              for (let ic = 0; ic < Cin; ic++) for (let kh = 0; kh < kH; kh++) {
+                const ih = ih0 + kh; if (ih < 0 || ih >= H) continue;
+                for (let kw = 0; kw < kW; kw++) {
+                  const iw = iw0 + kw; if (iw < 0 || iw >= W) continue;
+                  dx[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw] +=
+                    g * w[oc * wStr[0] + ic * wStr[1] + kh * wStr[2] + kw];
+                }
+              }
+            }
+        }
+        if (weight.requiresGrad) {
+          if (!weight.grad) weight.grad = new Float32Array(weight.numel);
+          const dw = weight.grad;
+          for (let n = 0; n < N; n++) for (let oc = 0; oc < Cout; oc++)
+            for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++) {
+              const g = gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
+              const ih0 = oh * sH - pH, iw0 = ow * sW - pW;
+              for (let ic = 0; ic < Cin; ic++) for (let kh = 0; kh < kH; kh++) {
+                const ih = ih0 + kh; if (ih < 0 || ih >= H) continue;
+                for (let kw = 0; kw < kW; kw++) {
+                  const iw = iw0 + kw; if (iw < 0 || iw >= W) continue;
+                  dw[oc * wStr[0] + ic * wStr[1] + kh * wStr[2] + kw] +=
+                    g * x[n * xStr[0] + ic * xStr[1] + ih * xStr[2] + iw];
+                }
+              }
+            }
+        }
+        if (bias && bias.requiresGrad) {
+          if (!bias.grad) bias.grad = new Float32Array(Cout);
+          for (let n = 0; n < N; n++) for (let oc = 0; oc < Cout; oc++)
+            for (let oh = 0; oh < Ho; oh++) for (let ow = 0; ow < Wo; ow++)
+              bias.grad[oc] += gout[n * oStr[0] + oc * oStr[1] + oh * oStr[2] + ow];
+        }
+      });
+    }
+
+    /** Affine on NCHW channel dim (axis=1). */
+    affineChannel(weight, bias = null) {
+      if (this.shape.length < 2) throw new Error("affineChannel needs rank>=2");
+      const C = this.shape[1];
+      if (weight.numel !== C) throw new Error("affineChannel weight mismatch");
+      const N = this.shape[0];
+      const rest = this.numel / (N * C);
+      const out = new Float32Array(this.numel);
+      const x = this.data, w = weight.data, b = bias ? bias.data : null;
+      for (let n = 0; n < N; n++) for (let c = 0; c < C; c++) {
+        const off = (n * C + c) * rest;
+        const wc = w[c], bc = b ? b[c] : 0;
+        for (let i = 0; i < rest; i++) out[off + i] = x[off + i] * wc + bc;
+      }
+      const req = this.requiresGrad || weight.requiresGrad || !!(bias && bias.requiresGrad);
+      const parents = bias ? [this, weight, bias] : [this, weight];
+      return new Tensor(out, [...this.shape], req, parents, (gout) => {
+        if (this.requiresGrad) {
+          if (!this.grad) this.grad = new Float32Array(this.numel);
+          for (let n = 0; n < N; n++) for (let c = 0; c < C; c++) {
+            const off = (n * C + c) * rest;
+            for (let i = 0; i < rest; i++) this.grad[off + i] += gout[off + i] * w[c];
+          }
+        }
+        if (weight.requiresGrad) {
+          if (!weight.grad) weight.grad = new Float32Array(C);
+          for (let n = 0; n < N; n++) for (let c = 0; c < C; c++) {
+            const off = (n * C + c) * rest;
+            let s = 0;
+            for (let i = 0; i < rest; i++) s += gout[off + i] * x[off + i];
+            weight.grad[c] += s;
+          }
+        }
+        if (bias && bias.requiresGrad) {
+          if (!bias.grad) bias.grad = new Float32Array(C);
+          for (let n = 0; n < N; n++) for (let c = 0; c < C; c++) {
+            const off = (n * C + c) * rest;
+            let s = 0;
+            for (let i = 0; i < rest; i++) s += gout[off + i];
+            bias.grad[c] += s;
+          }
+        }
+      });
+    }
+
     /** Elementwise absolute value. Backward: sign(x). */
     abs() {
       const n = this.numel;
@@ -1603,6 +1797,7 @@
       this.weightDecay = opts.weightDecay || 0.0;
       this.momentum = opts.momentum || 0.0;
       this.nesterov = !!opts.nesterov;
+      this.tcoef = opts.tcoef != null ? opts.tcoef : (opts.optimizer === "lars" ? 0.001 : 0.0);
       this.maxNorm = opts.gradClipNorm != null ? opts.gradClipNorm : 1.0;
       this.warmupSteps = Math.max(1, opts.warmupSteps || 10);
       this._step = window._adamStep || 0;
@@ -1713,18 +1908,61 @@
         }
       } else {
         // CPU path (also used for momentum / weight-decay SGD)
-        if (this.type === "adam" || this.type === "adamw") {
+        if (this.type === "adam" || this.type === "adamw" || this.type === "lamb") {
           for (const p of this.params) {
             if (!p.grad) continue;
             if (!p._adam_m) p._adam_m = new Float32Array(p.data.length);
             if (!p._adam_v) p._adam_v = new Float32Array(p.data.length);
             const m = p._adam_m, v = p._adam_v, g = p.grad;
-            const wd = this.type === "adamw" ? this.weightDecay : 0;
+            const wd = this.type === "adam" ? 0 : this.weightDecay;
+            let r1 = 0, r2 = 0;
+            const ups = this.type === "lamb" ? new Float32Array(p.data.length) : null;
             for (let i = 0; i < p.data.length; i++) {
               m[i] = this.beta1 * m[i] + (1 - this.beta1) * g[i];
               v[i] = this.beta2 * v[i] + (1 - this.beta2) * g[i] * g[i];
               const adamDir = (m[i] / bc1) / (Math.sqrt(v[i] / bc2) + this.eps);
-              p.data[i] -= effLr * (adamDir + wd * p.data[i]);
+              const up = adamDir + wd * p.data[i];
+              if (ups) {
+                ups[i] = up;
+                r1 += p.data[i] * p.data[i];
+                r2 += up * up;
+              } else {
+                p.data[i] -= effLr * up;
+              }
+            }
+            if (ups) {
+              r1 = Math.sqrt(r1); r2 = Math.sqrt(r2);
+              const r = (r1 > 0 && r2 > 0) ? r1 / r2 : 1;
+              for (let i = 0; i < p.data.length; i++) p.data[i] -= effLr * r * ups[i];
+            }
+            if (typeof p.markCPUDirty === "function") p.markCPUDirty();
+          }
+        } else if (this.type === "lars") {
+          for (const p of this.params) {
+            if (!p.grad) continue;
+            const g = p.grad;
+            if (this.weightDecay > 0) {
+              for (let i = 0; i < p.data.length; i++) g[i] += this.weightDecay * p.data[i];
+            }
+            let r1 = 0, r2 = 0;
+            for (let i = 0; i < p.data.length; i++) {
+              r1 += p.data[i] * p.data[i];
+              r2 += g[i] * g[i];
+            }
+            r1 = Math.sqrt(r1); r2 = Math.sqrt(r2);
+            let r = 1;
+            if (this.tcoef !== 0 && r1 > 0 && r2 > 0) r = this.tcoef * r1 / (r2 + this.weightDecay * r1);
+            if (this.momentum > 0) {
+              if (!p._sgd_b) p._sgd_b = new Float32Array(p.data.length);
+              const b = p._sgd_b;
+              for (let i = 0; i < p.data.length; i++) {
+                const gi = g[i] * r * this.lr;
+                b[i] = this.momentum * b[i] + gi;
+                const step = this.nesterov ? (gi + this.momentum * b[i]) : b[i];
+                p.data[i] -= step;
+              }
+            } else {
+              for (let i = 0; i < p.data.length; i++) p.data[i] -= this.lr * r * g[i];
             }
             if (typeof p.markCPUDirty === "function") p.markCPUDirty();
           }
@@ -1777,6 +2015,12 @@
   }
   function SGD(params, opts = {}) {
     return new Optimizer(params, Object.assign({ optimizer: "sgd" }, opts));
+  }
+  function LAMB(params, opts = {}) {
+    return new Optimizer(params, Object.assign({ optimizer: "lamb", weightDecay: 0.01 }, opts));
+  }
+  function LARS(params, opts = {}) {
+    return new Optimizer(params, Object.assign({ optimizer: "lars", momentum: 0.9, weightDecay: 1e-4, tcoef: 0.001 }, opts));
   }
 
   class OptimizerGroup {
@@ -1990,8 +2234,210 @@
     }
   }
 
-  const nn = { Module, Linear, Embedding, RMSNorm, LayerNorm, Dropout };
-  const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD };
+  class Conv2d extends Module {
+    constructor(inChannels, outChannels, kernelSize, { stride = 1, padding = 0, dilation = 1, groups = 1, bias = true } = {}) {
+      super();
+      const kH = Array.isArray(kernelSize) ? kernelSize[0] : kernelSize;
+      const kW = Array.isArray(kernelSize) ? kernelSize[1] || kernelSize[0] : kernelSize;
+      this.stride = stride;
+      this.padding = padding;
+      this.dilation = dilation;
+      this.groups = groups;
+      this.weight = new Tensor(new Float32Array(outChannels * inChannels * kH * kW), [outChannels, inChannels, kH, kW], true);
+      this.bias = bias ? Tensor.zeros([outChannels], true) : null;
+    }
+    forward(x) {
+      return x.conv2d(this.weight, this.bias, this.groups, this.stride, this.dilation, this.padding);
+    }
+  }
+
+  function Conv1d(inChannels, outChannels, kernelSize, opts = {}) {
+    const conv = new Conv2d(inChannels, outChannels, [1, kernelSize], opts);
+    const orig = conv.forward.bind(conv);
+    conv.forward = (x) => {
+      if (x.shape.length !== 3) throw new Error("Conv1d expects [N,C,W]");
+      const [N, C, W] = x.shape;
+      const y = orig(x.reshape([N, C, 1, W]));
+      return y.reshape([y.shape[0], y.shape[1], y.shape[3]]);
+    };
+    return conv;
+  }
+
+  class GroupNorm extends Module {
+    constructor(numGroups, numChannels, { eps = 1e-5, affine = true, requiresGrad = true } = {}) {
+      super();
+      if (numChannels % numGroups !== 0) throw new Error("GroupNorm channels not divisible by groups");
+      this.numGroups = numGroups;
+      this.numChannels = numChannels;
+      this.eps = eps;
+      this.weight = affine ? Tensor.fromArray(new Float32Array(numChannels).fill(1), [numChannels], requiresGrad) : null;
+      this.bias = affine ? Tensor.zeros([numChannels], requiresGrad) : null;
+    }
+    forward(x) {
+      const N = x.shape[0];
+      const C = x.shape[1];
+      const rest = x.numel / (N * C);
+      const grouped = x.reshape([N, this.numGroups, (C / this.numGroups) * rest]);
+      const y = grouped.layerNorm(this.eps).reshape(x.shape);
+      return this.weight ? y.affineChannel(this.weight, this.bias) : y;
+    }
+  }
+
+  class BatchNorm extends Module {
+    constructor(sz, { eps = 1e-5, affine = true, momentum = 0.1 } = {}) {
+      super();
+      this.eps = eps;
+      this.momentum = momentum;
+      this.weight = affine ? Tensor.fromArray(new Float32Array(sz).fill(1), [sz], true) : null;
+      this.bias = affine ? Tensor.zeros([sz], true) : null;
+      this.runningMean = new Float32Array(sz);
+      this.runningVar = new Float32Array(sz).fill(1);
+    }
+    forward(x) {
+      if (x.shape.length < 2) throw new Error("BatchNorm expects [N,C,...]");
+      const N = x.shape[0], C = x.shape[1];
+      const rest = x.numel / (N * C);
+      const train = getTraining();
+      const mean = new Float32Array(C);
+      const va = new Float32Array(C);
+      const xd = x.data;
+      if (train) {
+        for (let c = 0; c < C; c++) {
+          let s = 0, cnt = N * rest;
+          for (let n = 0; n < N; n++) {
+            const off = (n * C + c) * rest;
+            for (let i = 0; i < rest; i++) s += xd[off + i];
+          }
+          mean[c] = s / cnt;
+          let v = 0;
+          for (let n = 0; n < N; n++) {
+            const off = (n * C + c) * rest;
+            for (let i = 0; i < rest; i++) {
+              const d = xd[off + i] - mean[c];
+              v += d * d;
+            }
+          }
+          va[c] = v / cnt;
+          this.runningMean[c] = (1 - this.momentum) * this.runningMean[c] + this.momentum * mean[c];
+          this.runningVar[c] = (1 - this.momentum) * this.runningVar[c] + this.momentum * va[c];
+        }
+      } else {
+        mean.set(this.runningMean);
+        va.set(this.runningVar);
+      }
+      const out = new Float32Array(x.numel);
+      const w = this.weight ? this.weight.data : null;
+      const b = this.bias ? this.bias.data : null;
+      const inv = new Float32Array(C);
+      for (let c = 0; c < C; c++) inv[c] = 1 / Math.sqrt(va[c] + this.eps);
+      for (let n = 0; n < N; n++) for (let c = 0; c < C; c++) {
+        const off = (n * C + c) * rest;
+        const wc = w ? w[c] : 1, bc = b ? b[c] : 0;
+        for (let i = 0; i < rest; i++) out[off + i] = (xd[off + i] - mean[c]) * inv[c] * wc + bc;
+      }
+      const req = x.requiresGrad || !!(this.weight && this.weight.requiresGrad) || !!(this.bias && this.bias.requiresGrad);
+      const parents = [x];
+      if (this.weight) parents.push(this.weight);
+      if (this.bias) parents.push(this.bias);
+      return new Tensor(out, [...x.shape], req, parents, (gout) => {
+        if (!x.requiresGrad) return;
+        if (!x.grad) x.grad = new Float32Array(x.numel);
+        for (let n = 0; n < N; n++) for (let c = 0; c < C; c++) {
+          const off = (n * C + c) * rest;
+          const wc = w ? w[c] : 1;
+          let sumG = 0, sumGY = 0;
+          for (let i = 0; i < rest; i++) {
+            const yhat = (xd[off + i] - mean[c]) * inv[c];
+            sumG += gout[off + i] * wc;
+            sumGY += gout[off + i] * wc * yhat;
+          }
+          const cnt = N * rest;
+          // Use per-channel reduction over all N later — first pass local only is wrong.
+          // Full channel reduction:
+        }
+        // proper channel-wide stats
+        for (let c = 0; c < C; c++) {
+          let sumG = 0, sumGY = 0;
+          const wc = w ? w[c] : 1;
+          for (let n = 0; n < N; n++) {
+            const off = (n * C + c) * rest;
+            for (let i = 0; i < rest; i++) {
+              const yhat = (xd[off + i] - mean[c]) * inv[c];
+              sumG += gout[off + i] * wc;
+              sumGY += gout[off + i] * wc * yhat;
+            }
+          }
+          const cnt = N * rest;
+          for (let n = 0; n < N; n++) {
+            const off = (n * C + c) * rest;
+            for (let i = 0; i < rest; i++) {
+              const yhat = (xd[off + i] - mean[c]) * inv[c];
+              x.grad[off + i] += inv[c] * (gout[off + i] * wc - sumG / cnt - yhat * sumGY / cnt);
+            }
+          }
+        }
+        if (this.weight && this.weight.requiresGrad) {
+          if (!this.weight.grad) this.weight.grad = new Float32Array(C);
+          for (let c = 0; c < C; c++) {
+            let s = 0;
+            for (let n = 0; n < N; n++) {
+              const off = (n * C + c) * rest;
+              for (let i = 0; i < rest; i++) s += gout[off + i] * (xd[off + i] - mean[c]) * inv[c];
+            }
+            this.weight.grad[c] += s;
+          }
+        }
+        if (this.bias && this.bias.requiresGrad) {
+          if (!this.bias.grad) this.bias.grad = new Float32Array(C);
+          for (let c = 0; c < C; c++) {
+            let s = 0;
+            for (let n = 0; n < N; n++) {
+              const off = (n * C + c) * rest;
+              for (let i = 0; i < rest; i++) s += gout[off + i];
+            }
+            this.bias.grad[c] += s;
+          }
+        }
+      });
+    }
+  }
+
+  class LSTMCell extends Module {
+    constructor(inputSize, hiddenSize, { bias = true } = {}) {
+      super();
+      this.inputSize = inputSize;
+      this.hiddenSize = hiddenSize;
+      this.weightIh = new Tensor(new Float32Array(hiddenSize * 4 * inputSize), [hiddenSize * 4, inputSize], true);
+      this.weightHh = new Tensor(new Float32Array(hiddenSize * 4 * hiddenSize), [hiddenSize * 4, hiddenSize], true);
+      this.biasIh = bias ? Tensor.zeros([hiddenSize * 4], true) : null;
+      this.biasHh = bias ? Tensor.zeros([hiddenSize * 4], true) : null;
+    }
+    forward(x, hc = null) {
+      const B = x.shape[0];
+      const H = this.hiddenSize;
+      const h = hc ? hc[0] : Tensor.zeros([B, H], false);
+      const c = hc ? hc[1] : Tensor.zeros([B, H], false);
+      const gi = x.matmul(this.weightIh.transpose2d());
+      const gh = h.matmul(this.weightHh.transpose2d());
+      let gates = gi.add(gh);
+      if (this.biasIh) gates = gates.addBroadcastLast(this.biasIh);
+      if (this.biasHh) gates = gates.addBroadcastLast(this.biasHh);
+      const parts = gates.splitLast([H, H, H, H]);
+      const i = parts[0].sigmoid();
+      const f = parts[1].sigmoid();
+      const g = parts[2].tanh();
+      const o = parts[3].sigmoid();
+      const newC = f.mul(c).add(i.mul(g));
+      const newH = o.mul(newC.tanh());
+      return [newH, newC];
+    }
+  }
+
+  const nn = {
+    Module, Linear, Embedding, RMSNorm, LayerNorm, Dropout,
+    Conv2d, Conv1d, GroupNorm, BatchNorm, BatchNorm2d: BatchNorm, LSTMCell,
+  };
+  const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD, LAMB, LARS };
 
   window.tinygradV0 = {
     Tensor,
@@ -2003,6 +2449,8 @@
     Adam,
     AdamW,
     SGD,
+    LAMB,
+    LARS,
     training: false,
     crossEntropy,
     crossEntropyGPU,

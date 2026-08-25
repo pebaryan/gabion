@@ -65,6 +65,38 @@ const opt = tg.AdamW([p], {
 });
 await opt.step();
 
+const conv = new tg.nn.Conv2d(1, 2, 3, { padding: 1, bias: true });
+conv.weight.data.set(Float32Array.from(fixture.conv_w));
+conv.bias.data.set(Float32Array.from(fixture.conv_b));
+const convY = conv.forward(Tensor.fromArray(fixture.conv_x, fixture.conv_x_shape, false));
+
+const gn = new tg.nn.GroupNorm(2, 4, { eps: 1e-5 });
+gn.weight.data.set(Float32Array.from(fixture.gn_w));
+gn.bias.data.set(Float32Array.from(fixture.gn_b));
+const gnY = gn.forward(Tensor.fromArray(fixture.gn_x, fixture.gn_x_shape, false));
+
+tg.training = true;
+const bn = new tg.nn.BatchNorm(3, { eps: 1e-5, momentum: 0.1 });
+bn.weight.data.set(Float32Array.from(fixture.bn_w));
+bn.bias.data.set(Float32Array.from(fixture.bn_b));
+const bnY = bn.forward(Tensor.fromArray(fixture.bn_x, fixture.bn_x_shape, false));
+tg.training = false;
+
+const lstm = new tg.nn.LSTMCell(3, 4, { bias: true });
+lstm.weightIh.data.set(Float32Array.from(fixture.lstm_wih));
+lstm.weightHh.data.set(Float32Array.from(fixture.lstm_whh));
+lstm.biasIh.data.set(Float32Array.from(fixture.lstm_bih));
+lstm.biasHh.data.set(Float32Array.from(fixture.lstm_bhh));
+const [lh, lc] = lstm.forward(Tensor.fromArray(fixture.lstm_x, [2, 3], false));
+
+const lp = Tensor.fromArray(fixture.lamb_p, [fixture.lamb_p.length], true);
+lp.grad = Float32Array.from(fixture.lamb_g);
+const lamb = tg.LAMB([lp], {
+  lr: fixture.lr, beta1: 0.9, beta2: 0.999, eps: 1e-8,
+  weightDecay: fixture.wd, warmupSteps: 1, gradClipNorm: 0,
+});
+await lamb.step();
+
 const report = {
   nn_modules: Object.keys(tg.nn).sort(),
   optim_exports: Object.keys(tg.optim).sort(),
@@ -74,6 +106,12 @@ const report = {
   dropout_identity_ok: maxAbs(dropOff.data, fixture.x) === 0,
   dropout_p1_zero: Array.from(dropAll.data).every((v) => v === 0),
   adamw_max_abs: maxAbs(p.data, fixture.p_after),
+  conv_max_abs: maxAbs(convY.data, fixture.conv_y),
+  gn_max_abs: maxAbs(gnY.data, fixture.gn_y),
+  bn_max_abs: maxAbs(bnY.data, fixture.bn_y),
+  lstm_h_max_abs: maxAbs(lh.data, fixture.lstm_h),
+  lstm_c_max_abs: maxAbs(lc.data, fixture.lstm_c),
+  lamb_max_abs: maxAbs(lp.data, fixture.lamb_after),
 };
 const outPath = fixturePath.replace(/\.json$/, "_js.json");
 fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
