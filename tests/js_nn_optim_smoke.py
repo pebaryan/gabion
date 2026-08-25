@@ -336,6 +336,13 @@ def build_fixture() -> dict:
     unet_tt = Tensor(unet_t.tolist())
     unet_yt = unet_forward(unet_xt, unet_tt)
     unet_y = unet_yt.numpy().astype(np.float64).reshape(-1)
+    # DDPM MSE loss + grad (e2e)
+    unet_noise = rng.normal(0, 1, size=(2, 2, 8, 8)).astype(np.float32)
+    unet_noise_t = Tensor(unet_noise.tolist())
+    unet_loss = ((unet_yt - unet_noise_t) * (unet_yt - unet_noise_t)).mean()
+    unet_loss_val = float(unet_loss.numpy())
+    unet_loss_grads = unet_loss.gradient(unet_stem.weight, unet_out_c.weight)
+    unet_loss_g_stem, unet_loss_g_out = [g.numpy().astype(np.float64).reshape(-1) for g in unet_loss_grads]
 
     mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mg = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
@@ -557,6 +564,10 @@ def build_fixture() -> dict:
         "unet_out_cw": unet_out_c.weight.numpy().astype(float).reshape(-1).tolist(),
         "unet_out_cb": unet_out_c.bias.numpy().astype(float).reshape(-1).tolist(),
         "unet_y": unet_y.tolist(),
+        "unet_noise": unet_noise.astype(float).reshape(-1).tolist(),
+        "unet_loss": float(unet_loss_val),
+        "unet_loss_g_stem": unet_loss_g_stem.tolist(),
+        "unet_loss_g_out": unet_loss_g_out.tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -606,6 +617,7 @@ def main() -> int:
         "spatial_attention": report["sa_fwd"] < 1e-4 and max(
             report["sa_grad_x"], report["sa_gnw"], report["sa_gnb"], report["sa_qkv"], report["sa_proj"]) < 1e-4,
         "unet": report["unet_fwd"] < 1e-4,
+        "unet_loss": report["unet_loss_err"] < 1e-4 and report["unet_loss_g_stem"] < 1e-4 and report["unet_loss_g_out"] < 1e-4,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])

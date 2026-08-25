@@ -271,6 +271,15 @@ unet.outConv.bias.data.set(Float32Array.from(fixture.unet_out_cb));
 const unetX = Tensor.fromArray(fixture.unet_x, fixture.unet_x_shape, true);
 const unetT = Tensor.fromArray(fixture.unet_t, [2, 16], false);
 const unetY = unet.forward(unetX, unetT);
+const unetNoise = Tensor.fromArray(fixture.unet_noise, [2,2,8,8], false);
+const unetDiff = unetY.sub(unetNoise);
+const unetLoss = unetDiff.mul(unetDiff).mean();
+unetLoss.grad = new Float32Array([1]);
+{
+  const topo=[];const seen=new Set();const build=(tt)=>{if(seen.has(tt))return;seen.add(tt);for(const q of tt._parents) build(q);topo.push(tt);};
+  build(unetLoss);
+  for(let i=topo.length-1;i>=0;i--){const tt=topo[i];if(tt.grad===null&&!tt._gradGPUBuf&&!tt._pendingGradBuf) continue;const g=tt.grad||new Float32Array(tt.numel).fill(0);tt._backward(g, tt._gradGPUBuf||tt._pendingGradBuf||null);}
+}
 
 const mp = Tensor.fromArray(fixture.muon_p, [4, 4], true);
 mp.grad = Float32Array.from(fixture.muon_g);
@@ -303,6 +312,10 @@ const report = {
   ct2_grad_w: maxAbs(ct2.weight.grad, fixture.ct2_w_grad),
   ct2_grad_b: maxAbs(ct2.bias.grad, fixture.ct2_b_grad),
   unet_fwd: maxAbs(unetY.data, fixture.unet_y),
+  unet_loss: unetLoss.data[0],
+  unet_loss_err: Math.abs(unetLoss.data[0] - fixture.unet_loss),
+  unet_loss_g_stem: maxAbs(unet.stem.weight.grad, fixture.unet_loss_g_stem),
+  unet_loss_g_out: maxAbs(unet.outConv.weight.grad, fixture.unet_loss_g_out),
   muon_max_abs: maxAbs(mp.data, fixture.muon_after),
   sum_fwd: maxAbs(sumY.data, fixture.sum_y),
   sum_grad: maxAbs(redx.grad.slice(), fixture.sum_x_grad),
