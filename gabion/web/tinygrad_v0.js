@@ -2655,10 +2655,14 @@
       const params = [];
       const seen = new Set();
       const collect = (obj) => {
-        if (seen.has(obj)) return;
+        if (!obj || seen.has(obj)) return;
         seen.add(obj);
         if (obj instanceof Tensor) {
           if (obj.requiresGrad) params.push(obj);
+          return;
+        }
+        if (Array.isArray(obj)) {
+          for (const item of obj) collect(item);
           return;
         }
         if (obj instanceof Module) {
@@ -2670,8 +2674,16 @@
               collect(val);
             } else if (Array.isArray(val)) {
               for (const item of val) collect(item);
+            } else if (val && typeof val === 'object') {
+              // plain object wrappers like {rb, down}
+              for (const sub of Object.values(val)) collect(sub);
             }
           }
+          return;
+        }
+        // plain object container (e.g. downBlocks entry)
+        if (typeof obj === 'object') {
+          for (const v of Object.values(obj)) collect(v);
         }
       };
       collect(this);
@@ -2695,7 +2707,23 @@
               dict[`${name}.${i}`] = item;
             } else if (item instanceof Module) {
               Object.assign(dict, item.stateDict(`${name}.${i}`));
+            } else if (item && typeof item === 'object') {
+              // plain object {rb, down}
+              for (const [k, sub] of Object.entries(item)) {
+                if (sub instanceof Tensor && sub.requiresGrad) dict[`${name}.${i}.${k}`] = sub;
+                else if (sub instanceof Module) Object.assign(dict, sub.stateDict(`${name}.${i}.${k}`));
+                else if (Array.isArray(sub)) {
+                  for (let j = 0; j < sub.length; j++) {
+                    const s = sub[j];
+                    if (s instanceof Module) Object.assign(dict, s.stateDict(`${name}.${i}.${k}.${j}`));
+                  }
+                }
+              }
             }
+          }
+        } else if (val && typeof val === 'object') {
+          for (const [k, sub] of Object.entries(val)) {
+            if (sub instanceof Module) Object.assign(dict, sub.stateDict(`${name}.${k}`));
           }
         }
       }
@@ -3014,6 +3042,81 @@
     }
   }
 
+  /** Minimal DDPM UNet: stem -> down -> mid (Res+Attn+Res) -> up -> out */
+  class UNet extends Module {
+    constructor(inChannels, baseChannels, timeDim, { chMults = [1, 2], numGroups = 4, eps = 1e-5 } = {}) {
+      super();
+      this.inChannels = inChannels;
+      this.baseChannels = baseChannels;
+      this.timeDim = timeDim;
+      this.chMults = chMults;
+      this.numGroups = numGroups;
+      this.eps = eps;
+      const chs = chMults.map((m) => baseChannels * m);
+      this.stem = new Conv2d(inChannels, chs[0], 3, { padding: 1, bias: false });
+      this.downBlocks = [];
+      let prevCh = chs[0];
+      for (let i = 0; i < chs.length; i++) {
+        const outCh = chs[i];
+        const rb = new ResBlock(prevCh, outCh, timeDim, { numGroups, eps });
+        const blk = { rb };
+        prevCh = outCh;
+        if (i < chs.length - 1) {
+          const nextCh = chs[i + 1];
+          blk.down = new Conv2d(outCh, nextCh, 3, { stride: 2, padding: 1, bias: false });
+          prevCh = nextCh;
+        }
+        this.downBlocks.push(blk);
+      }
+      const midCh = chs[chs.length - 1];
+      this.mid1 = new ResBlock(midCh, midCh, timeDim, { numGroups, eps });
+      this.midAttn = new SpatialAttention(midCh, { numGroups, eps });
+      this.mid2 = new ResBlock(midCh, midCh, timeDim, { numGroups, eps });
+      this.upBlocks = [];
+      let curCh = midCh;
+      for (let i = chs.length - 1; i >= 0; i--) {
+        const skipCh = chs[i];
+        const inCh = curCh + skipCh;
+        const outCh = skipCh;
+        const rb = new ResBlock(inCh, outCh, timeDim, { numGroups, eps });
+        const blk = { rb };
+        curCh = outCh;
+        if (i > 0) {
+          const upOutCh = chs[i - 1];
+          blk.up = new ConvTranspose2d(outCh, upOutCh, 3, { stride: 2, padding: 1, outputPadding: 1, bias: false });
+          curCh = upOutCh;
+        }
+        this.upBlocks.push(blk);
+      }
+      this.outNorm = new GroupNorm(Math.min(numGroups, chs[0]), chs[0], { eps });
+      this.outConv = new Conv2d(chs[0], inChannels, 3, { padding: 1, bias: true });
+    }
+
+    forward(x, tEmb) {
+      const skips = [];
+      let h = this.stem.forward(x);
+      for (let i = 0; i < this.downBlocks.length; i++) {
+        const blk = this.downBlocks[i];
+        h = blk.rb.forward(h, tEmb);
+        skips.push(h);
+        if (blk.down) h = blk.down.forward(h);
+      }
+      h = this.mid1.forward(h, tEmb);
+      h = this.midAttn.forward(h);
+      h = this.mid2.forward(h, tEmb);
+      for (let i = 0; i < this.upBlocks.length; i++) {
+        const blk = this.upBlocks[i];
+        const skip = skips.pop();
+        h = h.concat(skip, 1);
+        h = blk.rb.forward(h, tEmb);
+        if (blk.up) h = blk.up.forward(h);
+      }
+      h = this.outNorm.forward(h).silu();
+      h = this.outConv.forward(h);
+      return h;
+    }
+  }
+
   class BatchNorm extends Module {
     constructor(sz, { eps = 1e-5, affine = true, momentum = 0.1 } = {}) {
       super();
@@ -3270,6 +3373,7 @@
     SinusoidalTimestep,
     ResBlock,
     SpatialAttention,
+    UNet,
   };
   const optim = { Optimizer, OptimizerGroup, Adam, AdamW, SGD, LAMB, LARS, Muon };
 

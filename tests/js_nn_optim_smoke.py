@@ -221,6 +221,122 @@ def build_fixture() -> dict:
     )
     sa_x_grad, sa_gnw_grad, sa_gnb_grad, sa_qkv_grad, sa_proj_grad = [g.numpy().astype(np.float64).reshape(-1) for g in sa_grads]
 
+    # UNet tiny (8x8, base=4, chMults [1,2], in=2) forward reference
+    from tinygrad.nn import ConvTranspose2d as TGConvTranspose2d
+    unet_x = rng.normal(0, 1, size=(2, 2, 8, 8)).astype(np.float32)
+    unet_t = rng.normal(0, 1, size=(2, 16)).astype(np.float32)
+    # stem
+    unet_stem = TGConv2d(2, 4, 3, padding=1, bias=False)
+    # down0 rb 4->4
+    unet_d0_gn1 = TGGroupNorm(2, 4, eps=1e-5)
+    unet_d0_c1 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    unet_d0_gn2 = TGGroupNorm(2, 4, eps=1e-5)
+    unet_d0_c2 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    unet_d0_mlp = rng.normal(0, 0.5, size=(16, 4)).astype(np.float32)
+    unet_d0_mlp_t = Tensor(unet_d0_mlp.tolist())
+    unet_down0 = TGConv2d(4, 8, 3, stride=2, padding=1, bias=False)
+    # down1 rb 8->8
+    unet_d1_gn1 = TGGroupNorm(2, 8, eps=1e-5)
+    unet_d1_c1 = TGConv2d(8, 8, 3, padding=1, bias=False)
+    unet_d1_gn2 = TGGroupNorm(2, 8, eps=1e-5)
+    unet_d1_c2 = TGConv2d(8, 8, 3, padding=1, bias=False)
+    unet_d1_mlp = rng.normal(0, 0.5, size=(16, 8)).astype(np.float32)
+    unet_d1_mlp_t = Tensor(unet_d1_mlp.tolist())
+    # mid
+    unet_m1_gn1 = TGGroupNorm(2, 8, eps=1e-5)
+    unet_m1_c1 = TGConv2d(8, 8, 3, padding=1, bias=False)
+    unet_m1_gn2 = TGGroupNorm(2, 8, eps=1e-5)
+    unet_m1_c2 = TGConv2d(8, 8, 3, padding=1, bias=False)
+    unet_m1_mlp = rng.normal(0, 0.5, size=(16, 8)).astype(np.float32)
+    unet_m1_mlp_t = Tensor(unet_m1_mlp.tolist())
+    # mid attn
+    unet_mid_gn = TGGroupNorm(2, 8, eps=1e-5)
+    unet_mid_qkv = rng.normal(0, 0.5, size=(8, 24)).astype(np.float32)
+    unet_mid_qkv_t = Tensor(unet_mid_qkv.tolist())
+    unet_mid_proj = rng.normal(0, 0.5, size=(8, 8)).astype(np.float32)
+    unet_mid_proj_t = Tensor(unet_mid_proj.tolist())
+    unet_m2_gn1 = TGGroupNorm(2, 8, eps=1e-5)
+    unet_m2_c1 = TGConv2d(8, 8, 3, padding=1, bias=False)
+    unet_m2_gn2 = TGGroupNorm(2, 8, eps=1e-5)
+    unet_m2_c2 = TGConv2d(8, 8, 3, padding=1, bias=False)
+    unet_m2_mlp = rng.normal(0, 0.5, size=(16, 8)).astype(np.float32)
+    unet_m2_mlp_t = Tensor(unet_m2_mlp.tolist())
+    # up0 rb 16->8 (concat 8+8)
+    unet_u0_gn1 = TGGroupNorm(2, 16, eps=1e-5)
+    unet_u0_c1 = TGConv2d(16, 8, 3, padding=1, bias=False)
+    unet_u0_gn2 = TGGroupNorm(2, 8, eps=1e-5)
+    unet_u0_c2 = TGConv2d(8, 8, 3, padding=1, bias=False)
+    unet_u0_mlp = rng.normal(0, 0.5, size=(16, 8)).astype(np.float32)
+    unet_u0_mlp_t = Tensor(unet_u0_mlp.tolist())
+    unet_u0_skip = TGConv2d(16, 8, 1, bias=False)
+    unet_up0 = TGConvTranspose2d(8, 4, 3, stride=2, padding=1, output_padding=1, bias=False)
+    # up1 rb 8->4
+    unet_u1_gn1 = TGGroupNorm(2, 8, eps=1e-5)
+    unet_u1_c1 = TGConv2d(8, 4, 3, padding=1, bias=False)
+    unet_u1_gn2 = TGGroupNorm(2, 4, eps=1e-5)
+    unet_u1_c2 = TGConv2d(4, 4, 3, padding=1, bias=False)
+    unet_u1_mlp = rng.normal(0, 0.5, size=(16, 4)).astype(np.float32)
+    unet_u1_mlp_t = Tensor(unet_u1_mlp.tolist())
+    unet_u1_skip = TGConv2d(8, 4, 1, bias=False)
+    unet_out_gn = TGGroupNorm(2, 4, eps=1e-5)
+    unet_out_c = TGConv2d(4, 2, 3, padding=1, bias=True)
+
+    def unet_rb(xt, tt, gn1, c1, gn2, c2, mlp_t, skip):
+        h = gn1(xt).silu()
+        h = c1(h)
+        h = gn2(h).silu()
+        h = c2(h)
+        h = h + tt.matmul(mlp_t).reshape(xt.shape[0], h.shape[1], 1, 1)
+        if skip is not None:
+            return h + skip(xt)
+        return h + xt
+
+    def unet_sa(xt, gn, qkv_t, proj_t):
+        h = gn(xt)
+        B, C, H, W = xt.shape
+        HW = H*W
+        bhwc = h.permute(0,2,3,1).reshape(B, HW, C)
+        flat = bhwc.reshape(B*HW, C)
+        qkvFlat = flat.matmul(qkv_t)
+        qkv3d = qkvFlat.reshape(B, HW, 3*C)
+        q, k, v = qkv3d.chunk(3, dim=2)
+        scale = 1 / np.sqrt(C)
+        scores = (q @ k.transpose(1,2)) * scale
+        attn = scores.softmax(axis=-1)
+        out = attn @ v
+        outFlat = out.reshape(B*HW, C)
+        projFlat = outFlat.matmul(proj_t)
+        proj3d = projFlat.reshape(B, HW, C)
+        projNchw = proj3d.reshape(B, H, W, C).permute(0,3,1,2)
+        return projNchw + xt
+
+    def unet_forward(xt, tt):
+        skips = []
+        h = unet_stem(xt)
+        h = unet_rb(h, tt, unet_d0_gn1, unet_d0_c1, unet_d0_gn2, unet_d0_c2, unet_d0_mlp_t, None)
+        skips.append(h)
+        h = unet_down0(h)
+        h = unet_rb(h, tt, unet_d1_gn1, unet_d1_c1, unet_d1_gn2, unet_d1_c2, unet_d1_mlp_t, None)
+        skips.append(h)
+        h = unet_rb(h, tt, unet_m1_gn1, unet_m1_c1, unet_m1_gn2, unet_m1_c2, unet_m1_mlp_t, None)
+        h = unet_sa(h, unet_mid_gn, unet_mid_qkv_t, unet_mid_proj_t)
+        h = unet_rb(h, tt, unet_m2_gn1, unet_m2_c1, unet_m2_gn2, unet_m2_c2, unet_m2_mlp_t, None)
+        skip = skips.pop()
+        h = h.cat(skip, dim=1)
+        h = unet_rb(h, tt, unet_u0_gn1, unet_u0_c1, unet_u0_gn2, unet_u0_c2, unet_u0_mlp_t, unet_u0_skip)
+        h = unet_up0(h)
+        skip = skips.pop()
+        h = h.cat(skip, dim=1)
+        h = unet_rb(h, tt, unet_u1_gn1, unet_u1_c1, unet_u1_gn2, unet_u1_c2, unet_u1_mlp_t, unet_u1_skip)
+        h = unet_out_gn(h).silu()
+        h = unet_out_c(h)
+        return h
+
+    unet_xt = Tensor(unet_x.tolist())
+    unet_tt = Tensor(unet_t.tolist())
+    unet_yt = unet_forward(unet_xt, unet_tt)
+    unet_y = unet_yt.numpy().astype(np.float64).reshape(-1)
+
     mp = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mg = rng.normal(0, 1, size=(4, 4)).astype(np.float32)
     mpt = Tensor(mp.tolist())
@@ -382,6 +498,65 @@ def build_fixture() -> dict:
         "sa_gnb_grad": sa_gnb_grad.tolist(),
         "sa_qkv_grad": sa_qkv_grad.tolist(),
         "sa_proj_grad": sa_proj_grad.tolist(),
+        "unet_x": unet_x.astype(float).reshape(-1).tolist(),
+        "unet_x_shape": list(unet_x.shape),
+        "unet_t": unet_t.astype(float).reshape(-1).tolist(),
+        "unet_stem_w": unet_stem.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d0_gn1w": unet_d0_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d0_gn1b": unet_d0_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d0_c1w": unet_d0_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d0_gn2w": unet_d0_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d0_gn2b": unet_d0_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d0_c2w": unet_d0_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d0_mlp": unet_d0_mlp.astype(float).reshape(-1).tolist(),
+        "unet_down0w": unet_down0.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d1_gn1w": unet_d1_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d1_gn1b": unet_d1_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d1_c1w": unet_d1_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d1_gn2w": unet_d1_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d1_gn2b": unet_d1_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d1_c2w": unet_d1_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_d1_mlp": unet_d1_mlp.astype(float).reshape(-1).tolist(),
+        "unet_m1_gn1w": unet_m1_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m1_gn1b": unet_m1_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m1_c1w": unet_m1_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m1_gn2w": unet_m1_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m1_gn2b": unet_m1_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m1_c2w": unet_m1_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m1_mlp": unet_m1_mlp.astype(float).reshape(-1).tolist(),
+        "unet_mid_gnw": unet_mid_gn.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_mid_gnb": unet_mid_gn.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_mid_qkv": unet_mid_qkv.astype(float).reshape(-1).tolist(),
+        "unet_mid_proj": unet_mid_proj.astype(float).reshape(-1).tolist(),
+        "unet_m2_gn1w": unet_m2_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m2_gn1b": unet_m2_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m2_c1w": unet_m2_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m2_gn2w": unet_m2_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m2_gn2b": unet_m2_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m2_c2w": unet_m2_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_m2_mlp": unet_m2_mlp.astype(float).reshape(-1).tolist(),
+        "unet_u0_gn1w": unet_u0_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u0_gn1b": unet_u0_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u0_c1w": unet_u0_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u0_gn2w": unet_u0_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u0_gn2b": unet_u0_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u0_c2w": unet_u0_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u0_mlp": unet_u0_mlp.astype(float).reshape(-1).tolist(),
+        "unet_u0_skipw": unet_u0_skip.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_up0w": unet_up0.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u1_gn1w": unet_u1_gn1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u1_gn1b": unet_u1_gn1.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u1_c1w": unet_u1_c1.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u1_gn2w": unet_u1_gn2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u1_gn2b": unet_u1_gn2.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u1_c2w": unet_u1_c2.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_u1_mlp": unet_u1_mlp.astype(float).reshape(-1).tolist(),
+        "unet_u1_skipw": unet_u1_skip.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_out_gnw": unet_out_gn.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_out_gnb": unet_out_gn.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_out_cw": unet_out_c.weight.numpy().astype(float).reshape(-1).tolist(),
+        "unet_out_cb": unet_out_c.bias.numpy().astype(float).reshape(-1).tolist(),
+        "unet_y": unet_y.tolist(),
         "muon_p": mp.astype(float).reshape(-1).tolist(),
         "muon_g": mg.astype(float).reshape(-1).tolist(),
         "muon_after": muon_after.tolist(),
@@ -430,6 +605,7 @@ def main() -> int:
             report["rb_grad_conv2w"], report["rb_grad_mlpw"], report["rb_grad_skipw"]) < 1e-4,
         "spatial_attention": report["sa_fwd"] < 1e-4 and max(
             report["sa_grad_x"], report["sa_gnw"], report["sa_gnb"], report["sa_qkv"], report["sa_proj"]) < 1e-4,
+        "unet": report["unet_fwd"] < 1e-4,
     }
     print("verdict", {k: ("PASS" if v else "FAIL") for k, v in checks.items()})
     print("nn", report["nn_modules"], "optim", report["optim_exports"])

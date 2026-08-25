@@ -211,6 +211,67 @@ saY.grad = Float32Array.from(fixture.sa_gout);
   for (let i = topo.length - 1; i >= 0; i--) { const tt = topo[i]; if (tt.grad === null || tt.grad === undefined) continue; tt._backward(tt.grad, tt._gradGPUBuf || tt._pendingGradBuf || null); }
 }
 
+// UNet tiny forward
+const unet = new tg.nn.UNet(2, 4, 16, { chMults: [1, 2], numGroups: 2 });
+unet.stem.weight.data.set(Float32Array.from(fixture.unet_stem_w));
+unet.downBlocks[0].rb.norm1.weight.data.set(Float32Array.from(fixture.unet_d0_gn1w));
+unet.downBlocks[0].rb.norm1.bias.data.set(Float32Array.from(fixture.unet_d0_gn1b));
+unet.downBlocks[0].rb.conv1.weight.data.set(Float32Array.from(fixture.unet_d0_c1w));
+unet.downBlocks[0].rb.norm2.weight.data.set(Float32Array.from(fixture.unet_d0_gn2w));
+unet.downBlocks[0].rb.norm2.bias.data.set(Float32Array.from(fixture.unet_d0_gn2b));
+unet.downBlocks[0].rb.conv2.weight.data.set(Float32Array.from(fixture.unet_d0_c2w));
+unet.downBlocks[0].rb.timeMlp.weight.data.set(Float32Array.from(fixture.unet_d0_mlp));
+unet.downBlocks[0].down.weight.data.set(Float32Array.from(fixture.unet_down0w));
+unet.downBlocks[1].rb.norm1.weight.data.set(Float32Array.from(fixture.unet_d1_gn1w));
+unet.downBlocks[1].rb.norm1.bias.data.set(Float32Array.from(fixture.unet_d1_gn1b));
+unet.downBlocks[1].rb.conv1.weight.data.set(Float32Array.from(fixture.unet_d1_c1w));
+unet.downBlocks[1].rb.norm2.weight.data.set(Float32Array.from(fixture.unet_d1_gn2w));
+unet.downBlocks[1].rb.norm2.bias.data.set(Float32Array.from(fixture.unet_d1_gn2b));
+unet.downBlocks[1].rb.conv2.weight.data.set(Float32Array.from(fixture.unet_d1_c2w));
+unet.downBlocks[1].rb.timeMlp.weight.data.set(Float32Array.from(fixture.unet_d1_mlp));
+unet.mid1.norm1.weight.data.set(Float32Array.from(fixture.unet_m1_gn1w));
+unet.mid1.norm1.bias.data.set(Float32Array.from(fixture.unet_m1_gn1b));
+unet.mid1.conv1.weight.data.set(Float32Array.from(fixture.unet_m1_c1w));
+unet.mid1.norm2.weight.data.set(Float32Array.from(fixture.unet_m1_gn2w));
+unet.mid1.norm2.bias.data.set(Float32Array.from(fixture.unet_m1_gn2b));
+unet.mid1.conv2.weight.data.set(Float32Array.from(fixture.unet_m1_c2w));
+unet.mid1.timeMlp.weight.data.set(Float32Array.from(fixture.unet_m1_mlp));
+unet.midAttn.norm.weight.data.set(Float32Array.from(fixture.unet_mid_gnw));
+unet.midAttn.norm.bias.data.set(Float32Array.from(fixture.unet_mid_gnb));
+unet.midAttn.qkv.weight.data.set(Float32Array.from(fixture.unet_mid_qkv));
+unet.midAttn.proj.weight.data.set(Float32Array.from(fixture.unet_mid_proj));
+unet.mid2.norm1.weight.data.set(Float32Array.from(fixture.unet_m2_gn1w));
+unet.mid2.norm1.bias.data.set(Float32Array.from(fixture.unet_m2_gn1b));
+unet.mid2.conv1.weight.data.set(Float32Array.from(fixture.unet_m2_c1w));
+unet.mid2.norm2.weight.data.set(Float32Array.from(fixture.unet_m2_gn2w));
+unet.mid2.norm2.bias.data.set(Float32Array.from(fixture.unet_m2_gn2b));
+unet.mid2.conv2.weight.data.set(Float32Array.from(fixture.unet_m2_c2w));
+unet.mid2.timeMlp.weight.data.set(Float32Array.from(fixture.unet_m2_mlp));
+unet.upBlocks[0].rb.norm1.weight.data.set(Float32Array.from(fixture.unet_u0_gn1w));
+unet.upBlocks[0].rb.norm1.bias.data.set(Float32Array.from(fixture.unet_u0_gn1b));
+unet.upBlocks[0].rb.conv1.weight.data.set(Float32Array.from(fixture.unet_u0_c1w));
+unet.upBlocks[0].rb.norm2.weight.data.set(Float32Array.from(fixture.unet_u0_gn2w));
+unet.upBlocks[0].rb.norm2.bias.data.set(Float32Array.from(fixture.unet_u0_gn2b));
+unet.upBlocks[0].rb.conv2.weight.data.set(Float32Array.from(fixture.unet_u0_c2w));
+unet.upBlocks[0].rb.timeMlp.weight.data.set(Float32Array.from(fixture.unet_u0_mlp));
+unet.upBlocks[0].rb.skip.weight.data.set(Float32Array.from(fixture.unet_u0_skipw));
+unet.upBlocks[0].up.weight.data.set(Float32Array.from(fixture.unet_up0w));
+unet.upBlocks[1].rb.norm1.weight.data.set(Float32Array.from(fixture.unet_u1_gn1w));
+unet.upBlocks[1].rb.norm1.bias.data.set(Float32Array.from(fixture.unet_u1_gn1b));
+unet.upBlocks[1].rb.conv1.weight.data.set(Float32Array.from(fixture.unet_u1_c1w));
+unet.upBlocks[1].rb.norm2.weight.data.set(Float32Array.from(fixture.unet_u1_gn2w));
+unet.upBlocks[1].rb.norm2.bias.data.set(Float32Array.from(fixture.unet_u1_gn2b));
+unet.upBlocks[1].rb.conv2.weight.data.set(Float32Array.from(fixture.unet_u1_c2w));
+unet.upBlocks[1].rb.timeMlp.weight.data.set(Float32Array.from(fixture.unet_u1_mlp));
+unet.upBlocks[1].rb.skip.weight.data.set(Float32Array.from(fixture.unet_u1_skipw));
+unet.outNorm.weight.data.set(Float32Array.from(fixture.unet_out_gnw));
+unet.outNorm.bias.data.set(Float32Array.from(fixture.unet_out_gnb));
+unet.outConv.weight.data.set(Float32Array.from(fixture.unet_out_cw));
+unet.outConv.bias.data.set(Float32Array.from(fixture.unet_out_cb));
+const unetX = Tensor.fromArray(fixture.unet_x, fixture.unet_x_shape, true);
+const unetT = Tensor.fromArray(fixture.unet_t, [2, 16], false);
+const unetY = unet.forward(unetX, unetT);
+
 const mp = Tensor.fromArray(fixture.muon_p, [4, 4], true);
 mp.grad = Float32Array.from(fixture.muon_g);
 const muon = tg.Muon([mp], { lr: 1e-3, warmupSteps: 1, gradClipNorm: 0 });
@@ -241,6 +302,7 @@ const report = {
   ct2_grad_x: maxAbs(ct2x.grad, fixture.ct2_x_grad),
   ct2_grad_w: maxAbs(ct2.weight.grad, fixture.ct2_w_grad),
   ct2_grad_b: maxAbs(ct2.bias.grad, fixture.ct2_b_grad),
+  unet_fwd: maxAbs(unetY.data, fixture.unet_y),
   muon_max_abs: maxAbs(mp.data, fixture.muon_after),
   sum_fwd: maxAbs(sumY.data, fixture.sum_y),
   sum_grad: maxAbs(redx.grad.slice(), fixture.sum_x_grad),
