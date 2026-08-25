@@ -93,7 +93,10 @@
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
         mappedAtCreation: true,
       });
-      new Float32Array(buf.getMappedRange()).set(data);
+      // Respect the input array type — .set() on a Float32Array view would
+      // convert Uint32 index values to f32 (wrong bit patterns for u32 reads).
+      if (data instanceof Uint32Array) new Uint32Array(buf.getMappedRange()).set(data);
+      else new Float32Array(buf.getMappedRange()).set(data);
       buf.unmap();
       return buf;
     }

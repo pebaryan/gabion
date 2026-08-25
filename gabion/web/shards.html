@@ -49,11 +49,11 @@
 <div id="stats"></div>
 <pre id="resultJson" hidden>{}</pre>
 
-<script src="/gabion/web/tinygrad_v0.js?v=12"></script>
-<script src="/gabion/web/webgpu_backend.js?v=12"></script>
-<script src="/gabion/web/tokenizer.js?v=12"></script>
-<script src="/gabion/web/bbt_forward.js?v=12"></script>
-<script src="/gabion/web/model_loader.js?v=12"></script>
+<script src="/gabion/web/tinygrad_v0.js?v=14"></script>
+<script src="/gabion/web/webgpu_backend.js?v=14"></script>
+<script src="/gabion/web/tokenizer.js?v=14"></script>
+<script src="/gabion/web/bbt_forward.js?v=14"></script>
+<script src="/gabion/web/model_loader.js?v=14"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -65,7 +65,14 @@ async function initCoordGPU() {
   try {
     const adapter = await navigator.gpu.requestAdapter();
     if (!adapter) return (coordGPU = false);
-    const device = await adapter.requestDevice();
+    // Default device limits cap maxBufferSize at 256MB — the embedding/head
+    // buffers are 544MB, so request the adapter's full limits.
+    const device = await adapter.requestDevice({
+      requiredLimits: {
+        maxBufferSize: adapter.limits.maxBufferSize,
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      },
+    });
     WebGPUBackend.init(device);
     for (const name of ["matmul", "embedding_forward"]) {
       const r = await fetch(`/gabion/web/kernels/${name}.wgsl`, { cache: "no-store" });
