@@ -403,8 +403,7 @@
         x = await this._block(x, B, T, bl, ternarize);
       }
 
-      // Final norm (rmsNorm forward is CPU, auto-readbacks if needed)
-      if (x.onGPU) await x.toCPU();
+      // Final norm (now GPU-resident)
       x = this.normF.forward(x);
 
       // LM head projection: [B, T, D] @ [D, V] -> [B, T, V]
@@ -456,18 +455,14 @@
      * x: [B, T, D], bl: TransformerBlock
      */
     async _block(x, B, T, bl, ternarize = false) {
-      // Pre-norm + attention + residual
-      if (x.onGPU) await x.toCPU(); // rmsNorm forward is CPU
+      // Pre-norm + attention + residual (all GPU-resident — RMSNorm + matmul + add on GPU)
       let h = bl.norm1.forward(x);
       h = await this._causalSelfAttention(h, B, T, bl.q.weight, bl.k.weight, bl.v.weight, bl.o.weight, ternarize, bl.qBias || null, bl.kBias || null, bl.vBias || null);
-      if (h.onGPU) await h.toCPU();
       x = x.add(h);
 
       // Pre-norm + FFN + residual
-      if (x.onGPU) await x.toCPU(); // rmsNorm forward is CPU
       h = bl.norm2.forward(x);
       h = await this._swiGLU(h, B, T, bl.gateUp.weight, bl.down.weight, ternarize);
-      if (h.onGPU) await h.toCPU();
       x = x.add(h);
 
       return x;

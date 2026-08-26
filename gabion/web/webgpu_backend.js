@@ -480,6 +480,31 @@
       return outBuf;
     }
 
+    /** RMSNorm forward: rows x d, y = x * rsqrt(mean(x^2)+eps) * w? */
+    rmsNorm(xBuf, rows, d, eps, weightBuf = null) {
+      const pipeline = this.getPipeline("rmsnorm_forward");
+      const hasWeight = weightBuf ? 1 : 0;
+      const paramBuf = new ArrayBuffer(16);
+      new Uint32Array(paramBuf, 0, 2).set([rows, d]);
+      new Float32Array(paramBuf, 8, 1).set([eps]);
+      new Uint32Array(paramBuf, 12, 1).set([hasWeight]);
+      const uniformBuf = this.createUniformBuffer(new Uint8Array(paramBuf));
+      const outBuf = this.createEmptyBuffer(rows * d * 4);
+      const dummy = hasWeight ? weightBuf : this.createEmptyBuffer(4);
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: xBuf } },
+          { binding: 2, resource: { buffer: dummy } },
+          { binding: 3, resource: { buffer: outBuf } },
+        ],
+      });
+      this._dispatch(pipeline, bindGroup, rows, 1, 1, uniformBuf);
+      if (!hasWeight) dummy.destroy();
+      return outBuf;
+    }
+
     /** Inverted dropout backward with the same hash mask as dropoutFwd. */
     dropoutBwd(goutBuf, len, p, seed = 0) {
       const pipeline = this.getPipeline("dropout_bwd");

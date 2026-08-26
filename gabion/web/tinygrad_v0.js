@@ -2228,6 +2228,52 @@
     const shape = x.shape;
     const d = shape[shape.length - 1];
     const rows = x.numel / d;
+    const backend = gpu();
+    // GPU fast path — keep tensor resident
+    if (backend && x.onGPU) {
+      let wBufTmp = null;
+      let wBufForKernel = w ? w.gpuBuffer : null;
+      if (w && !wBufForKernel) { wBufTmp = backend.createBufferFromData(w.data); wBufForKernel = wBufTmp; }
+      const outBuf = backend.rmsNorm(x.gpuBuffer, rows, d, eps, wBufForKernel);
+      if (wBufTmp) backend.releaseBuffer(wBufTmp);
+      const req2 = x.requiresGrad || (w && w.requiresGrad);
+      const parents2 = w ? [x, w] : [x];
+      const xBuf2 = x.gpuBuffer;
+      const wBuf2 = w ? w.gpuBuffer : null;
+      const xOnGPU2 = true;
+      const t2 = new Tensor(new Float32Array(x.numel), [...shape], req2, parents2, (gout, goutBuf) => {
+        const be = gpu();
+        if (xOnGPU2 && be && xBuf2) {
+          const gb = goutBuf || be.createBufferFromData(gout);
+          const needsDestroy = !goutBuf;
+          const result = be.rmsNormBackward(xBuf2, gb, wBuf2, rows, d, eps);
+          if (x.requiresGrad) x._pendingGradBuf = result.dXBuf; else be.releaseBuffer(result.dXBuf);
+          if (w && w.requiresGrad) { w._pendingDWBuf = result.dWBuf; w._pendingDWRows = rows; w._pendingDWD = d; } else be.releaseBuffer(result.dWBuf);
+          if (needsDestroy) be.releaseBuffer(gb);
+        } else {
+          // CPU fallback (should not happen when xOnGPU)
+          if (x.requiresGrad) {
+            if (!x.grad) x.grad = new Float32Array(x.data.length);
+            // recompute inv on CPU from x.data
+            for (let i = 0; i < rows; i++) {
+              const row = i * d;
+              let s2 = 0; for (let j = 0; j < d; j++) s2 += x.data[row+j]*x.data[row+j];
+              const r = 1/Math.sqrt(s2/d + eps);
+              let dot=0; for (let j=0;j<d;j++) dot += (w? gout[row+j]*w.data[j]:gout[row+j])*x.data[row+j];
+              const coeff = (r*r*r*dot)/d;
+              for (let j=0;j<d;j++) { const xi=x.data[row+j]; const gj=w?gout[row+j]*w.data[j]:gout[row+j]; x.grad[row+j] += gj*r - xi*coeff; }
+            }
+          }
+          if (w && w.requiresGrad) {
+            if (!w.grad) w.grad = new Float32Array(d);
+            for (let i=0;i<rows;i++) { const row=i*d; let s2=0; for(let j=0;j<d;j++) s2+=x.data[row+j]*x.data[row+j]; const r=1/Math.sqrt(s2/d+eps); for(let j=0;j<d;j++) w.grad[j]+= gout[row+j]*x.data[row+j]*r; }
+          }
+        }
+      });
+      t2.gpuBuffer = outBuf;
+      t2._dirty = "gpu";
+      return t2;
+    }
     const out = new Float32Array(x.numel);
     const inv = new Float32Array(rows);
     for (let i = 0; i < rows; i++) {

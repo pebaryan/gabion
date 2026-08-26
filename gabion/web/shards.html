@@ -75,7 +75,7 @@ async function initCoordGPU() {
       },
     });
     WebGPUBackend.init(device);
-    for (const name of ["matmul", "embedding_forward"]) {
+    for (const name of ["matmul", "embedding_forward", "rmsnorm_forward"]) {
       const r = await fetch(`/gabion/web/kernels/${name}.wgsl`, { cache: "no-store" });
       if (r.ok) WebGPUBackend.registerShader(name, await r.text());
     }

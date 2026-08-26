@@ -11,6 +11,7 @@ layernorm.wgsl
 matmul.wgsl
 pad.wgsl
 reduce.wgsl
+rmsnorm_forward.wgsl
 rope.wgsl
 silu_mul.wgsl
 softmax.wgsl
