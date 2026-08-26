@@ -1,0 +1,16 @@
+batched_matmul.wgsl
+batched_transpose.wgsl
+concat.wgsl
+elementwise.wgsl
+embedding_forward.wgsl
+fused_attention.wgsl
+kv_attention_apply.wgsl
+kv_attention_scores.wgsl
+kv_group_sum.wgsl
+layernorm.wgsl
+matmul.wgsl
+pad.wgsl
+reduce.wgsl
+rope.wgsl
+silu_mul.wgsl
+softmax.wgsl
