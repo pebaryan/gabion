@@ -290,8 +290,8 @@
           take(bl.o.weight, uploadToGPU);
           take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
         }
-        take(bl.norm2.weight);          // CPU (1D) — exporter order: norm2 BEFORE gate_up
         take(bl.gateUp.weight, uploadToGPU);
+        take(bl.norm2.weight);          // CPU (1D)
         take(bl.down.weight, uploadToGPU);
       }
       take(this.normF.weight);
@@ -354,8 +354,8 @@
           take(bl.o.weight, uploadToGPU);
           take(bl.norm1.weight);          // CPU (1D, used in rmsNorm)
         }
-        take(bl.norm2.weight);          // CPU (1D) — exporter order: norm2 BEFORE gate_up
         take(bl.gateUp.weight, uploadToGPU);
+        take(bl.norm2.weight);          // CPU (1D)
         take(bl.down.weight, uploadToGPU);
       }
       return cursor;
