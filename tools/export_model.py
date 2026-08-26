@@ -1432,6 +1432,21 @@ def main(argv=None) -> int:
                     return 2 * D * D + 2 * D * kvD + 2 * D * dFF + dFF * D + 2 * D + 2 * hd
                 return 4 * D * D + 2 * D * dFF + dFF * D + 2 * D + 3 * D
             sizes = [layer_n(i) for i in range(L)]
+        elif cfg.get("arch") == "qwen35":
+            # heterogeneous: full layers [norm,q(2*H*hd),qn,k,kn,v,o(H*hd*D),n2,gate_up,down]
+            #            linear [norm,qkv,zg,sa,alpha,beta,dt,conv1d,snorm,sout,n2,gate_up,down]
+            lt = cfg["layer_types"]
+            hd = cfg["head_dim"]
+            S = cfg["ssm"]
+            def layer_n(i):
+                if lt[i] == "full":
+                    return (D + 2 * cfg["n_heads"] * hd * D + hd + D * cfg["n_kv_heads"] * hd
+                            + hd + D * cfg["n_kv_heads"] * hd + cfg["n_heads"] * hd * D
+                            + D + 2 * D * dFF + dFF * D)
+                return (D + S["conv_dim"] * D + S["v_dim"] * D + S["dt_rank"] * (2 + 2 * D)
+                        + S["conv_dim"] * S["conv_kernel"] + S["head_v_dim"] + S["v_dim"] * D
+                        + D + 2 * D * dFF + dFF * D)
+            sizes = [layer_n(i) for i in range(L)]
         else:
             per = 2 * D * D + 2 * D * kvD + 2 * D + 2 * D * dFF + dFF * D
             sizes = [per] * L
