@@ -213,3 +213,12 @@ artifacts/
 tests/_js_bbt_fixture*.json
 tests/_js_nn_optim_fixture*.json
 web/models/
+# Precompressed web assets (built by tools/compress_assets.py)
+gabion/web/*.js.gz
+gabion/web/*.js.br
+gabion/web/*.html.gz
+gabion/web/*.html.br
+gabion/web/kernels/*.wgsl.gz
+gabion/web/kernels/*.wgsl.br
+gabion/web/kernels/infer/*.wgsl.gz
+gabion/web/kernels/infer/*.wgsl.br
