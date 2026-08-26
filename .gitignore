@@ -222,3 +222,5 @@ gabion/web/kernels/*.wgsl.gz
 gabion/web/kernels/*.wgsl.br
 gabion/web/kernels/infer/*.wgsl.gz
 gabion/web/kernels/infer/*.wgsl.br
+# Source maps are build artifacts (generated with --source-map)
+gabion/web/*.js.map
