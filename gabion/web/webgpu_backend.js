@@ -1300,6 +1300,31 @@
       return outBuf;
     }
 
+    /** heads_split: [B*T, H_in*Hd] (+bias) -> [B*H_out, T, Hd] with GQA expand */
+    headsSplit(srcBuf, B, T, H_in, H_out, headDim, biasBuf=null) {
+      const pipeline=this.getPipeline("heads_split");
+      const hasBias=biasBuf?1:0;
+      const paramBuf=new ArrayBuffer(24);
+      new Uint32Array(paramBuf,0,6).set([B,T,H_in,H_out,headDim,hasBias]);
+      const uniformBuf=this.createUniformBuffer(new Uint8Array(paramBuf));
+      const outBuf=this.createEmptyBuffer(B*H_out*T*headDim*4);
+      const biasActual=biasBuf||this.createEmptyBuffer(4);
+      const bg=this.device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:uniformBuf}},{binding:1,resource:{buffer:srcBuf}},{binding:2,resource:{buffer:biasActual}},{binding:3,resource:{buffer:outBuf}}]});
+      this._dispatch(pipeline,bg,Math.ceil(B*H_out*T*headDim/256),1,1,uniformBuf);
+      if(!biasBuf) biasActual.destroy();
+      return outBuf;
+    }
+
+    /** heads_combine: [B*H, T, Hd] -> [B*T, H*Hd] */
+    headsCombine(srcBuf, B, T, H, headDim) {
+      const pipeline=this.getPipeline("heads_combine");
+      const uniformBuf=this.createUniformBuffer(new Uint32Array([B,T,H,headDim]));
+      const outBuf=this.createEmptyBuffer(B*T*H*headDim*4);
+      const bg=this.device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:uniformBuf}},{binding:1,resource:{buffer:srcBuf}},{binding:2,resource:{buffer:outBuf}}]});
+      this._dispatch(pipeline,bg,Math.ceil(B*T*H*headDim/256),1,1,uniformBuf);
+      return outBuf;
+    }
+
     /**
      * Batched transpose: out[b, j, i] = in[b, i, j]
      * Input: [B * M * N], Output: [B * N * M].

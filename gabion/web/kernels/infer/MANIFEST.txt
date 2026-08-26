@@ -4,6 +4,8 @@ concat.wgsl
 elementwise.wgsl
 embedding_forward.wgsl
 fused_attention.wgsl
+heads_combine.wgsl
+heads_split.wgsl
 kv_attention_apply.wgsl
 kv_attention_scores.wgsl
 kv_group_sum.wgsl

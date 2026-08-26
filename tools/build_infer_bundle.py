@@ -26,6 +26,8 @@ KEEP = {
     # keep layernorm for diffusion inference; rmsnorm is CPU today but keep wgsl if present
     "layernorm.wgsl",
     "rmsnorm_forward.wgsl",
+    "heads_split.wgsl",
+    "heads_combine.wgsl",
     "pad.wgsl",                  # VAE padding if latent diffusion demo
     "concat.wgsl",
 }

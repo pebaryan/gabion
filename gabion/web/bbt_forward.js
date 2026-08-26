@@ -492,31 +492,48 @@
         v = x2d.matmul(vW);
       }
 
-      // Readback Q/K/V for CPU reshape (head reordering)
-      if (q.onGPU) await q.toCPU();
-      if (k.onGPU) await k.toCPU();
-      if (v.onGPU) await v.toCPU();
+      // GPU fast path for inference: keep Q/K/V on GPU through RoPE (no readback)
+      // Falls back to CPU reshape when training (requiresGrad) or no backend.
+      const useGPUHeads = backend && this._ensureRopeGPU() && q.onGPU && k.onGPU && v.onGPU && !q.requiresGrad && !k.requiresGrad && !v.requiresGrad;
+      let qHeadsBuf=null, kHeadsBuf=null, vHeadsBuf=null;
+      let qHeadsBiasBuf=null, kHeadsBiasBuf=null, vHeadsBiasBuf=null;
+      if (useGPUHeads) {
+        if (qBias) qHeadsBiasBuf = backend.createBufferFromData(new Float32Array(qBias));
+        if (kBias) kHeadsBiasBuf = backend.createBufferFromData(new Float32Array(kBias));
+        if (vBias) vHeadsBiasBuf = backend.createBufferFromData(new Float32Array(vBias));
+        qHeadsBuf = backend.headsSplit(q.gpuBuffer, B, T, H, H, headDim, qHeadsBiasBuf);
+        kHeadsBuf = backend.headsSplit(k.gpuBuffer, B, T, this.kvH, H, headDim, kHeadsBiasBuf);
+        vHeadsBuf = backend.headsSplit(v.gpuBuffer, B, T, this.kvH, H, headDim, vHeadsBiasBuf);
+        if (qHeadsBiasBuf) backend.releaseBuffer(qHeadsBiasBuf);
+        if (kHeadsBiasBuf) backend.releaseBuffer(kHeadsBiasBuf);
+        if (vHeadsBiasBuf) backend.releaseBuffer(vHeadsBiasBuf);
+      } else {
+        // Readback Q/K/V for CPU reshape (head reordering)
+        if (q.onGPU) await q.toCPU();
+        if (k.onGPU) await k.toCPU();
+        if (v.onGPU) await v.toCPU();
 
-      // Attention biases (Qwen2.5-Instruct): q/k/v projections are affine
-      if (qBias) for (let i = 0; i < q.data.length; i++) q.data[i] += qBias[i % qBias.length];
-      if (kBias) for (let i = 0; i < k.data.length; i++) k.data[i] += kBias[i % kBias.length];
-      if (vBias) for (let i = 0; i < v.data.length; i++) v.data[i] += vBias[i % vBias.length];
+        // Attention biases (Qwen2.5-Instruct): q/k/v projections are affine
+        if (qBias) for (let i = 0; i < q.data.length; i++) q.data[i] += qBias[i % qBias.length];
+        if (kBias) for (let i = 0; i < k.data.length; i++) k.data[i] += kBias[i % kBias.length];
+        if (vBias) for (let i = 0; i < v.data.length; i++) v.data[i] += vBias[i % vBias.length];
 
-      // Reshape to [B*H, T, headDim] (CPU — data reordering); k/v are grouped
-      // when GQA (kvH < H) and expanded to full query-head count for the kernels.
-      q = this._reshapeForHeads(q, B, T, H, headDim);
-      k = this._reshapeForHeads(k, B, T, this.kvH, headDim);
-      v = this._reshapeForHeads(v, B, T, this.kvH, headDim);
-      k = this._expandKV(k, B, T);
-      v = this._expandKV(v, B, T);
+        // Reshape to [B*H, T, headDim] (CPU — data reordering); k/v are grouped
+        // when GQA (kvH < H) and expanded to full query-head count for the kernels.
+        q = this._reshapeForHeads(q, B, T, H, headDim);
+        k = this._reshapeForHeads(k, B, T, this.kvH, headDim);
+        v = this._reshapeForHeads(v, B, T, this.kvH, headDim);
+        k = this._expandKV(k, B, T);
+        v = this._expandKV(v, B, T);
+      }
 
       // GPU-accelerated attention core (RoPE + scores + softmax + weighted sum)
       // Forward outputs are kept on GPU for the backward pass.
       if (backend && this._ensureRopeGPU()) {
-        // Upload reshaped Q/K/V to GPU
-        const qBuf = backend.createBufferFromData(q.data);
-        const kBuf = backend.createBufferFromData(k.data);
-        const vBuf = backend.createBufferFromData(v.data);
+        // Upload reshaped Q/K/V to GPU if not already on GPU path
+        const qBuf = useGPUHeads ? qHeadsBuf : backend.createBufferFromData(q.data);
+        const kBuf = useGPUHeads ? kHeadsBuf : backend.createBufferFromData(k.data);
+        const vBuf = useGPUHeads ? vHeadsBuf : backend.createBufferFromData(v.data);
 
         // Batch all forward attention dispatches into a single submit
         backend.beginBatch();

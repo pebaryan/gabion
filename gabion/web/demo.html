@@ -57,7 +57,7 @@
 <script>
 "use strict";
 // All kernels the engine can dispatch (decode path needs the KV-attention set).
-const KERNELS = ["matmul","elementwise","reduce","softmax","rope","batched_matmul","fused_attention","rmsnorm_forward",
+const KERNELS = ["matmul","elementwise","reduce","softmax","rope","batched_matmul","fused_attention","rmsnorm_forward","heads_split","heads_combine",
   "softmax_backward","rope_backward","batched_transpose","rmsnorm_backward","adam_update","adamw_update",
   "sgd_update","cross_entropy_forward","cross_entropy_backward","embedding_forward","silu_mul",
   "silu_mul_backward","layernorm","layernorm_backward","dropout_fwd","dropout_bwd","conv2d_fwd",
