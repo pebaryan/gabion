@@ -1488,6 +1488,8 @@ def main(argv=None) -> int:
         print(f"wrote {d / 'model.json'} + {d / 'weights.f16'} ({n_weights} weights, "
               f"{len(out.get('vocab', {})) if out.get('vocab') else 0} vocab tokens)")
         return 0
+    if not args.out and not args.out_bin and not args.out_shards:
+        print("[hint] use --out-bin DIR for binary wire (model.json + weights.f16, 33% smaller than base64) or --out-shards N DIR", file=sys.stderr)
     out_path = args.out or Path(str((args.from_gguf or args.from_tinygrad or args.from_hf)) + ".gabion.json")
     out_path.write_text(json.dumps(out), encoding="utf-8")
     print(f"wrote {out_path} ({n_weights} weights, "

@@ -27,7 +27,7 @@
 <body>
 <h1>gabion demo — a real llama model generating in your tab</h1>
 <div class="bar">
-  <label>wire <input type="text" id="modelUrl" value="/gabion/web/models/qwen2.5-0.5b.gabion.json"></label>
+  <label>wire <input type="text" id="modelUrl" value="/gabion/web/models/qwen2.5-0.5b.json"></label>
   <label>tokens <input type="text" id="tokens" value="128" style="width:4rem"></label>
   <label>temp <input type="text" id="temp" value="0.7" style="width:4rem"></label>
   <label>top-k <input type="text" id="topk" value="40" style="width:4rem"></label>
@@ -101,16 +101,20 @@ async function generate() {
   $("output").textContent = ""; $("stats").textContent = "";
   out.error = null;
   try {
-    const url = $("modelUrl").value.trim() || "/gabion/web/models/qwen2.5-0.5b.gabion.json";
+    const url = $("modelUrl").value.trim() || "/gabion/web/models/qwen2.5-0.5b.json";
     const binary = $("binary").checked;
     const maxNew = Math.max(1, Math.min(512, parseInt($("tokens").value, 10) || 64));
     const temp = parseFloat($("temp").value);
     const topK = Math.max(0, parseInt($("topk").value, 10) || 0);
     const topP = parseFloat($("topp").value);
     const seedTxt = $("seed").value.trim();
-    status(binary ? "loading binary wire (weights.f16 + model.json)…" : "loading model wire…");
+    status(binary ? "loading binary wire (model.json + weights.f16)…" : "loading model wire…");
+    // Binary wire is the default (33% smaller than base64); auto-detect .json vs .gabion.json
+    const isGabionJson = url.endsWith(".gabion.json");
     const model = binary
-      ? await gabionLoader.loadBBTModelBin(url.replace(/\.gabion\.json$/, ".json"), url.replace(/\.gabion\.json$/, ".f16"))
+      ? await gabionLoader.loadBBTModelBin(
+          isGabionJson ? url.replace(/\.gabion\.json$/, ".json") : url,
+          isGabionJson ? url.replace(/\.gabion\.json$/, ".f16") : url.replace(/\.json$/, ".f16"))
       : await gabionLoader.loadBBTModel(url);
     out.model = { d_model: model.D, n_heads: model.H, kv_heads: model.kvH,
                   n_layers: model.L, vocab: model.V, seq_len: model.T };
@@ -208,10 +212,13 @@ async function generate() {
   if (p.get("mode") === "ref") {
     // diagnostic: GPU forward on the full prompt, last-row logits only
     try {
-      const url = $("modelUrl").value.trim() || "/gabion/web/models/qwen2.5-0.5b.gabion.json";
+      const url = $("modelUrl").value.trim() || "/gabion/web/models/qwen2.5-0.5b.json";
       const binary = p.get("binary") !== "0";
+      const isGabionJson = url.endsWith(".gabion.json");
       const model = binary
-        ? await gabionLoader.loadBBTModelBin(url.replace(/\.gabion\.json$/, ".json"), url.replace(/\.gabion\.json$/, ".f16"))
+        ? await gabionLoader.loadBBTModelBin(
+            isGabionJson ? url.replace(/\.gabion\.json$/, ".json") : url,
+            isGabionJson ? url.replace(/\.gabion\.json$/, ".f16") : url.replace(/\.json$/, ".f16"))
         : await gabionLoader.loadBBTModel(url);
       let prompt = p.get("prompt") || "The capital of France is";
       if (model.chatTemplate) {
