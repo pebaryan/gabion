@@ -35,7 +35,10 @@ def apply_worker_device_flags(args: argparse.Namespace) -> None:
         os.environ["DEV"] = "WEBGPU"
 
     if args.visible_devices:
-        os.environ["HCQ_VISIBLE_DEVICES"] = args.visible_devices
+        # tinygrad 0.14 cannot select a device index via DEV (the second
+        # colon-field is a renderer name); the qwen35 adapter reads the
+        # explicit indexed device string from QWEN35_DEVICE instead.
+        os.environ["QWEN35_DEVICE"] = f"CUDA:{args.visible_devices}"
     if args.webgpu_backend:
         os.environ["WEBGPU_BACKEND"] = args.webgpu_backend
 
@@ -76,6 +79,17 @@ def parse_args() -> argparse.Namespace:
     pebble.add_argument("--auto-work-scale", action="store_true")
     pebble.add_argument("--target-round-seconds", type=float, default=1.0)
     pebble.add_argument("--calibration-steps", type=int, default=2)
+    pebble.add_argument(
+        "--model",
+        dest="model_kind",
+        default=os.environ.get("PEBBLE_MODEL", "gemma4"),
+        choices=["gemma4", "qwen35"],
+        help="text inference model loaded by this pebble",
+    )
+    pebble.add_argument("--gguf", dest="model_gguf", default=None)
+    pebble.add_argument("--tokenizer", dest="tokenizer_path", default=None)
+    pebble.add_argument("--shard", dest="shard_idx", type=int, default=None)
+    pebble.add_argument("--num-shards", dest="num_shards", type=int, default=None)
 
     return parser.parse_args()
 
@@ -162,6 +176,11 @@ def main() -> None:
             mesh_ws_url=args.mesh_ws_url,
             preferred_job_id=args.job_id,
             work_scale=work_scale,
+            model_kind=str(args.model_kind),
+            model_gguf=args.model_gguf,
+            tokenizer_path=args.tokenizer_path,
+            shard_idx=args.shard_idx,
+            num_shards=args.num_shards,
         )
         worker = PebbleWorker(config=config, trainer=trainer)
         asyncio.run(worker.run())

@@ -30,3 +30,8 @@ class PebbleConfig:
     work_scale: float = 1.0
     gemma4_gguf: str = "D:/aimodels/gemma-4-E2B-it-Q4_K_M.gguf"
     gemma4_tokenizer_path: str = "D:/tmp/gemma4-e2b-hf/tokenizer.json"
+    model_kind: str = "gemma4"
+    model_gguf: str | None = None
+    tokenizer_path: str | None = None
+    shard_idx: int | None = None
+    num_shards: int | None = None

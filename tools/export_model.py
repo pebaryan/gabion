@@ -111,7 +111,11 @@ def parse_gguf(path: Path) -> tuple[dict, list[tuple[str, tuple, str, int]], int
     (name, dims_tuple, ggml_type, byte_offset) with byte_offset RELATIVE to the
     tensor data section (GGUF spec; llama.cpp writers use this). data_base is the
     absolute file position where the data section starts."""
-    buf = Path(path).read_bytes()
+    # Map the file only for header parsing.  Tensor payloads are reopened by
+    # the consumers as needed; reading the whole GGUF here would transiently
+    # allocate 10–17 GB before a shard can even start.
+    with Path(path).open("rb") as fh:
+        buf = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
     assert buf[:4] == b"GGUF", "not a GGUF file"
     (version, n_tensors, n_kv) = struct.unpack_from("<IQQ", buf, 4)
     if version != 3:
@@ -140,7 +144,9 @@ def parse_gguf(path: Path) -> tuple[dict, list[tuple[str, tuple, str, int]], int
     align = int(meta.get("general.alignment") or 32)
     if align <= 0 or (align & (align - 1)):
         raise ValueError(f"general.alignment must be a positive power of two, got {align}")
-    return meta, infos, (off + align - 1) & ~(align - 1)
+    result = (meta, infos, (off + align - 1) & ~(align - 1))
+    buf.close()
+    return result
 
 
 def _dequant(name: str, raw: bytes, dims: tuple, gtype: str) -> np.ndarray:
@@ -1120,9 +1126,11 @@ def _export_gguf_qwen35(meta: dict, by_name: dict, buf: bytes, data_base, config
     else:
         raise ValueError("cannot determine vocab size: token_embd.weight missing")
 
-    layer_types = []
-    for i in range(L):
-        layer_types.append("full" if (i + 1) % interval == 0 else "linear")
+    # Tensor presence is authoritative.  Qwen3.8 has the regular full
+    # attention interval plus a final full-attention tail layer (blk.64), so
+    # deriving this solely from `full_attention_interval` misreads that layer
+    # as GatedDeltaNet and fails on attn_qkv.weight.
+    layer_types = ["full" if f"blk.{i}.attn_q.weight" in by_name else "linear" for i in range(L)]
 
     tensors = [get("token_embd.weight")]
     for i in range(L):
@@ -1154,13 +1162,15 @@ def _export_gguf_qwen35(meta: dict, by_name: dict, buf: bytes, data_base, config
             so = as_linear(f"blk.{i}.ssm_out.weight", (vd, D))
             tensors += [norm, qkv, zg, sa, al, be, dt, cv, sn, so, n2, gate_up, down]
 
-    if "output.weight" in by_name:
-        raise ValueError("qwen35 wire assumes tied embeddings; unexpected output.weight")
-    tie = True
     norm_f = get("output_norm.weight")
     if norm_f is None:
         raise ValueError("GGUF is missing required tensor 'output_norm.weight'")
     tensors.append(norm_f.reshape(-1))
+    tie = "output.weight" not in by_name
+    if not tie:
+        # The generic wire loader expects [norm_f, lm_head] at the tail.
+        output = as_linear("output.weight", (D, n_vocab))
+        tensors.append(output)
 
     if config is None:
         cfg = {

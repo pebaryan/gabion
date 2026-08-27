@@ -133,6 +133,58 @@ gabion pebble --id w-nv --job-id my-job-v1 --device cuda --visible-devices 0
 gabion pebble --id w-amd --job-id my-job-v1 --device webgpu --webgpu-backend WGPUBackendType_Vulkan
 ```
 
+## Qwen3.8-27B CUDA inference
+
+> **Perf warning (measured 2026-08-27):** the streaming layer-dequant path
+> below runs at **~14s/token (0.07 tok/s)** — ~35× slower than the proven
+> standalone runner (`D:/tmp/_q27_run.py`: fused IQ4_NL GEMV, persistent u8
+> weights, GPU scan → **0.40s/tok**). Read `docs/qwen35-inference-status.md`
+> before extending this path; porting the fused-kernel techniques in is the
+> intended next step.
+>
+> **All speed/memory claims are measured with the protocol in
+> `docs/qwen35-benchmark.md` via `tools/bench_qwen35_pipeline.py --verify`
+> (single process, both shards, correctness gate + prefill/decode metrics).**
+> Multi-agent optimization work must follow that protocol.
+
+The Python pebble path supports the Qwen3.8 `qwen35` hybrid architecture and
+keeps the GGUF quantized on the host while streaming one active layer at a
+time to CUDA. Run two pebble processes, one per RTX 5060 Ti, with contiguous
+model shards:
+
+```powershell
+$env:CUDA_PATH = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+$env:NVRTC_PATH = "$env:CUDA_PATH\bin\nvrtc64_120_0.dll"
+$env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
+$gguf = 'D:\aimodels\Qwen3.8-27B-IQ4_NL.gguf'
+$tok = 'D:\aimodels\hf\Qwen3.5-9B\tokenizer.json'
+
+gabion mesh --host 127.0.0.1 --port 8765
+
+gabion pebble --id qwen-gpu0 --mesh-ws-url ws://127.0.0.1:8765/ws `
+  --device cuda --visible-devices 0 --model qwen35 --gguf $gguf `
+  --tokenizer $tok --shard 0 --num-shards 2
+
+gabion pebble --id qwen-gpu1 --mesh-ws-url ws://127.0.0.1:8765/ws `
+  --device cuda --visible-devices 1 --model qwen35 --gguf $gguf `
+  --tokenizer $tok --shard 1 --num-shards 2
+```
+
+Then call the greedy pipeline endpoint:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8765/infer -H 'Content-Type: application/json' `
+  -d '{"model":"qwen35","prompt":"Explain model parallelism in one sentence.","max_tokens":32}'
+```
+
+`IQ4_NL` is the recommended local file for quality/speed. The uncensored
+`IQ4_XS` file is also supported. The IQ3/UD files are smaller, but their
+additional IQ1/IQ2/IQ3 formats are not implemented in this CUDA path. Keep
+`QWEN35_MAX_CONTEXT` at or below the card's memory budget (the default is
+2048). To measure steady-state shard time after tinygrad compilation, run
+`python tools/bench_qwen35_cuda.py --shard 0
+--visible-device 0` and the corresponding `--shard 1 --visible-device 1`.
+
 List jobs:
 
 ```bash

@@ -250,7 +250,10 @@ class MeshServer:
             return await self._infer_pipeline_handler(request)
         # if workers are sharded, data-parallel path is invalid — auto pipeline
         async with self._workers_lock:
-            _has_pipe = any(sess.capabilities.get("gemma4_shard","") in ("0/2","1/2") for sess in self._workers.values())
+            _has_pipe = any(
+                sess.capabilities.get("model_shard", sess.capabilities.get("gemma4_shard", "")) in ("0/2", "1/2")
+                for sess in self._workers.values()
+            )
         if _has_pipe:
             return await self._infer_pipeline_handler(request)
         try:
@@ -364,7 +367,9 @@ class MeshServer:
         return web.json_response({"results": results, "workers": workers})
 
     async def _infer_pipeline_handler(self, request: web.Request) -> web.Response:
-        # Model-parallel: 35L split across 2 workers, hidden [B,T,1536] f16 between shards
+        # Model-parallel: contiguous layers split across two workers.  Hidden
+        # states cross the websocket as f16; recurrent/KV state stays local to
+        # each worker and is keyed by stream_id.
         import uuid, base64
         import numpy as np
 
@@ -376,13 +381,24 @@ class MeshServer:
         prompts = [str(p) for p in prompts if str(p).strip()]
         if not prompts:
             return web.json_response({"error": "no_prompts"}, status=400)
-        max_tokens = int(body.get("max_tokens", 8))
-        max_tokens = max(1, min(32, max_tokens))
+        max_tokens = int(body.get("max_tokens", 32))
+        max_tokens = max(1, min(128, max_tokens))
+        async with self._workers_lock:
+            model_kinds = {
+                str(sess.capabilities.get("model", "gemma4")).lower()
+                for sess in self._workers.values()
+            }
+        model_kind = str(body.get("model", "")).lower() or os.environ.get("PEBBLE_MODEL", "")
+        if not model_kind:
+            model_kind = "qwen35" if "qwen35" in model_kinds else "gemma4"
         # tokenizer on server
         try:
             from tokenizers import Tokenizer as HFTokenizer  # type: ignore
 
-            tok_path = Path("D:/tmp/gemma4-e2b-hf/tokenizer.json")
+            if model_kind == "qwen35":
+                tok_path = Path(os.environ.get("QWEN35_TOKENIZER", "D:/aimodels/hf/Qwen3.5-9B/tokenizer.json"))
+            else:
+                tok_path = Path("D:/tmp/gemma4-e2b-hf/tokenizer.json")
             if tok_path.exists():
                 _tok = HFTokenizer.from_file(str(tok_path))
             else:
@@ -402,9 +418,14 @@ class MeshServer:
             return web.json_response({"error": f"tokenizer_failed: {exc}"}, status=500)
         encoded: List[List[int]] = []
         for pr in prompts:
-            # Gemma4 canonical chat template: <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n — raw via ?raw=1
-            is_raw = request.query.get("raw") == "1" or pr.strip().startswith("<bos>") or pr.strip().startswith("<|turn>")
-            eff = pr if is_raw else f"<bos><|turn>user\n{pr}<turn|>\n<|turn>model\n"
+            is_raw = request.query.get("raw") == "1" or pr.strip().startswith(("<bos>", "<|turn>", "<|im_start|>"))
+            if is_raw:
+                eff = pr
+            elif model_kind == "qwen35":
+                eff = f"<|im_start|>user\n{pr}<|im_end|>\n<|im_start|>assistant\n"
+            else:
+                # Gemma4 canonical chat template.
+                eff = f"<bos><|turn>user\n{pr}<turn|>\n<|turn>model\n"
             try:
                 ids = _tok.encode(eff).ids  # type: ignore
             except Exception:
@@ -414,10 +435,13 @@ class MeshServer:
         # locate pipeline workers: need 2 with shard 0/1
         async with self._workers_lock:
             all_workers = dict(self._workers)
-        # pick pipeline workers: prefer those advertising gemma4_shard
+        # Pick workers advertising the requested model and a layer shard.
         shard_workers: Dict[int, tuple[str, any]] = {}
         for wid, sess in all_workers.items():
-            cap = sess.capabilities.get("gemma4_shard", "")
+            worker_model = str(sess.capabilities.get("model", "gemma4")).lower()
+            cap = sess.capabilities.get("model_shard", sess.capabilities.get("gemma4_shard", ""))
+            if worker_model != model_kind:
+                continue
             if cap in ("0/2", "1/2"):
                 idx = int(cap.split("/")[0])
                 shard_workers[idx] = (wid, sess)
@@ -425,22 +449,36 @@ class MeshServer:
                 # fallback: if only full workers, pipeline not available
                 pass
         if 0 not in shard_workers or 1 not in shard_workers:
-            # fallback: use any 2 workers as shard0/1 (sorted deterministic)
-            workers_sorted = sorted(all_workers.keys())
-            if len(workers_sorted) < 2:
-                return web.json_response({"error": "pipeline_need_2_workers", "have": list(all_workers.keys())}, status=503)
-            # assign
-            shard_workers = {0: (workers_sorted[0], all_workers[workers_sorted[0]]), 1: (workers_sorted[1], all_workers[workers_sorted[1]])}
+            return web.json_response(
+                {
+                    "error": "pipeline_need_2_model_shards",
+                    "model": model_kind,
+                    "have": [
+                        {
+                            "worker_id": wid,
+                            "model": sess.capabilities.get("model", "gemma4"),
+                            "shard": sess.capabilities.get("model_shard", sess.capabilities.get("gemma4_shard", "")),
+                        }
+                        for wid, sess in all_workers.items()
+                    ],
+                },
+                status=503,
+            )
         wid0, sess0 = shard_workers[0]
         wid1, sess1 = shard_workers[1]
         # helper to call shard via websocket future
-        async def _call_shard0(ids_list: List[int]):
+        async def _call_shard0(stream_id: str, ids_list: List[int] | None = None, token_id: int | None = None, reset: bool = False):
             rid = uuid.uuid4().hex[:8]
             fut: asyncio.Future = asyncio.get_event_loop().create_future()
             async with self._pipeline_lock:
                 self._pipeline_pending[rid] = fut
             try:
-                await sess0.ws.send_json(make_message("infer_pipeline_request", {"request_id": rid, "shard": 0, "ids": ids_list}))
+                payload = {"request_id": rid, "shard": 0, "stream_id": stream_id, "reset": reset}
+                if token_id is not None:
+                    payload["token_id"] = token_id
+                else:
+                    payload["ids"] = ids_list or []
+                await sess0.ws.send_json(make_message("infer_pipeline_request", payload))
             except Exception as exc:
                 async with self._pipeline_lock:
                     self._pipeline_pending.pop(rid, None)
@@ -452,13 +490,13 @@ class MeshServer:
                 async with self._pipeline_lock:
                     self._pipeline_pending.pop(rid, None)
 
-        async def _call_shard1(hidden_b64: str, hidden_shape: List[int]):
+        async def _call_shard1(stream_id: str, hidden_b64: str, hidden_shape: List[int], reset: bool = False):
             rid = uuid.uuid4().hex[:8]
             fut: asyncio.Future = asyncio.get_event_loop().create_future()
             async with self._pipeline_lock:
                 self._pipeline_pending[rid] = fut
             try:
-                await sess1.ws.send_json(make_message("infer_pipeline_request", {"request_id": rid, "shard": 1, "hidden_b64": hidden_b64, "hidden_shape": hidden_shape}))
+                await sess1.ws.send_json(make_message("infer_pipeline_request", {"request_id": rid, "shard": 1, "stream_id": stream_id, "reset": reset, "hidden_b64": hidden_b64, "hidden_shape": hidden_shape}))
             except Exception as exc:
                 async with self._pipeline_lock:
                     self._pipeline_pending.pop(rid, None)
@@ -471,39 +509,69 @@ class MeshServer:
                     self._pipeline_pending.pop(rid, None)
 
         results: List[Dict[str, Any]] = []
-        # sequential per-prompt pipeline, greedy
+        stop_tokens = {248044, 248045} if model_kind == "qwen35" else {1, 106, 0}
+        # sequential per-prompt pipeline, greedy.  Qwen3.8 is stateful: the
+        # first pass consumes the whole prompt, later passes consume one token.
         for pidx, prompt in enumerate(prompts):
             cur = list(encoded[pidx])
             gen_ids: List[int] = []
+            stream_id = uuid.uuid4().hex
+            failed = False
             for _step in range(max_tokens):
                 try:
-                    r0 = await _call_shard0(cur)
+                    first = _step == 0
+                    if model_kind == "qwen35":
+                        # Stateful hybrid model: prompt once, then one token.
+                        r0 = await _call_shard0(
+                            stream_id,
+                            ids_list=cur if first else None,
+                            token_id=None if first else cur[-1],
+                            reset=first,
+                        )
+                    else:
+                        # Preserve the original Gemma4 stateless pipeline
+                        # protocol, which expects the complete prefix each pass.
+                        r0 = await _call_shard0(stream_id, ids_list=cur)
                     if isinstance(r0, dict) and r0.get("error"):
                         raise RuntimeError(r0["error"])
                     hidden_b64 = str(r0.get("hidden_b64", "")) if isinstance(r0, dict) else ""
                     hidden_shape = list(r0.get("hidden_shape", [])) if isinstance(r0, dict) else []
                     if not hidden_b64:
                         raise RuntimeError("no hidden from shard0")
-                    r1 = await _call_shard1(hidden_b64, hidden_shape)
+                    r1 = await _call_shard1(
+                        stream_id, hidden_b64, hidden_shape, reset=first if model_kind == "qwen35" else False
+                    )
                     if isinstance(r1, dict) and r1.get("error"):
                         raise RuntimeError(r1["error"])
-                    b64 = str(r1.get("logits_b64", ""))
-                    if not b64:
-                        raise RuntimeError("no logits from shard1")
-                    raw = base64.b64decode(b64)
-                    logits = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
-                    nxt = int(np.argmax(logits))
-                    if nxt in (1, 106, 0):
+                    if model_kind == "qwen35" and "next_token_id" in r1:
+                        nxt = int(r1["next_token_id"])
+                    else:
+                        b64 = str(r1.get("logits_b64", ""))
+                        if not b64:
+                            raise RuntimeError("no logits from shard1")
+                        raw = base64.b64decode(b64)
+                        logits = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+                        nxt = int(np.argmax(logits))
+                    if nxt in stop_tokens:
                         break
                     cur.append(nxt)
                     gen_ids.append(nxt)
                 except asyncio.TimeoutError:
                     results.append({"prompt_idx": pidx, "prompt": prompt, "error": "pipeline_timeout", "generated_ids": gen_ids})
+                    failed = True
                     break
                 except Exception as exc:
                     results.append({"prompt_idx": pidx, "prompt": prompt, "error": str(exc), "generated_ids": gen_ids})
+                    failed = True
                     break
-            else:
+            # Do not retain KV/recurrent state after the request.  The release
+            # message is best-effort; a worker reconnect also clears it.
+            for sess in (sess0, sess1):
+                try:
+                    await sess.ws.send_json(make_message("infer_pipeline_release", {"stream_id": stream_id}))
+                except Exception:
+                    pass
+            if not failed:
                 # completed max_tokens
                 try:
                     text = _tok.decode(gen_ids)  # type: ignore
@@ -511,14 +579,8 @@ class MeshServer:
                     text = ""
                 results.append({"prompt_idx": pidx, "prompt": prompt, "generated_ids": gen_ids, "text": text, "mode": "pipeline", "workers": [wid0, wid1]})
                 continue
-            # if we broke via completing loop, decode for those with partial gen_ids
-            if not any(r.get("prompt_idx") == pidx for r in results):
-                try:
-                    text = _tok.decode(gen_ids)  # type: ignore
-                except Exception:
-                    text = ""
-                results.append({"prompt_idx": pidx, "prompt": prompt, "generated_ids": gen_ids, "text": text, "mode": "pipeline", "workers": [wid0, wid1]})
-            elif gen_ids and "text" not in [r for r in results if r.get("prompt_idx")==pidx][0]:
+            # Attach partial text to a failed result when there is one.
+            if gen_ids and any(r.get("prompt_idx") == pidx for r in results):
                 for r in results:
                     if r.get("prompt_idx")==pidx and "text" not in r and gen_ids:
                         try:

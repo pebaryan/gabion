@@ -22,12 +22,46 @@ class PebbleWorker:
         self._joined_job_id: str | None = None
         self._gemma4 = None
         self._gemma4_tok = None
+        self._qwen35 = None
+        self._qwen35_tok = None
         import os
-        self._shard_idx = int(os.environ.get("GEMMA4_SHARD", "0")) if os.environ.get("GEMMA4_NUM_SHARDS") else 0
-        self._num_shards = int(os.environ.get("GEMMA4_NUM_SHARDS", "1"))
+        self._model_kind = str(config.model_kind or os.environ.get("PEBBLE_MODEL", "gemma4")).lower()
+        env_shard = os.environ.get("QWEN35_SHARD", os.environ.get("GEMMA4_SHARD", "0"))
+        env_num_shards = os.environ.get("QWEN35_NUM_SHARDS", os.environ.get("GEMMA4_NUM_SHARDS", "1"))
+        self._shard_idx = int(config.shard_idx if config.shard_idx is not None else env_shard)
+        self._num_shards = int(config.num_shards if config.num_shards is not None else env_num_shards)
         # align mesh shard count with env; if pipeline enabled, num_shards=2
-        if os.environ.get("GEMMA4_PIPELINE", "0") == "1":
+        if os.environ.get("GEMMA4_PIPELINE", "0") == "1" or os.environ.get("QWEN35_PIPELINE", "0") == "1":
             self._num_shards = 2
+
+    def _get_qwen35(self):
+        if self._qwen35 is not None:
+            return self._qwen35, self._qwen35_tok
+        from pathlib import Path
+        import os
+
+        from gabion.user_models.qwen35_text import Qwen35TextAdapter
+
+        gguf = self.config.model_gguf or os.environ.get(
+            "QWEN35_GGUF", "D:/aimodels/Qwen3.8-27B-IQ4_NL.gguf"
+        )
+        if self._num_shards > 1:
+            self._qwen35 = Qwen35TextAdapter.from_gguf_shard(gguf, self._shard_idx, self._num_shards)
+            shard_tag = f"{self._shard_idx}/{self._num_shards} layers {self._qwen35.layer_start}-{self._qwen35.layer_end-1}"
+        else:
+            self._qwen35 = Qwen35TextAdapter.from_gguf(gguf)
+            shard_tag = "full"
+        tok_path = self.config.tokenizer_path or os.environ.get(
+            "QWEN35_TOKENIZER", "D:/aimodels/hf/Qwen3.5-9B/tokenizer.json"
+        )
+        try:
+            from tokenizers import Tokenizer
+
+            self._qwen35_tok = Tokenizer.from_file(str(Path(tok_path)))
+        except Exception as exc:
+            raise RuntimeError(f"Qwen tokenizer load failed ({tok_path}): {exc}") from exc
+        logger.info("pebble %s loaded qwen35 %s shard=%s", self.config.worker_id, gguf, shard_tag)
+        return self._qwen35, self._qwen35_tok
 
     def _get_gemma4(self):
         if self._gemma4 is not None:
@@ -78,6 +112,9 @@ class PebbleWorker:
         # only handle if matches our shard
         if shard != self._shard_idx and self._num_shards > 1:
             return
+        if self._model_kind == "qwen35":
+            await self._handle_qwen35_pipeline_request(ws, data)
+            return
         try:
             import base64, numpy as np, asyncio
 
@@ -109,6 +146,51 @@ class PebbleWorker:
         except Exception as exc:
             logger.warning("pipeline shard %s failed %s: %s", shard, rid, exc)
             await ws.send_json(make_message("infer_pipeline_result", {"request_id": rid, "error": str(exc)}))
+
+    async def _handle_qwen35_pipeline_request(self, ws, data):
+        """Run one Qwen3.8 pipeline stage while retaining decode state."""
+        rid = str(data.get("request_id", ""))
+        stream_id = str(data.get("stream_id", "default"))
+        shard = int(data.get("shard", 0))
+        reset = bool(data.get("reset", False))
+
+        def _sync():
+            import numpy as np
+
+            adapter, _tok = self._get_qwen35()
+            state = adapter.stream_state(stream_id, reset=reset)
+            if shard == 0:
+                if "token_id" in data and not reset:
+                    ids = [int(data["token_id"])]
+                else:
+                    ids = list(data.get("ids", []))
+                hidden = adapter.forward_shard_ids_to_hidden(ids, state=state)
+                from gabion.user_models.gemma4_text import _encode_hidden_f16
+
+                b64, shape = _encode_hidden_f16(hidden)
+                return {"hidden_b64": b64, "hidden_shape": shape}
+
+            from gabion.user_models.gemma4_text import _decode_hidden_f16
+
+            hidden = _decode_hidden_f16(str(data.get("hidden_b64", "")), list(data.get("hidden_shape", [])))
+            logits = adapter.forward_shard_hidden_to_logits(hidden, state=state)
+            return {
+                # Greedy Qwen decoding only needs argmax. Avoid shipping the
+                # 248k-vocabulary logits vector over the websocket each step.
+                "next_token_id": int(np.argmax(logits)),
+            }
+
+        try:
+            res = await asyncio.to_thread(_sync)
+            await ws.send_json(make_message("infer_pipeline_result", {"request_id": rid, **res}))
+        except Exception as exc:
+            logger.warning("qwen35 pipeline shard %s failed %s: %s", shard, rid, exc)
+            await ws.send_json(make_message("infer_pipeline_result", {"request_id": rid, "error": str(exc)}))
+
+    async def _handle_infer_pipeline_release(self, data):
+        if self._model_kind != "qwen35" or self._qwen35 is None:
+            return
+        self._qwen35.release_stream(str(data.get("stream_id", "default")))
 
     async def _handle_infer_request(self, ws, data):
         rid = str(data.get("request_id", ""))
@@ -165,7 +247,9 @@ class PebbleWorker:
                                     "capabilities": {
                                         "trainer": self.trainer.backend,
                                         "work_scale": f"{self.config.work_scale:.4f}",
+                                        "model": self._model_kind,
                                         "gemma4_shard": f"{self._shard_idx}/{self._num_shards}" if self._num_shards > 1 else "full",
+                                        "model_shard": f"{self._shard_idx}/{self._num_shards}" if self._num_shards > 1 else "full",
                                         "gemma4_pipeline": "1" if self._num_shards > 1 else "0",
                                     },
                                 },
@@ -209,6 +293,8 @@ class PebbleWorker:
                                     await self._handle_infer_request(ws, data)
                                 elif msg_type == "infer_pipeline_request":
                                     await self._handle_infer_pipeline_request(ws, data)
+                                elif msg_type == "infer_pipeline_release":
+                                    await self._handle_infer_pipeline_release(data)
                                 elif msg_type == "round_start":
                                     await self._handle_round_start(ws, data)
                                 elif msg_type == "round_summary":
