@@ -32,7 +32,11 @@ def _decode_int8_delta(b64str: str, scale: float, original: List[float]) -> List
     """Decode int8 delta-compressed weights back to full float weights."""
     raw = base64.b64decode(b64str)
     n = len(raw)
-    result = list(original[:n])
+    if n != len(original):
+        raise ValueError(
+            f"int8 delta length {n} does not match weights length {len(original)}"
+        )
+    result = list(original)
     for i in range(n):
         # Signed int8
         val = raw[i]
@@ -151,6 +155,7 @@ class MeshServer:
                 web.get("/assets/{name}", self.asset_handler),
                 web.get("/assets/kernels/{name}", self.kernel_asset_handler),
                 web.post("/jobs/{job_id}/max-rounds", self.set_max_rounds_handler),
+                web.post("/infer", self.infer_handler),
                 web.get("/ws", self.ws_handler),
             ]
         )
@@ -182,6 +187,10 @@ class MeshServer:
 
     async def _on_startup(self, app: web.Application) -> None:
         self._round_task = asyncio.create_task(self._round_loop())
+        self._infer_pending: Dict[str, asyncio.Future] = {}
+        self._infer_lock = asyncio.Lock()
+        self._pipeline_pending: Dict[str, asyncio.Future] = {}
+        self._pipeline_lock = asyncio.Lock()
 
     async def _on_cleanup(self, app: web.Application) -> None:
         if self._round_task:
@@ -234,6 +243,290 @@ class MeshServer:
                 "model_version": runtime.model_version,
             }
         )
+
+    async def infer_handler(self, request: web.Request) -> web.Response:
+        # pipeline split-layers mode via ?split=layers
+        if request.query.get("split") == "layers":
+            return await self._infer_pipeline_handler(request)
+        # if workers are sharded, data-parallel path is invalid — auto pipeline
+        async with self._workers_lock:
+            _has_pipe = any(sess.capabilities.get("gemma4_shard","") in ("0/2","1/2") for sess in self._workers.values())
+        if _has_pipe:
+            return await self._infer_pipeline_handler(request)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        prompts = body.get("prompts") or ([body.get("prompt")] if body.get("prompt") else [])
+        prompts = [str(p) for p in prompts if str(p).strip()]
+        if not prompts:
+            return web.json_response({"error": "no_prompts"}, status=400)
+        max_tokens = int(body.get("max_tokens", 20))
+        max_tokens = max(1, min(128, max_tokens))
+        # load tokenizer on server to encode prompts to ids
+        try:
+            from tokenizers import Tokenizer as HFTokenizer  # type: ignore
+
+            tok_path = Path("D:/tmp/gemma4-e2b-hf/tokenizer.json")
+            if tok_path.exists():
+                _tok = HFTokenizer.from_file(str(tok_path))
+            else:
+                from transformers import AutoTokenizer  # type: ignore
+
+                _tok = AutoTokenizer.from_pretrained("google/gemma-4-e2b-it", trust_remote_code=True)
+                # wrap to have encode
+                class _Wrap:
+                    def encode(self, s):
+                        return type("o", (), {"ids": _tok.encode(s)})()
+
+                _tok = _Wrap()
+        except Exception as exc:
+            return web.json_response({"error": f"tokenizer_failed: {exc}"}, status=500)
+        # encode
+        encoded: List[List[int]] = []
+        for pr in prompts:
+            try:
+                ids = _tok.encode(pr).ids  # type: ignore
+            except Exception:
+                ids = _tok.encode(pr)  # type: ignore
+                if hasattr(ids, "ids"):
+                    ids = ids.ids
+                else:
+                    ids = list(ids)
+            encoded.append(list(ids))
+
+        async with self._workers_lock:
+            workers = [wid for wid, sess in self._workers.items() if sess.joined_job_id]
+            if not workers:
+                workers = list(self._workers.keys())
+            if not workers:
+                return web.json_response({"error": "no_workers"}, status=503)
+            # round-robin shard prompts across workers
+            shards: Dict[str, List[int]] = {wid: [] for wid in workers}
+            for idx in range(len(prompts)):
+                wid = workers[idx % len(workers)]
+                shards[wid].append(idx)
+
+        # create per-shard futures
+        import uuid
+
+        pending: Dict[str, List[Dict[str, Any]]] = {}
+        futures: Dict[str, asyncio.Future] = {}
+        for wid, idxs in shards.items():
+            if not idxs:
+                continue
+            rid = uuid.uuid4().hex[:8]
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            async with self._infer_lock:
+                self._infer_pending[rid] = fut
+            futures[rid] = fut
+            pending[rid] = [{"prompt_idx": i, "prompt": prompts[i], "ids": encoded[i]} for i in idxs]
+            # send to specific worker
+            sess = self._workers.get(wid)
+            if sess:
+                try:
+                    await sess.ws.send_json(
+                        make_message(
+                            "infer_request",
+                            {"request_id": rid, "prompts": pending[rid], "max_tokens": max_tokens},
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("infer send failed to %s: %s", wid, exc)
+                    async with self._infer_lock:
+                        if rid in self._infer_pending and not fut.done():
+                            fut.set_exception(exc)
+
+        # collect with timeout
+        results: List[Dict[str, Any]] = []
+        for rid, fut in futures.items():
+            try:
+                res = await asyncio.wait_for(fut, timeout=600)
+                # res is list of {prompt_idx, generated_ids, text}
+                results.extend(res)
+            except asyncio.TimeoutError:
+                logger.warning("infer timeout %s", rid)
+                async with self._infer_lock:
+                    self._infer_pending.pop(rid, None)
+                for item in pending[rid]:
+                    results.append({"prompt_idx": item["prompt_idx"], "prompt": item["prompt"], "error": "timeout"})
+            except Exception as exc:
+                results.append({"prompt_idx": pending[rid][0]["prompt_idx"] if pending[rid] else -1, "error": str(exc)})
+
+        results.sort(key=lambda x: x.get("prompt_idx", 999))
+        # decode generated ids server-side if needed
+        for r in results:
+            if "generated_ids" in r and "text" not in r:
+                try:
+                    r["text"] = _tok.decode(r["generated_ids"])  # type: ignore
+                except Exception:
+                    pass
+        return web.json_response({"results": results, "workers": workers})
+
+    async def _infer_pipeline_handler(self, request: web.Request) -> web.Response:
+        # Model-parallel: 35L split across 2 workers, hidden [B,T,1536] f16 between shards
+        import uuid, base64
+        import numpy as np
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        prompts = body.get("prompts") or ([body.get("prompt")] if body.get("prompt") else [])
+        prompts = [str(p) for p in prompts if str(p).strip()]
+        if not prompts:
+            return web.json_response({"error": "no_prompts"}, status=400)
+        max_tokens = int(body.get("max_tokens", 8))
+        max_tokens = max(1, min(32, max_tokens))
+        # tokenizer on server
+        try:
+            from tokenizers import Tokenizer as HFTokenizer  # type: ignore
+
+            tok_path = Path("D:/tmp/gemma4-e2b-hf/tokenizer.json")
+            if tok_path.exists():
+                _tok = HFTokenizer.from_file(str(tok_path))
+            else:
+                from transformers import AutoTokenizer  # type: ignore
+
+                _tok2 = AutoTokenizer.from_pretrained("google/gemma-4-e2b-it", trust_remote_code=True)
+
+                class _Wrap:  # type: ignore
+                    def encode(self, s):
+                        return type("o", (), {"ids": _tok2.encode(s)})()
+
+                    def decode(self, ids):
+                        return _tok2.decode(ids, skip_special_tokens=True)
+
+                _tok = _Wrap()
+        except Exception as exc:
+            return web.json_response({"error": f"tokenizer_failed: {exc}"}, status=500)
+        encoded: List[List[int]] = []
+        for pr in prompts:
+            # Gemma4 canonical chat template: <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n — raw via ?raw=1
+            is_raw = request.query.get("raw") == "1" or pr.strip().startswith("<bos>") or pr.strip().startswith("<|turn>")
+            eff = pr if is_raw else f"<bos><|turn>user\n{pr}<turn|>\n<|turn>model\n"
+            try:
+                ids = _tok.encode(eff).ids  # type: ignore
+            except Exception:
+                ids2 = _tok.encode(eff)  # type: ignore
+                ids = list(ids2.ids) if hasattr(ids2, "ids") else list(ids2)
+            encoded.append(list(ids))
+        # locate pipeline workers: need 2 with shard 0/1
+        async with self._workers_lock:
+            all_workers = dict(self._workers)
+        # pick pipeline workers: prefer those advertising gemma4_shard
+        shard_workers: Dict[int, tuple[str, any]] = {}
+        for wid, sess in all_workers.items():
+            cap = sess.capabilities.get("gemma4_shard", "")
+            if cap in ("0/2", "1/2"):
+                idx = int(cap.split("/")[0])
+                shard_workers[idx] = (wid, sess)
+            elif cap == "full":
+                # fallback: if only full workers, pipeline not available
+                pass
+        if 0 not in shard_workers or 1 not in shard_workers:
+            # fallback: use any 2 workers as shard0/1 (sorted deterministic)
+            workers_sorted = sorted(all_workers.keys())
+            if len(workers_sorted) < 2:
+                return web.json_response({"error": "pipeline_need_2_workers", "have": list(all_workers.keys())}, status=503)
+            # assign
+            shard_workers = {0: (workers_sorted[0], all_workers[workers_sorted[0]]), 1: (workers_sorted[1], all_workers[workers_sorted[1]])}
+        wid0, sess0 = shard_workers[0]
+        wid1, sess1 = shard_workers[1]
+        # helper to call shard via websocket future
+        async def _call_shard0(ids_list: List[int]):
+            rid = uuid.uuid4().hex[:8]
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            async with self._pipeline_lock:
+                self._pipeline_pending[rid] = fut
+            try:
+                await sess0.ws.send_json(make_message("infer_pipeline_request", {"request_id": rid, "shard": 0, "ids": ids_list}))
+            except Exception as exc:
+                async with self._pipeline_lock:
+                    self._pipeline_pending.pop(rid, None)
+                raise exc
+            try:
+                res = await asyncio.wait_for(fut, timeout=1800)
+                return res
+            finally:
+                async with self._pipeline_lock:
+                    self._pipeline_pending.pop(rid, None)
+
+        async def _call_shard1(hidden_b64: str, hidden_shape: List[int]):
+            rid = uuid.uuid4().hex[:8]
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            async with self._pipeline_lock:
+                self._pipeline_pending[rid] = fut
+            try:
+                await sess1.ws.send_json(make_message("infer_pipeline_request", {"request_id": rid, "shard": 1, "hidden_b64": hidden_b64, "hidden_shape": hidden_shape}))
+            except Exception as exc:
+                async with self._pipeline_lock:
+                    self._pipeline_pending.pop(rid, None)
+                raise exc
+            try:
+                res = await asyncio.wait_for(fut, timeout=1800)
+                return res
+            finally:
+                async with self._pipeline_lock:
+                    self._pipeline_pending.pop(rid, None)
+
+        results: List[Dict[str, Any]] = []
+        # sequential per-prompt pipeline, greedy
+        for pidx, prompt in enumerate(prompts):
+            cur = list(encoded[pidx])
+            gen_ids: List[int] = []
+            for _step in range(max_tokens):
+                try:
+                    r0 = await _call_shard0(cur)
+                    if isinstance(r0, dict) and r0.get("error"):
+                        raise RuntimeError(r0["error"])
+                    hidden_b64 = str(r0.get("hidden_b64", "")) if isinstance(r0, dict) else ""
+                    hidden_shape = list(r0.get("hidden_shape", [])) if isinstance(r0, dict) else []
+                    if not hidden_b64:
+                        raise RuntimeError("no hidden from shard0")
+                    r1 = await _call_shard1(hidden_b64, hidden_shape)
+                    if isinstance(r1, dict) and r1.get("error"):
+                        raise RuntimeError(r1["error"])
+                    b64 = str(r1.get("logits_b64", ""))
+                    if not b64:
+                        raise RuntimeError("no logits from shard1")
+                    raw = base64.b64decode(b64)
+                    logits = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+                    nxt = int(np.argmax(logits))
+                    if nxt in (1, 106, 0):
+                        break
+                    cur.append(nxt)
+                    gen_ids.append(nxt)
+                except asyncio.TimeoutError:
+                    results.append({"prompt_idx": pidx, "prompt": prompt, "error": "pipeline_timeout", "generated_ids": gen_ids})
+                    break
+                except Exception as exc:
+                    results.append({"prompt_idx": pidx, "prompt": prompt, "error": str(exc), "generated_ids": gen_ids})
+                    break
+            else:
+                # completed max_tokens
+                try:
+                    text = _tok.decode(gen_ids)  # type: ignore
+                except Exception:
+                    text = ""
+                results.append({"prompt_idx": pidx, "prompt": prompt, "generated_ids": gen_ids, "text": text, "mode": "pipeline", "workers": [wid0, wid1]})
+                continue
+            # if we broke via completing loop, decode for those with partial gen_ids
+            if not any(r.get("prompt_idx") == pidx for r in results):
+                try:
+                    text = _tok.decode(gen_ids)  # type: ignore
+                except Exception:
+                    text = ""
+                results.append({"prompt_idx": pidx, "prompt": prompt, "generated_ids": gen_ids, "text": text, "mode": "pipeline", "workers": [wid0, wid1]})
+            elif gen_ids and "text" not in [r for r in results if r.get("prompt_idx")==pidx][0]:
+                for r in results:
+                    if r.get("prompt_idx")==pidx and "text" not in r and gen_ids:
+                        try:
+                            r["text"] = _tok.decode(gen_ids)  # type: ignore
+                        except Exception:
+                            pass
+        results.sort(key=lambda x: x.get("prompt_idx", 999))
+        return web.json_response({"results": results, "mode": "pipeline", "workers": [wid0, wid1]})
 
     async def webgpu_worker_handler(self, request: web.Request) -> web.Response:
         return web.Response(text=self._webgpu_worker_html(), content_type="text/html")
@@ -411,6 +704,23 @@ class MeshServer:
                         session = self._workers.get(worker_id)
                         if session:
                             session.last_heartbeat = time.time()
+
+                elif msg_type == "infer_result" and worker_id:
+                    rid = str(payload.get("request_id", ""))
+                    results = payload.get("results", [])
+                    async with self._infer_lock:
+                        fut = self._infer_pending.get(rid)
+                        if fut and not fut.done():
+                            fut.set_result(list(results) if isinstance(results, list) else [])
+                            self._infer_pending.pop(rid, None)
+
+                elif msg_type == "infer_pipeline_result" and worker_id:
+                    rid = str(payload.get("request_id", ""))
+                    async with self._pipeline_lock:
+                        fut = self._pipeline_pending.get(rid)
+                        if fut and not fut.done():
+                            fut.set_result(dict(payload))
+                            self._pipeline_pending.pop(rid, None)
 
                 elif msg_type == "round_result" and worker_id:
                     worker_meta = {

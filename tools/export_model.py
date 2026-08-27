@@ -1209,6 +1209,154 @@ def _export_gguf_qwen35(meta: dict, by_name: dict, buf: bytes, data_base, config
     return wire
 
 
+def _export_gguf_gemma4(meta: dict, by_name: dict, buf: bytes, data_base: int, config: dict | None = None) -> dict:
+    """Gemma4 (text) — E2B/E4B/31B. Heterogeneous per-layer FFN width and
+    optional per-layer input gate (hidden_size_per_layer_input). Wire layout
+    (flat, intended for a future JS BBTTransformer arch='gemma4' consumer;
+    NOT implemented in model_loader.js/bbt_forward.js yet — current consumers
+    are Python-only: Gemma4TextAdapter reads the GGUF directly):
+
+      token_embd [V, D]
+      per layer i:
+        input_norm [D], q [D,H*hd], q_norm [hd], k [D,K*hd], k_norm [hd],
+        v [D,K*hd], o [H*hd,D], proj? depends on hidden_size_per_layer_input
+        inp_gate [D,256] + proj [256,D] + post_per_layer_input_norm [D] when needed
+        post_attention_norm [D], pre_ffn_norm [D], gate [D,dff], up [D,dff],
+        gate_up fused [D,2*dff], down [dff,D], post_ffw_norm [D],
+        post_per_layer_input_norm? layer_scale [1]
+      output_norm [D]
+    """
+    arch = "gemma4"
+    def kv(key: str):
+        return meta.get(f"{arch}.{key}")
+    def get(name: str):
+        if name not in by_name:
+            return None
+        dims, gtype, off = by_name[name]
+        return _tensor_data(buf, name, dims, gtype, off, data_base)
+    def as_linear(name: str, want: tuple):
+        t = get(name)
+        if t is None:
+            raise ValueError(f"GGUF missing '{name}'")
+        t = t.T
+        if t.shape != want:
+            raise ValueError(f"{name}: {t.shape} vs {want}")
+        return t
+    L = int(kv("block_count"))
+    D = int(kv("embedding_length"))
+    H = int(kv("attention.head_count"))
+    Kv = int(kv("attention.head_count_kv") or H)
+    ctx = int(kv("context_length") or 131072)
+    rope = float(kv("rope.freq_base") or 1000000.0)
+    rope_swa = float(kv("rope.freq_base_swa") or 10000.0)
+    sw = int(kv("attention.sliding_window") or 512)
+    pat = kv("attention.sliding_window_pattern") or [True]*L
+    # feed_forward_length may be int or list per layer
+    ffl = kv("feed_forward_length")
+    if isinstance(ffl, list):
+        dffs = [int(x) for x in ffl]
+    else:
+        dffs = [int(ffl or 4*D)]*L
+    hs_per = int(kv("embedding_length_per_layer_input") or 0)
+    tok_dims = by_name.get("token_embd.weight", ((),))[0]
+    n_vocab = int(tok_dims[1]) if len(tok_dims)==2 else int(kv("vocab_size") or 0)
+    if not n_vocab:
+        toks = meta.get("tokenizer.ggml.tokens")
+        n_vocab = len(toks) if toks else 0
+    tok = get("token_embd.weight")
+    if tok is None or tok.shape != (n_vocab, D):
+        raise ValueError(f"token_embd {tok.shape if tok is not None else None} vs {(n_vocab,D)}")
+    tensors=[tok]
+    # per-layer hd from q shape
+    for i in range(L):
+        # hd from the q shape: by_name dims are numpy order (D, H*hd)
+        qd = by_name[f"blk.{i}.attn_q.weight"][0]
+        hd = int(qd[1] // H) if len(qd) == 2 else D // H
+        kv_hd = int(by_name[f"blk.{i}.attn_k.weight"][0][1] // Kv) if f"blk.{i}.attn_k.weight" in by_name else hd
+        # norms and attentions
+        n1 = get(f"blk.{i}.attn_norm.weight").reshape(-1)
+        q = as_linear(f"blk.{i}.attn_q.weight", (D, H*hd))
+        qn = get(f"blk.{i}.attn_q_norm.weight").reshape(-1)
+        k = as_linear(f"blk.{i}.attn_k.weight", (D, Kv*hd))
+        kn = get(f"blk.{i}.attn_k_norm.weight").reshape(-1)
+        v = as_linear(f"blk.{i}.attn_v.weight", (D, Kv*hd))
+        o = as_linear(f"blk.{i}.attn_output.weight", (H*hd, D))
+        tensors += [n1, q, qn, k, kn, v, o]
+        if hs_per:
+            ig = as_linear(f"blk.{i}.inp_gate.weight", (D, hs_per))
+            proj = as_linear(f"blk.{i}.proj.weight", (hs_per, D))
+            tensors += [ig, proj]
+        # post attention
+        pa = get(f"blk.{i}.post_attention_norm.weight")
+        if pa is not None:
+            tensors.append(pa.reshape(-1))
+        pf = get(f"blk.{i}.ffn_norm.weight")
+        if pf is not None:
+            tensors.append(pf.reshape(-1))
+        else:
+            # fallback pre_feedforward name
+            pf2 = get(f"blk.{i}.pre_feedforward_layernorm.weight")
+            if pf2 is not None:
+                tensors.append(pf2.reshape(-1))
+        dff = dffs[i]
+        gate = as_linear(f"blk.{i}.ffn_gate.weight", (D, dff))
+        up = as_linear(f"blk.{i}.ffn_up.weight", (D, dff))
+        gate_up = np.concatenate([gate, up], axis=1)
+        down = as_linear(f"blk.{i}.ffn_down.weight", (dff, D))
+        tensors += [gate_up, down]
+        pff = get(f"blk.{i}.post_ffw_norm.weight")
+        if pff is None:
+            pff = get(f"blk.{i}.post_feedforward_layernorm.weight")
+        if pff is not None:
+            tensors.append(pff.reshape(-1))
+        if hs_per:
+            ppn = get(f"blk.{i}.post_norm.weight")
+            if ppn is None:
+                ppn = get(f"blk.{i}.post_per_layer_input_norm.weight")
+            if ppn is not None:
+                tensors.append(ppn.reshape(-1))
+            else:
+                tensors.append(get(f"blk.{i}.post_attention_norm.weight").reshape(-1)*0)  # placeholder?
+        sc = get(f"blk.{i}.layer_output_scale.weight")
+        if sc is not None:
+            tensors.append(sc.reshape(-1))
+    out_norm = get("output_norm.weight")
+    if out_norm is None:
+        out_norm = get("output_norm.weight") or get("token_embd_norm.weight")
+    tensors.append(out_norm.reshape(-1))
+    # tied
+    tie = "output.weight" not in by_name
+    if not tie:
+        tensors.append(as_linear("output.weight", (D, n_vocab)))
+    # config
+    layer_types = ["full_attention" if not bool(pat[i]) else "sliding_attention" for i in range(L)] if isinstance(pat, list) else ["sliding_attention"]*L
+    cfg = {
+        "arch": "gemma4", "vocab_size": n_vocab, "d_model": D, "n_heads": H, "n_kv_heads": Kv,
+        "n_layers": L, "seq_len": min(ctx, 131072), "d_ff": int(np.mean(dffs)), "d_ff_per_layer": dffs,
+        "tie_weights": tie, "act_quant": True, "rope_base": rope, "rope_base_swa": rope_swa,
+        "sliding_window": sw, "sliding_window_pattern": [bool(x) for x in pat] if isinstance(pat, list) else pat,
+        "hidden_size_per_layer_input": hs_per, "rope_dim": int(kv("rope.dimension_count") or 0),
+        "rope_dim_swa": int(kv("rope.dimension_count_swa") or 0),
+        "final_logit_softcapping": float(kv("final_logit_softcapping") or 0),
+        "layer_types": layer_types,
+    }
+    if config is not None:
+        cfg = {**cfg, **dict(config)}
+        cfg["arch"] = "gemma4"
+    flat = np.concatenate([np.asarray(t, dtype=np.float32).reshape(-1) for t in tensors])
+    wire={"config": cfg, "weights_b64": f16_base64(flat)}
+    toks = meta.get("tokenizer.ggml.tokens")
+    if toks and meta.get("tokenizer.ggml.merges"):
+        wire["vocab"]={t:i for i,t in enumerate(toks)}
+        wire["merges"]=[ln for ln in meta["tokenizer.ggml.merges"] if ln]
+        ttypes=meta.get("tokenizer.ggml.token_type")
+        if ttypes:
+            wire["special"]=[t for i,t in enumerate(toks) if i < len(ttypes) and ttypes[i] in (3,4)]
+        if meta.get("tokenizer.chat_template"):
+            wire["chat_template"]=meta["tokenizer.chat_template"]
+        cfg["tokenizer"]=f"gemma4:{meta.get('tokenizer.ggml.pre','sp')}"
+    return wire
+
 def export_gguf(path: Path, config: dict | None = None) -> dict:
     buf = Path(path).read_bytes()
     meta, infos, data_base = parse_gguf(path)
@@ -1220,6 +1368,8 @@ def export_gguf(path: Path, config: dict | None = None) -> dict:
         return _export_gguf_lfm2(meta, by_name, buf, data_base, config)
     if arch == "qwen35":
         return _export_gguf_qwen35(meta, by_name, buf, data_base, config)
+    if arch in ("gemma4", "gemma3"):
+        return _export_gguf_gemma4(meta, by_name, buf, data_base, config)
 
     def kv(key: str):
         return meta.get(f"{arch}.{key}") if f"{arch}.{key}" in meta else meta.get(f"llama.{key}")

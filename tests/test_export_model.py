@@ -112,10 +112,20 @@ def _write_gguf(path: Path, meta: dict, tensors: dict[str, np.ndarray],
         elif isinstance(v, float):
             out += struct.pack("<I", 6) + struct.pack("<f", v)
         elif isinstance(v, list):  # array: u32 elem_type, u64 count, bare elements
-            assert all(isinstance(e, str) for e in v), "only string arrays supported"
-            out += struct.pack("<I", 9) + struct.pack("<IQ", 8, len(v))
-            for e in v:
-                put_str(e)
+            if all(isinstance(e, str) for e in v):
+                out += struct.pack("<I", 9) + struct.pack("<IQ", 8, len(v))
+                for e in v:
+                    put_str(e)
+            elif all(isinstance(e, bool) for e in v):
+                out += struct.pack("<I", 9) + struct.pack("<IQ", 7, len(v))
+                for e in v:
+                    out += struct.pack("<?", e)
+            elif all(isinstance(e, int) for e in v):
+                out += struct.pack("<I", 9) + struct.pack("<IQ", 11, len(v))
+                for e in v:
+                    out += struct.pack("<q", e)
+            else:
+                raise TypeError(f"unsupported array element type: {v!r}")
         else:
             raise TypeError(type(v))
 
@@ -751,3 +761,86 @@ def test_export_gguf_qwen35(tmp_path):
     assert np.allclose(q_flat.reshape(D, 2 * H * HD), tensors["blk.3.attn_q.weight"].T, atol=1e-3)
     assert out["vocab"] == {"a": 0, "b": 1} and out["merges"] == ["a b"]
     assert cfg["tokenizer"] == "qwen2:bpe"
+
+
+def test_export_gguf_gemma4(tmp_path):
+    """Synthetic gemma4 GGUF -> wire: per-layer FFN widths, sliding-window
+    pattern, config keys, flat sizes, tied head, optional layer scale.
+    Mirrors _export_gguf_gemma4 (no JS consumer yet — locks the exporter)."""
+    import numpy as np
+    from tools.export_model import f16_decode
+    D, H, KVH, HD, L, V = 32, 4, 2, 8, 3, 16
+    dffs = [48, 64, 48]
+    sw, pat = 8, [False, True, False]  # False -> full attention
+    rng = np.random.default_rng(7)
+    tensors = {"token_embd.weight": rng.standard_normal((V, D)).astype(np.float32),
+               "output_norm.weight": rng.standard_normal(D).astype(np.float32)}
+    for i in range(L):
+        tensors[f"blk.{i}.attn_norm.weight"] = rng.standard_normal(D).astype(np.float32)
+        tensors[f"blk.{i}.attn_q.weight"] = rng.standard_normal((H * HD, D)).astype(np.float32)
+        tensors[f"blk.{i}.attn_q_norm.weight"] = rng.standard_normal(HD).astype(np.float32)
+        tensors[f"blk.{i}.attn_k.weight"] = rng.standard_normal((KVH * HD, D)).astype(np.float32)
+        tensors[f"blk.{i}.attn_k_norm.weight"] = rng.standard_normal(HD).astype(np.float32)
+        tensors[f"blk.{i}.attn_v.weight"] = rng.standard_normal((KVH * HD, D)).astype(np.float32)
+        tensors[f"blk.{i}.attn_output.weight"] = rng.standard_normal((D, H * HD)).astype(np.float32)
+        tensors[f"blk.{i}.post_attention_norm.weight"] = rng.standard_normal(D).astype(np.float32)
+        tensors[f"blk.{i}.ffn_norm.weight"] = rng.standard_normal(D).astype(np.float32)
+        tensors[f"blk.{i}.ffn_gate.weight"] = rng.standard_normal((dffs[i], D)).astype(np.float32)
+        tensors[f"blk.{i}.ffn_up.weight"] = rng.standard_normal((dffs[i], D)).astype(np.float32)
+        tensors[f"blk.{i}.ffn_down.weight"] = rng.standard_normal((D, dffs[i])).astype(np.float32)
+        tensors[f"blk.{i}.post_ffw_norm.weight"] = rng.standard_normal(D).astype(np.float32)
+    tensors["blk.2.layer_output_scale.weight"] = np.ones(1, dtype=np.float32)  # optional branch
+    meta = {
+        "general.architecture": "gemma4",
+        "gemma4.block_count": L,
+        "gemma4.embedding_length": D,
+        "gemma4.attention.head_count": H,
+        "gemma4.attention.head_count_kv": KVH,
+        "gemma4.rope.freq_base": 1e6,
+        "gemma4.rope.freq_base_swa": 1e4,
+        "gemma4.rope.dimension_count": 64,
+        "gemma4.attention.sliding_window": sw,
+        "gemma4.attention.sliding_window_pattern": pat,
+        "gemma4.feed_forward_length": dffs,
+        "gemma4.embedding_length_per_layer_input": 0,
+        "gemma4.context_length": 4096,
+        "gemma4.attention.layer_norm_rms_epsilon": 1e-6,
+        "tokenizer.ggml.tokens": ["a", "b"],
+        "tokenizer.ggml.merges": ["a b"],
+        "tokenizer.ggml.pre": "sp",
+    }
+    path = tmp_path / "gemma4.gguf"
+    _write_gguf(path, meta, tensors)
+    out = export_gguf(path)
+    cfg = out["config"]
+    assert cfg["arch"] == "gemma4"
+    assert cfg["d_ff_per_layer"] == dffs
+    assert cfg["d_ff"] == int(np.mean(dffs))
+    assert cfg["sliding_window"] == sw and cfg["sliding_window_pattern"] == pat
+    assert cfg["layer_types"] == ["full_attention", "sliding_attention", "full_attention"]
+    assert cfg["n_heads"] == H and cfg["n_kv_heads"] == KVH
+    assert cfg["rope_base"] == 1e6 and cfg["rope_base_swa"] == 1e4
+    assert cfg["rope_dim"] == 64
+    assert cfg["tie_weights"] is True and cfg["hidden_size_per_layer_input"] == 0
+    assert cfg["tokenizer"] == "gemma4:sp"
+    # flat size: tok + per-layer (norms, attn, fused gate_up, down, scale) + output_norm
+    def layer_n(i):
+        return (D + D * H * HD + HD + D * KVH * HD + HD + D * KVH * HD + H * HD * D
+                + D + D + 2 * D * dffs[i] + dffs[i] * D + D + (1 if i == 2 else 0))
+    f16 = f16_decode(out["weights_b64"])
+    assert len(f16) == V * D + sum(layer_n(i) for i in range(L)) + D
+    f32 = np.array(f16, dtype=np.float16).astype(np.float32)
+    # layer 0 q flat starts after tok_embd + attn_norm
+    off0 = V * D + D
+    q_flat = f32[off0: off0 + D * H * HD]
+    assert np.allclose(q_flat.reshape(D, H * HD), tensors["blk.0.attn_q.weight"].T, atol=1e-3)
+    # layer 0 fused gate_up: after layer-0 norms + attention block
+    gu_off = V * D + (D + D * H * HD + HD + D * KVH * HD + HD + D * KVH * HD + H * HD * D + D + D)
+    gu_flat = f32[gu_off: gu_off + 2 * D * dffs[0]]
+    gu_want = np.concatenate([tensors["blk.0.ffn_gate.weight"].T, tensors["blk.0.ffn_up.weight"].T], axis=1)
+    assert np.allclose(gu_flat.reshape(D, 2 * dffs[0]), gu_want, atol=1e-3)
+    # layer 0 ffn_down after gate_up
+    dn_off = gu_off + 2 * D * dffs[0]
+    dn_flat = f32[dn_off: dn_off + dffs[0] * D]
+    assert np.allclose(dn_flat.reshape(dffs[0], D), tensors["blk.0.ffn_down.weight"].T, atol=1e-3)
+    assert out["vocab"] == {"a": 0, "b": 1} and out["merges"] == ["a b"]

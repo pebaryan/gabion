@@ -28,3 +28,5 @@ class PebbleConfig:
     heartbeat_interval_s: float = 5.0
     preferred_job_id: str | None = None
     work_scale: float = 1.0
+    gemma4_gguf: str = "D:/aimodels/gemma-4-E2B-it-Q4_K_M.gguf"
+    gemma4_tokenizer_path: str = "D:/tmp/gemma4-e2b-hf/tokenizer.json"
