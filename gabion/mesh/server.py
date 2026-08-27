@@ -367,6 +367,13 @@ class MeshServer:
         return web.json_response({"results": results, "workers": workers})
 
     async def _infer_pipeline_handler(self, request: web.Request) -> web.Response:
+        # Serialize whole pipelines: concurrent /infer requests would interleave
+        # shard0/shard1 calls on the same worker adapter (single-flight GPU state)
+        # and corrupt each other's streams (observed: empty 200 / "Failed to fetch").
+        async with self._infer_lock:
+            return await self._infer_pipeline_handler_locked(request)
+
+    async def _infer_pipeline_handler_locked(self, request: web.Request) -> web.Response:
         # Model-parallel: contiguous layers split across two workers.  Hidden
         # states cross the websocket as f16; recurrent/KV state stays local to
         # each worker and is keyed by stream_id.
