@@ -701,11 +701,19 @@ class Qwen35TextAdapter:
 
         for li in range(self.layer_start, self.layer_end):
             self._w[li] = self._load_layer_weights(li)
+            # Drain tinygrad's pinned host staging (pending_copyin) per layer: each
+            # weight upload allocates a pinned buffer for the async HtoD copy, and
+            # without a sync they accumulate until the WDDM pinned pool is exhausted
+            # (~5.5GB) — the 27B two-shard load OOMs without these syncs (the standalone
+            # runner syncs after every weight group).
+            Device[self.dev].synchronize()
         if self.layer_start == 0:
             self._tok_emb = self._load_emb()
+            Device[self.dev].synchronize()
         if self.owns_output_norm:
             self._out_norm = self._small_gpu("output_norm.weight")
             self._out_w = self._load_head()
+            Device[self.dev].synchronize()
 
         self._blks = []
         for li in range(self.layer_start, self.layer_end):

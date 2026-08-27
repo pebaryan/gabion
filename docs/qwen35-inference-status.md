@@ -100,6 +100,33 @@ decode median s/tok, prefill tok/s at 64/512, VRAM). Adapter accepts an
 explicit `device=` (or `QWEN35_DEVICE=CUDA:<idx>`) — tinygrad 0.14 ignores
 `HCQ_VISIBLE_DEVICES` and `DEV=CUDA:1` for device selection.
 
+## Web deployment: single-process dual-device mesh worker (2026-08-27, RUNNING)
+
+The two-process mesh (one worker per shard) **cannot run the 27B on this
+system**: each process OOMs at ~7.4GB (`MemoryError: Allocation of 256 B
+failed on CUDA. Used: 7.29 GB`) — a WDDM per-context wall, while one process
+can allocate ~15GB per GPU. The web deployment therefore uses
+**`D:/tmp/_q35_dual_worker.py`**: ONE process builds both shard adapters
+(`from_gguf_shard(..., device="CUDA:0")` / `device="CUDA:1")`) and registers
+as BOTH pebble workers (`q35-s0`, `q35-s1`). The server still orchestrates
+shard0 → hidden → shard1 → logits over websockets.
+
+- Measured: GPU0 10.4 GiB / GPU1 9.6 GiB in one process, load ~60s.
+- Warm web decode ≈ **1.56 tok/s (0.64 s/tok)** at 30 tokens — the mesh adds
+  a per-token websocket round-trip + f16 hidden encode/decode on top of the
+  runner's 0.40 s/tok. 27B oracle prefix `[248068, 198, 760, 1156, 369, 9859]`
+  matches through the full pipeline.
+- **Pinned-pool bug found by this shape (fixed in the adapter):** each weight
+  upload allocates a tinygrad pinned host staging buffer (`_copyin` →
+  `BufferSpec(host=True)`) that is only released on stream sync. The port
+  dropped the runner's per-weight `Device[dev].synchronize()` calls, so at 27B
+  scale the WDDM pinned pool (~5.5GB) exhausted mid-load
+  (`cuMemHostAlloc: CUDA Error 2`). Fix: sync after every layer + emb/head in
+  `_load_gpu` (the runner syncs after every weight group).
+- Launch: mesh server (`--max-rounds 0`) + `_q35_dual_worker.py` + a local
+  chat page (`D:/tmp/_q35_chat_web.py`, proxies POST /infer same-origin).
+  `server.py` caps `max_tokens` at 2048 (was 128 — too small for real answers).
+
 ## Recommendation for this adapter (resolved by the port)
 
 - ✅ Adopt the runner's design: persistent u8 weights + the fused IQ4_NL GEMV

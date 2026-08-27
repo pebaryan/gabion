@@ -265,7 +265,7 @@ class MeshServer:
         if not prompts:
             return web.json_response({"error": "no_prompts"}, status=400)
         max_tokens = int(body.get("max_tokens", 20))
-        max_tokens = max(1, min(128, max_tokens))
+        max_tokens = max(1, min(2048, max_tokens))
         # load tokenizer on server to encode prompts to ids
         try:
             from tokenizers import Tokenizer as HFTokenizer  # type: ignore
@@ -382,7 +382,7 @@ class MeshServer:
         if not prompts:
             return web.json_response({"error": "no_prompts"}, status=400)
         max_tokens = int(body.get("max_tokens", 32))
-        max_tokens = max(1, min(128, max_tokens))
+        max_tokens = max(1, min(2048, max_tokens))
         async with self._workers_lock:
             model_kinds = {
                 str(sess.capabilities.get("model", "gemma4")).lower()
