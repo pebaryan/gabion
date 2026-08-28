@@ -681,19 +681,20 @@ class _QWeight:
             # sub-block loop.  Decode is the headline metric, so row-major
             # wins for Q5_K even though the same change is a large win for
             # the wider IQ4_NL and Q6_K kernels.
+            # uint32 is ALWAYS the realized primary; u8 is the lazy bitcast
+            # view for the dequant fallbacks.  This is not just a preference:
+            # when qs32/qh32 were an unrealized bitcast view (the old path for
+            # every shape except ssm_out), feeding them to the fused GEMV
+            # inside a TinyJit produced correct standalone values but
+            # degenerate output on replay — a stale captured buffer.  That,
+            # not numerics, is why attn_qkv fusion "failed the gate": its
+            # kernel is accurate to 7.5e-07 (better than ssm_out's 2.7e-06).
             qs_np = np.ascontiguousarray(blk[:, 48:176])
             qh_np = np.ascontiguousarray(blk[:, 16:48])
-            q5_part = os.environ.get("QWEN35_FUSE_Q5_PART", "so").lower()
-            if q5_part in {"1", "so", "ssm_out"} and shape == (5120, 6144):
-                self.qs32 = Tensor(qs_np.view("<u4"), device=dev).realize()
-                self.qh32 = Tensor(qh_np.view("<u4"), device=dev).realize()
-                self.qs = self.qs32.bitcast(dtypes.uint8)
-                self.qh = self.qh32.bitcast(dtypes.uint8)
-            else:
-                self.qs = Tensor(qs_np, device=dev, dtype=dtypes.uint8).realize()
-                self.qh = Tensor(qh_np, device=dev, dtype=dtypes.uint8).realize()
-                self.qs32 = self.qs.bitcast(dtypes.uint32)
-                self.qh32 = self.qh.bitcast(dtypes.uint32)
+            self.qs32 = Tensor(qs_np.view("<u4"), device=dev).realize()
+            self.qh32 = Tensor(qh_np.view("<u4"), device=dev).realize()
+            self.qs = self.qs32.bitcast(dtypes.uint8)
+            self.qh = self.qh32.bitcast(dtypes.uint8)
             self.d = Tensor(d, device=dev).realize()
             self.dmin = Tensor(dmin, device=dev).realize()
             self.sc = Tensor(sc, device=dev).realize()
@@ -1462,7 +1463,8 @@ class Qwen35TextAdapter:
         # additional opt-in diagnostics that must not disable "so".
         q5_fused = (isinstance(w, _QWeight) and w.gtype == "Q5_K"
                     and ((q5_part in {"1", "so", "ssm_out", "all"} and w.shape == (5120, 6144))
-                         or (q5_part in {"qkv", "all"} and w.shape == (10240, 5120))
+                         or ((q5_part in {"qkv", "all"} or os.environ.get("QWEN35_FUSE_Q5_QKV", "0") == "1")
+                             and w.shape == (10240, 5120))
                          or (os.environ.get("QWEN35_FUSE_Q5_V", "1") == "1" and w.shape == (1024, 5120))))
         if (isinstance(w, _QWeight) and str(self.dev).startswith("CUDA")
                 and x.numel() == w.shape[1]

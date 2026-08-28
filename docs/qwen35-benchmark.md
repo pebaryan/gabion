@@ -74,6 +74,82 @@ Cumulative for the session: **decode 0.2783 → 0.1322 s/tok (−53%, 3.59 →
 7.56 tok/s)** and **prefill 22.25/23.32 → 30.50/31.67 tok/s (+37%/+36%)** at
 equal-or-lower VRAM, every step gate-PASS.
 
+### 2e. int8 DP4A, and the attn_qkv investigation (2026-08-28)
+
+**Why llama.cpp is faster, measured rather than assumed.** Its central trick
+is keeping the dot product in the integer domain: quantize the activation to
+int8 per 32-block and use `__dp4a` (4-way int8 MAC) against the quantized
+weights, applying scales once per block, instead of dequantizing each weight
+to float. A raw-NVRTC prototype of that for IQ4_NL measured:
+
+| shape | float dequant-FMA | int8 `__dp4a` | speedup |
+|---|---|---|---|
+| ffn_gate/up 17408x5120 | 151-161 us | 130-134 us | 1.13-1.24x |
+| ffn_down 5120x17408 | 349-366 us | 231-254 us | 1.38-1.58x |
+
+Accuracy: maxrel 5.9e-3, cosine 0.99998 — *not* bit-exact, since int8
+activation quantization is a real numeric change.
+
+**The win is modest because IQ4_NL still needs a 16-entry `kvalues` table
+lookup per nibble, which DP4A does not remove.** A deliberately-wrong
+"no lookup" ceiling probe (cos 0.677) measured **no speedup at all** on
+ffn_gate/up and only 10% on ffn_down, proving the lookup is *not* the
+bottleneck. Working the numbers: the ffn_gate/up kernel moves ~55.7 MB per
+call, so 130 us is **~427 GB/s — about 95% of the card's 448 GB/s peak**, and
+the existing float kernel is already at ~345 GB/s (77%). There is nearly
+nothing left at the kernel level for this shape. DP4A would pay off far more
+for Q4_0-style quants where the nibble *is* the value.
+
+Given that ceiling, DP4A was **not integrated**: the isolated 1.1-1.6x would
+be offset by the ~1.2x penalty raw programs pay for falling out of CUDA-graph
+batching (measured in 2b), plus a per-activation quantization kernel and
+correctness-gate risk. llama.cpp gets the technique without the framework
+penalty because it has no framework — the two are not separable.
+
+#### attn_qkv: the biggest single remaining item, still blocked
+
+Per-token cost accounting from measured per-call times puts the **unfused
+Q5_K `attn_qkv` at ~28.5 ms of the ~132 ms step** (48 layers x ~593 us) —
+about 22% of decode, and 35% of all matmul time. It is the one large matrix
+still on the `x @ w.dequant().T` path.
+
+**Correction to an earlier claim in this file:** 2c said fusing attn_qkv
+"does not improve throughput". That measurement was confounded — setting
+`QWEN35_FUSE_Q5_PART=qkv` silently disabled the `ssm_out` fusion (the
+exclusive-match trap noted in 2c), so it measured the loss of `ssm_out`, not
+the gain from qkv. Measured fairly with an additive `QWEN35_FUSE_Q5_QKV=1`,
+qkv fusion is worth **0.1183 vs 0.1301 s/tok — a 9.1% decode win** that
+clearly clears the acceptance bar. It still fails the correctness gate, so it
+stays opt-in and off by default.
+
+Four root-cause hypotheses were tested and **eliminated**:
+1. *Kernel numerics* — no. Against real model weights the fused qkv GEMV is
+   accurate to **maxrel 7.5e-07, cosine 1.000000000**, which is *better* than
+   `ssm_out`'s 2.7e-06 — and ssm_out passes the gate.
+2. *Stale captured buffer from a lazy bitcast view* — no. qs32/qh32 are now
+   always realized primaries (kept: it is worth ~1.7% on its own, see below);
+   the gate still failed identically.
+3. *f16 product precision* — no. Forcing an f32 activation for qkv changed
+   nothing (`0.1183 s/tok`, same failure).
+4. *Unstable output buffer feeding the cross-token conv-state store* — no,
+   though `.contiguous()` on the qkv result **changed** the failure
+   (`[248068, 271, ...]` vs `[248068, 198, ...]`), confirming genuine buffer
+   aliasing sensitivity without fixing it.
+
+The failure signature is consistent across all variants: the first token or
+two are correct, then the model degenerates to `248046` (`<|im_end|>`) —
+i.e. the GDN recurrent/conv state is being corrupted across tokens, not the
+projection value itself. **Next investigator: instrument `conv_state` and
+`rec_state` divergence per layer per token between the fused and unfused qkv
+paths — the projection output is provably correct, so the bug is in how its
+result interacts with the in-graph state stores.** Do not re-test the four
+hypotheses above.
+
+A side benefit did land: making the Q5_K uint32 tensors always-realized
+primaries (rather than lazy bitcast views for every shape but `ssm_out`)
+improved the default from **0.1324 to 0.1301 s/tok**, gate PASS at unchanged
+VRAM — `attn_v` had been on the lazy path.
+
 #### Post-coalescing state and remaining headroom
 
 Re-profiling with `DEBUG=2` after the relayout: achieved bandwidth rose from
