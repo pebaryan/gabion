@@ -7,7 +7,62 @@ this protocol: the single report line from `tools/bench_qwen35_pipeline.py`,
 run before and after the change, on this machine. Numbers measured any other
 way are anecdotal and will be rejected.
 
-Last updated: 2026-08-28 (u32-word quant loads accepted; see §2b).
+Last updated: 2026-08-28 (rstride resweep + Q5_K attn_v fusion accepted; see §2c).
+
+### 2c. rstride resweep + Q5_K attn_v fusion (2026-08-28, accepted — current default)
+
+After the u32-word change (§2b) lowered per-kernel cost, two further defaults
+were resweept/extended and both won on repeated clean runs:
+
+- **Realization stride 1** (`QWEN35_RSTRIDE`, was 2): two clean runs measured
+  **0.1917 / 0.1919 s/tok** vs stride 2's **0.1928 / 0.1932**. Small but
+  consistent, prefill also ticked up slightly. Now the default.
+- **Q5_K `attn_v` GEMV fusion** (new `QWEN35_FUSE_Q5_V`, default `1`): the
+  27B full-attention layers' `attn_v` projection is Q5_K shape `(1024, 5120)`
+  — small, but 17 layers deep and previously routed through the unfused
+  `x @ w.dequant().T` path like `attn_qkv`. Unlike `attn_qkv`, fusing it
+  **passes the correctness gate** (its accumulation isn't in a 48-layer
+  recurrent scan, so 1-ULP drift doesn't compound the same way). Two clean
+  runs measured **0.1873 / 0.1873 s/tok** at fixed VRAM, vs the rstride-1
+  baseline's 0.1917/0.1919 — about **−2.4%** more.
+  (Caution: `QWEN35_FUSE_Q5_PART=v` alone — as opposed to `QWEN35_FUSE_Q5_V=1`
+  — is a trap: `q5_part` match is exclusive, so setting it to `v` silently
+  *disables* the `so` fusion and regresses to 0.2528 s/tok. `QWEN35_FUSE_Q5_V`
+  is intentionally a separate, additive flag for this reason.)
+
+Combined default report (both changes active):
+`qwen35-bench v1 path=native split=auto split_actual=33 q5_head=so q5_local=16 iq4_local=32 iq4_tile4=1 q6_head=fused q6_local=256 rstride=1 prefill_batch=4 gguf=Qwen3.8-27B-IQ4_NL.gguf load_s=27.2 warmup_s=5.9 decode_s_tok_min=0.1865 decode_s_tok_median=0.1870 decode_s_tok_mean=0.1876 decode_tok_s=5.35 prefill64_tok_s=29.944 prefill512_tok_s=31.068 vram_load=CUDA:8.82GiB,CUDA:1:9.67GiB,NPY:0.00GiB,PYTHON:0.00GiB gate=PASS`
+
+That's **decode 0.2783 → 0.1870 s/tok (−33%, 3.59 → 5.35 tok/s)** and
+**prefill 22.25/23.32 → 29.94/31.07 tok/s (+35%/+33%)** vs the session's
+original baseline (§2b), same or lower VRAM throughout.
+
+Investigated and rejected in this round:
+- **Q5_K `attn_qkv` fusion re-tested** (`QWEN35_FUSE_Q5_PART=qkv`): still
+  fails the correctness gate (`[248068, 198, 248046, ...]` vs expected),
+  confirming the prior finding — the 48-layer GDN recurrent state amplifies
+  the fused kernel's accumulation-order drift into a token flip. Also
+  measured slower (0.2521 s/tok) despite the smaller per-call cost, likely
+  from local-width mistuning at that shape. Kept as an opt-in diagnostic.
+- **IQ4 local width 16/64** (from 32): both regressed to 0.1949/0.1964 s/tok.
+- **Q5 local width 8** (from 16): 0.1940 s/tok, flat-to-worse.
+- **Q6 head local width 128** (from 256): 0.1927 s/tok, statistically flat.
+- **Prefill batch 8** on the generalized raw tile: rejected earlier in §2b
+  (14.4/16.0 tok/s vs batch 4's 22.25/23.32); not revisited since prefill
+  wasn't the remaining bottleneck.
+
+**Where the remaining time goes** (measured via `DEBUG=2` kernel timing on a
+real decode step): the GPU is ~90% busy during a step (summed device kernel
+time ≈ wall clock), so this is not a host-dispatch/HCQ bottleneck — TinyJit's
+CUDA-graph replay already collapses ~370 kernels/shard/step into 5-6 graph
+launches. The two largest launches per shard (the GDN/attention recurrence
+segments) achieve only ~10% of theoretical HBM bandwidth, consistent with
+many small sequentially-dependent per-layer ops (the T=1 recurrent scan)
+rather than a bandwidth-bound bulk kernel. The next lever is reducing
+sequential kernel count inside the 65-layer recurrence itself, not dequant
+kernel throughput — everything cheaply fusable at the kernel level is now
+fused; `attn_qkv` is the one large remaining unfused matrix, and it's fenced
+off by the correctness gate.
 
 ### 2b. u32-word quant loads (2026-08-28, accepted — current default)
 

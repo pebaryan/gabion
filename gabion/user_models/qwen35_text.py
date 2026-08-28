@@ -1271,7 +1271,10 @@ class Qwen35TextAdapter:
         # indexed device string (device= arg or QWEN35_DEVICE=CUDA:1), which
         # is the mechanism the standalone runner uses for its second card.
         self.dev = device or os.environ.get("QWEN35_DEVICE") or str(Device.DEFAULT)
-        self._rstride = int(os.environ.get("QWEN35_RSTRIDE", "2"))
+        # Resweep after the u32-word kernel change (2026-08-28): stride 1
+        # edged out stride 2 on two clean runs (0.1917/0.1919 vs 0.1928/0.1932
+        # s/tok) now that per-kernel cost is lower, so it is the new default.
+        self._rstride = int(os.environ.get("QWEN35_RSTRIDE", "1"))
         fuse = os.environ.get("QWEN35_FUSE_F16", "auto")
         self._fuse_f16 = {"1": True, "0": False}.get(fuse, self._gguf_size >= 8 * 2**30)
         self._v_sp = UOp.variable("start_pos", 0, self.seq_len - 1)
@@ -1399,9 +1402,12 @@ class Qwen35TextAdapter:
         # attn_qkv remains on the reference path because fusing it fails the
         # model gate and does not improve throughput.
         q5_part = os.environ.get("QWEN35_FUSE_Q5_PART", "so").lower()
+        # "so" is always eligible (it's the accepted default); qkv/v are
+        # additional opt-in diagnostics that must not disable "so".
         q5_fused = (isinstance(w, _QWeight) and w.gtype == "Q5_K"
-                    and q5_part in {"1", "so", "ssm_out"}
-                    and w.shape == (5120, 6144))
+                    and ((q5_part in {"1", "so", "ssm_out", "all"} and w.shape == (5120, 6144))
+                         or (q5_part in {"qkv", "all"} and w.shape == (10240, 5120))
+                         or (os.environ.get("QWEN35_FUSE_Q5_V", "1") == "1" and w.shape == (1024, 5120))))
         if (isinstance(w, _QWeight) and str(self.dev).startswith("CUDA")
                 and x.numel() == w.shape[1]
                 and (w.gtype == "IQ4_NL" or (w.gtype == "Q5_K" and q5_fused))

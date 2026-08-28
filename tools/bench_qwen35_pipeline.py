@@ -41,8 +41,10 @@ def pick_gate(gguf: str) -> tuple[list[int], list[int]]:
     return FRANCE_IDS_27B, EXPECTED_27B
 
 
-def run_pipeline(left, right, ids, s0, s1) -> int:
+def run_pipeline(left, right, ids, s0, s1, native=None) -> int:
     """One full forward over `ids`; returns the argmax of the final position."""
+    if native is not None:
+        return native.run_greedy(ids, s0, s1)
     hidden = left.forward_shard_ids_to_hidden(ids, s0)
     logits = right.forward_shard_hidden_to_logits(hidden, s1)
     return int(np.argmax(logits))
@@ -63,10 +65,12 @@ def main() -> None:
     ap.add_argument("--prefill-lens", type=int, nargs="+", default=[64, 512], help="synthetic prefill lengths")
     ap.add_argument("--warmup-prefill", type=int, default=32, help="synthetic prefill tokens for warmup")
     ap.add_argument("--warmup-decode", type=int, default=2, help="decode steps discarded as warmup")
+    ap.add_argument("--native", action="store_true",
+                    help="keep the shard boundary on-device with a synchronized direct tensor transfer")
     args = ap.parse_args()
 
     os.environ.setdefault("DEV", "CUDA")
-    from gabion.user_models.qwen35_text import Qwen35TextAdapter
+    from gabion.user_models.qwen35_text import Qwen35TextAdapter, Qwen35TextPipeline, _IQ4_RAW_TILE4_ENABLED
 
     gate_ids, gate_expected = pick_gate(args.gguf)
     t0 = time.perf_counter()
@@ -74,14 +78,15 @@ def main() -> None:
     right = Qwen35TextAdapter.from_gguf_shard(args.gguf, 1, 2, device="CUDA:1")
     load_s = time.perf_counter() - t0
     print(f"loaded shards 0/1 in {load_s:.1f}s | devices {left.dev} / {right.dev} | {mem_report()}", flush=True)
+    native = Qwen35TextPipeline(left, right) if args.native else None
 
     # ---- correctness gate ----
     gate = "SKIP"
     if args.verify:
         s0, s1 = left.new_state(), right.new_state()
-        got = [run_pipeline(left, right, gate_ids, s0, s1)]
+        got = [run_pipeline(left, right, gate_ids, s0, s1, native)]
         for _ in range(1, len(gate_expected)):
-            got.append(run_pipeline(left, right, [got[-1]], s0, s1))  # continue the same states
+            got.append(run_pipeline(left, right, [got[-1]], s0, s1, native))  # continue the same states
         gate = "PASS" if got[: len(gate_expected)] == gate_expected else f"FAIL {got[: len(gate_expected)]}"
         print(f"correctness gate: {gate} (want {gate_expected})", flush=True)
         if gate != "PASS":
@@ -91,19 +96,19 @@ def main() -> None:
     t_w = time.perf_counter()
     s0, s1 = left.new_state(), right.new_state()
     warm_ids = list(range(args.warmup_prefill))
-    run_pipeline(left, right, warm_ids, s0, s1)
+    run_pipeline(left, right, warm_ids, s0, s1, native)
     for _ in range(args.warmup_decode):
-        run_pipeline(left, right, [warm_ids[-1]], s0, s1)
+        run_pipeline(left, right, [warm_ids[-1]], s0, s1, native)
     warm_s = time.perf_counter() - t_w
     print(f"warmup (capture+compile): {warm_s:.1f}s | {mem_report()}", flush=True)
 
     # ---- decode measurement: fresh state prefilled with the gate prompt ----
     s0, s1 = left.new_state(), right.new_state()
-    nxt = run_pipeline(left, right, gate_ids, s0, s1)
+    nxt = run_pipeline(left, right, gate_ids, s0, s1, native)
     times = []
     for _ in range(args.decode_tokens):
         t1 = time.perf_counter()
-        nxt = run_pipeline(left, right, [nxt], s0, s1)
+        nxt = run_pipeline(left, right, [nxt], s0, s1, native)
         times.append(time.perf_counter() - t1)
     times = np.array(times)
     decode_min, decode_med, decode_mean = times.min(), np.median(times), times.mean()
@@ -114,14 +119,25 @@ def main() -> None:
         s0, s1 = left.new_state(), right.new_state()
         ids = [i % 248000 for i in range(L)]
         t1 = time.perf_counter()
-        run_pipeline(left, right, ids, s0, s1)
+        run_pipeline(left, right, ids, s0, s1, native)
         dt = time.perf_counter() - t1
         prefill[L] = L / dt
 
     name = Path(args.gguf).name
     pref = " ".join(f"prefill{L}_tok_s={prefill[L]:.3f}" for L in args.prefill_lens)
+    q6_mode = "n/a" if not args.native else ("fused" if os.environ.get("QWEN35_FUSE_Q6_HEAD", "1") == "1" else "chunked")
+    q6_local = os.environ.get("QWEN35_Q6_LOCAL", "256") if args.native else "n/a"
+    q5_mode = "n/a" if not args.native else os.environ.get("QWEN35_FUSE_Q5_PART", "so")
+    q5_local = os.environ.get("QWEN35_Q5_LOCAL", "16") if args.native else "n/a"
+    iq4_local = os.environ.get("QWEN35_IQ4_LOCAL", "32") if args.native else "n/a"
+    rstride = os.environ.get("QWEN35_RSTRIDE", "1") if args.native else "n/a"
+    prefill_batch = os.environ.get("QWEN35_PREFILL_BATCH", "4") if args.native else "n/a"
     print(
         "qwen35-bench v1 "
+        f"path={'native' if args.native else 'adapter'} "
+        f"split={os.environ.get('QWEN35_SPLIT', 'auto')} split_actual={left.layer_end} "
+        f"q5_head={q5_mode} q5_local={q5_local} iq4_local={iq4_local} iq4_tile4={int(_IQ4_RAW_TILE4_ENABLED)} "
+        f"q6_head={q6_mode} q6_local={q6_local} rstride={rstride} prefill_batch={prefill_batch} "
         f"gguf={name} "
         f"load_s={load_s:.1f} warmup_s={warm_s:.1f} "
         f"decode_s_tok_min={decode_min:.4f} decode_s_tok_median={decode_med:.4f} "

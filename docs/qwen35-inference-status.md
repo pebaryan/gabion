@@ -139,6 +139,22 @@ complete request to the local pipeline worker; the server-side shard0 → hidden
   but raw PROGRAMs are not CUDA-graph-batched → 0.3316 s/tok; kept as
   `QWEN35_IQ4_RAW_GEMV=1` diagnostic) and prefill batch 8 on the generalized
   raw tile (14.4/16.0 tok/s, worse than batch 4).
+- **Follow-up round (2026-08-28)**: realization stride resweept to **1** (was
+  2) — 0.1917/0.1919 s/tok on two clean runs, beating stride 2's
+  0.1928/0.1932. A new Q5_K fusion target, `attn_v` `(1024, 5120)`, passes
+  the correctness gate (unlike `attn_qkv` — its accumulation doesn't sit
+  inside the 48-layer GDN recurrence, so it doesn't amplify 1-ULP drift into
+  a token flip) and is now fused by default (`QWEN35_FUSE_Q5_V=1`): two
+  clean runs measured **0.1873 s/tok** both times. Combined default:
+  **decode 0.1870 s/tok (5.35 tok/s), prefill 29.944/31.068 tok/s**, gate
+  PASS, VRAM unchanged (8.82/9.67 GiB) — a further **−2.7% decode / +2%
+  prefill** on top of the u32 round, and **−33% decode / +35% prefill**
+  total vs the pre-u32 session baseline. `attn_qkv` fusion was re-verified
+  broken (still fails the gate, also slower). DEBUG=2 kernel-time profiling
+  shows the GPU is ~90% busy per decode step (not an HCQ/dispatch
+  bottleneck) with the two GDN/attention recurrence CUDA-graph segments
+  achieving only ~10% of peak HBM bandwidth — the remaining lever is
+  sequential kernel count inside the T=1 recurrence, not dequant throughput.
 - Prefill batch 8 also passed and fit, but measured only **7.742 / 8.501
   tok/s** and increased warmup, so batch 4 is the default. The live native
   route returned the expected output and two warmed 30-token requests took
