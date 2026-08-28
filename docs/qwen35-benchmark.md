@@ -74,6 +74,28 @@ Cumulative for the session: **decode 0.2783 → 0.1322 s/tok (−53%, 3.59 →
 7.56 tok/s)** and **prefill 22.25/23.32 → 30.50/31.67 tok/s (+37%/+36%)** at
 equal-or-lower VRAM, every step gate-PASS.
 
+#### Post-coalescing state and remaining headroom
+
+Re-profiling with `DEBUG=2` after the relayout: achieved bandwidth rose from
+~125-135 GB/s to **~204-217 GB/s** (≈47% of the 448 GB/s card peak) and wall
+clock per decode step fell 205 → 146 ms, still ~86% GPU-busy. Follow-up
+probes, all gate PASS, that found **no further headroom**:
+
+- **IQ4 local width resweep**: width 32 (exactly one warp) is now decisively
+  right — 64 regressed hard to **0.1609 s/tok** (it was only ~2% off before
+  coalescing). One warp maps to one coalesced transaction group.
+- **argmax cost**: negligible. Head GEMV alone 3.231 ms, head + argmax
+  3.250 ms, argmax alone 0.114 ms over 248320 logits. Not worth fusing.
+- **Split rebalance (`QWEN35_SPLIT=40`)**: shard 1's graph segments report a
+  lower average GB/s than shard 0's, which looked like the second card being
+  slower — in a sequential pipeline that would make shifting layers onto the
+  faster card a real latency win. It is not: split 40 measured **0.1320
+  s/tok**, statistically identical to auto/33's 0.1324, while prefill
+  regressed to **26.255 / 26.913 tok/s** (−14%) and VRAM skewed to
+  10.52/7.98 GiB. **The device-asymmetry hypothesis is falsified** — the low
+  GB/s is an average over a heterogeneous graph-batch remainder, not a slower
+  card. Byte-balanced auto/33 stands; do not re-derive this.
+
 ### 2c. rstride resweep + Q5_K attn_v fusion (2026-08-28, accepted — current default)
 
 ### 2c. rstride resweep + Q5_K attn_v fusion (2026-08-28, accepted — current default)
