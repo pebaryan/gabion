@@ -7,7 +7,74 @@ this protocol: the single report line from `tools/bench_qwen35_pipeline.py`,
 run before and after the change, on this machine. Numbers measured any other
 way are anecdotal and will be rejected.
 
-Last updated: 2026-08-28 (rstride resweep + Q5_K attn_v fusion accepted; see §2c).
+Last updated: 2026-08-28 (transposed/coalesced weight layout accepted; see §2d).
+
+### 2d. Transposed weight layout — coalesced quant loads (2026-08-28, accepted)
+
+**The single biggest win in this line of work.** Every fused dequant kernel
+gives one thread one output row and indexed the quant data row-major, e.g.
+`qs32.index(oo * B + b, jw)`. Adjacent threads (adjacent `oo`) were therefore
+`B * 16` bytes apart (2560 B for the 27B FFN shapes), so each 32-byte memory
+transaction returned **4 useful bytes** — about 1/8 of achievable bandwidth.
+`DEBUG=2` showed it plainly: the largest CUDA-graph segment reported
+**75 GB/s achieved against 665 GB/s** theoretical.
+
+The fix is a pure load-time relayout, no math change: store the quant data
+transposed as `[b, w, oo]` with the **output-row index varying fastest**, so
+adjacent threads read adjacent words. Isolated kernel measurements:
+
+| kernel / shape | row-major | transposed | speedup |
+|---|---|---|---|
+| Q6_K head 248320x5120 | 11.04 ms (~117 GB/s) | 3.23 ms (~400 GB/s) | **3.42x** |
+| IQ4 ffn_gate/up 17408x5120 (x128) | 421 / 440 us | 153 / 141 us | **2.75 / 3.11x** |
+| IQ4 ffn_down 5120x17408 (x64) | 596 / 459 us | 358 / 298 us | **1.66 / 1.54x** |
+| IQ4 gdn_gate,attn_out 6144x5120 (x48) | 97 / 99 us | 60 / 57 us | **1.62 / 1.73x** |
+
+All **bit-exact** (maxabs 0, identical argmax) — the reduction order is
+unchanged, only the addresses move.
+
+Full-protocol results, applied in two steps on the same boot:
+
+- Q6_K head transposed: **0.1870 → 0.1812 s/tok**, VRAM unchanged, gate PASS.
+- IQ4_NL transposed (288 matrices, the bulk of the model): **0.1812 → 0.1322
+  s/tok (7.56 tok/s)** with prefill **30.497 / 31.669 tok/s**, VRAM unchanged
+  at 8.82/9.67 GiB, gate PASS. Confirmed by a second clean run at **0.1321
+  s/tok**, prefill 30.283 / 31.668.
+
+Implementation notes worth keeping:
+- Only the transposed layout is stored. Row-major views are rebuilt lazily by
+  `__getattr__` (`_build_rowmajor*`) for the diagnostic dequant fallbacks, so
+  VRAM does not regress. **Watch for duplicate allocations**: a leftover
+  row-major `self.sc` assignment in the Q6_K branch silently added
+  **+0.30 GiB** on CUDA:1 before it was caught — always re-check
+  `vram_load` after a layout change.
+- The raw NVRTC prefill tile had to be **re-parallelized** to match: it used
+  one block per output row with threads striding over the input dim (which
+  was coalesced *only* in row-major). It is now one thread per output row,
+  threads across rows, still amortizing each dequantized weight across all T
+  token accumulators. `out_dim % 128 == 0` holds for every 27B shape.
+- `attn_qkv` (Q5_K, not fused — it fails the gate) deliberately stays
+  row-major: it reaches VRAM only through the byte-wise dequant paths, and
+  transposing it would force a per-layer row-major rebuild.
+- **The same transposition on Q5_K was measured and REJECTED.** Applying it
+  to the fused Q5 shapes (`ssm_out`, `attn_v`) measured **0.1332 / 0.1334
+  s/tok** vs row-major's **0.1321 / 0.1322** — a consistent **−0.9% decode**
+  — in exchange for **+3% prefill** (31.3/32.6 vs 30.3/31.7) and 0.02 GiB
+  less VRAM. Both gate PASS. It clears neither acceptance threshold and
+  decode is the headline metric, so Q5_K keeps the row-major layout. The
+  likely reason it does not transfer: these kernels run at local width 16
+  (half a warp), so coalescing buys less, while row-major keeps a row's
+  eight sub-blocks contiguous for the sub-block loop. **Do not re-attempt
+  without a wider Q5 local width or a restructured sub-block loop.**
+
+Combined default report:
+`qwen35-bench v1 path=native split=auto split_actual=33 q5_head=so q5_local=16 iq4_local=32 iq4_tile4=1 q6_head=fused q6_local=256 rstride=1 prefill_batch=4 gguf=Qwen3.8-27B-IQ4_NL.gguf load_s=45.6 warmup_s=5.9 decode_s_tok_min=0.1314 decode_s_tok_median=0.1322 decode_s_tok_mean=0.1323 decode_tok_s=7.56 prefill64_tok_s=30.497 prefill512_tok_s=31.669 vram_load=CUDA:9.00GiB,CUDA:1:9.67GiB,NPY:0.00GiB,PYTHON:0.00GiB gate=PASS`
+
+Cumulative for the session: **decode 0.2783 → 0.1322 s/tok (−53%, 3.59 →
+7.56 tok/s)** and **prefill 22.25/23.32 → 30.50/31.67 tok/s (+37%/+36%)** at
+equal-or-lower VRAM, every step gate-PASS.
+
+### 2c. rstride resweep + Q5_K attn_v fusion (2026-08-28, accepted — current default)
 
 ### 2c. rstride resweep + Q5_K attn_v fusion (2026-08-28, accepted — current default)
 

@@ -139,6 +139,22 @@ complete request to the local pipeline worker; the server-side shard0 → hidden
   but raw PROGRAMs are not CUDA-graph-batched → 0.3316 s/tok; kept as
   `QWEN35_IQ4_RAW_GEMV=1` diagnostic) and prefill batch 8 on the generalized
   raw tile (14.4/16.0 tok/s, worse than batch 4).
+- **Coalesced transposed weight layout (2026-08-28, the biggest win)**: every
+  fused dequant kernel indexed quant data row-major (`qs32.index(oo*B + b, w)`),
+  so adjacent threads were `B*16` bytes apart and each 32B transaction returned
+  4 useful bytes — `DEBUG=2` showed **75 GB/s against 665 GB/s** theoretical.
+  Storing the quant data transposed as `[b, w, oo]` (output-row index fastest)
+  makes those loads coalesced, with **no math change and bit-exact results**.
+  Isolated: Q6_K head **11.04 → 3.23 ms (3.4x)**; IQ4 shapes **1.5–3.1x**.
+  End to end: **0.1870 → 0.1812** (Q6 head) → **0.1322 s/tok, 7.56 tok/s**
+  (IQ4, 288 matrices), prefill **30.5 / 31.7 tok/s**, VRAM unchanged, gate
+  PASS, confirmed on repeat runs. The raw NVRTC prefill tile had to be
+  re-parallelized to one thread per output row to stay coalesced under the new
+  layout. Only the transposed layout is stored; row-major views are rebuilt
+  lazily for the dequant fallbacks (watch for accidental duplicate
+  allocations — a leftover row-major `sc` cost +0.30 GiB before being caught).
+  **The same change on Q5_K was rejected**: −0.9% decode for +3% prefill,
+  measured twice; its local width 16 makes coalescing less valuable.
 - **Follow-up round (2026-08-28)**: realization stride resweept to **1** (was
   2) — 0.1917/0.1919 s/tok on two clean runs, beating stride 2's
   0.1928/0.1932. A new Q5_K fusion target, `attn_v` `(1024, 5120)`, passes
