@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>gpu head ab test</title></head>
+<body><pre id="out">running…</pre>
+<script src="/gabion/web/tinygrad_v0.js?v=14"></script>
+<script src="/gabion/web/webgpu_backend.js?v=14"></script>
+<script src="/gabion/web/tokenizer.js?v=14"></script>
+<script src="/gabion/web/bbt_forward.js?v=14"></script>
+<script src="/gabion/web/model_loader.js?v=14"></script>
+<script>
+"use strict";
+const out = { embed: null, head: null, error: null };
+const $ = (id) => document.getElementById(id);
+async function main() {
+  try {
+    const dir = "/gabion/web/models/qwen2.5-0.5b-shards";
+    const manifest = await gabionLoader.loadBBTShards(dir + "/model.json");
+    const coord = await gabionLoader.loadCoordinator(manifest, dir + "/coord.f16");
+    const tg = window.tinygradV0;
+    const ids = new Int32Array([151644,8948,198,2610,525,264,10950,17847,13,151645,198,151644,872,198,785,6722,315,9625,374,151645,198,151644,77091,198]);
+
+    // --- EMBED: CPU vs GPU ---
+    const embCPU = Float32Array.from((await coord.tokEmb.forward(ids, 1, 24).toCPU()).data);
+    const adapter = await navigator.gpu.requestAdapter();
+    const device = await adapter.requestDevice({
+      requiredLimits: {
+        maxBufferSize: adapter.limits.maxBufferSize,
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      },
+    });
+    WebGPUBackend.init(device);
+    for (const name of ["matmul", "embedding_forward"]) {
+      const r = await fetch(`/gabion/web/kernels/${name}.wgsl`, { cache: "no-store" });
+      WebGPUBackend.registerShader(name, await r.text());
+    }
+    coord.tokEmb.weight.toGPU();
+    const embGPU = Float32Array.from((await coord.tokEmb.forward(ids, 1, 24).toCPU()).data);
+    let eMax = 0, eBad = 0;
+    for (let i = 0; i < embCPU.length; i++) {
+      const d = Math.abs(embCPU[i] - embGPU[i]);
+      if (d > eMax) eMax = d;
+      if (d > 1e-3) eBad++;
+    }
+    // Dump first rows: which ids map to which outputs
+    const row = (arr, r) => Array.from(arr.slice(r * 896, r * 896 + 4)).map(x => +x.toFixed(5));
+    const rows = [];
+    for (let r = 0; r < 5; r++) rows.push({ id: ids[r], cpu: row(embCPU, r), gpu: row(embGPU, r) });
+    // Find which CPU row the GPU row 0 actually equals
+    let gpu0Match = -1;
+    for (let r = 0; r < ids.length && gpu0Match < 0; r++) {
+      let same = true;
+      for (let j = 0; j < 896; j++) if (Math.abs(embGPU[j] - embCPU[r * 896 + j]) > 1e-3) { same = false; break; }
+      if (same) gpu0Match = r;
+    }
+    // Raw backend probe at REAL size: bypass Tensor.embedding entirely
+    let raw = null;
+    {
+      const backend = WebGPUBackend.instance;
+      // Probe A: all-zero indices -> should return table row 0
+      const eBuf = backend.createBufferFromData(coord.tokEmb.weight.data);
+      const iZero = backend.createBufferFromData(new Uint32Array(24));
+      const oZero = backend.embeddingForward(eBuf, iZero, 24, coord.D, coord.V);
+      const gotZero = await backend.readBuffer(oZero, 24 * coord.D);
+      // Probe B: indices 0..23 -> should return table rows 0..23
+      const iSmall = backend.createBufferFromData(Uint32Array.from({ length: 24 }, (_, r) => r));
+      const oSmall = backend.embeddingForward(eBuf, iSmall, 24, coord.D, coord.V);
+      const gotSmall = await backend.readBuffer(oSmall, 24 * coord.D);
+      const row0 = Array.from(coord.tokEmb.weight.data.slice(0, 4)).map(x => +x.toFixed(5));
+      const z0 = Array.from(gotZero.slice(0, 4)).map(x => +x.toFixed(5));
+      const s0 = Array.from(gotSmall.slice(0, 4)).map(x => +x.toFixed(5));
+      // Probe C: real indices
+      const iBuf = backend.createBufferFromData(Uint32Array.from(ids));
+      const oBuf = backend.embeddingForward(eBuf, iBuf, 24, coord.D, coord.V);
+      const got = await backend.readBuffer(oBuf, 24 * coord.D);
+      let rMax = 0, rBad = 0;
+      for (let i = 0; i < got.length; i++) {
+        const d = Math.abs(got[i] - embCPU[i]);
+        if (d > rMax) rMax = d;
+        if (d > 1e-3) rBad++;
+      }
+      raw = { maxAbsDiff: rMax, differing: rBad, row0, zeroIdxRow0: z0, smallIdxRow0: s0,
+              zeroIdxRow1: Array.from(gotZero.slice(896, 900)).map(x => +x.toFixed(5)),
+              smallIdxRow1: Array.from(gotSmall.slice(896, 900)).map(x => +x.toFixed(5)) };
+      // Probe D: SMOKE-SIZE control (V=128, D=32, BT=4) through the same raw path
+      {
+        const sV = 128, sD = 32, sBT = 4;
+        const sEmb = new Float32Array(sV * sD);
+        for (let i = 0; i < sEmb.length; i++) sEmb[i] = Math.sin(i * 0.7);
+        const sIdx = Uint32Array.from([3, 7, 127, 0]);
+        const seBuf = backend.createBufferFromData(sEmb);
+        const siBuf = backend.createBufferFromData(sIdx);
+        const soBuf = backend.embeddingForward(seBuf, siBuf, sBT, sD, sV);
+        const sGot = await backend.readBuffer(soBuf, sBT * sD);
+        let sMax = 0;
+        for (let r = 0; r < sBT; r++) {
+          for (let c = 0; c < sD; c++) {
+            const ref = sEmb[sIdx[r] * sD + c];
+            sMax = Math.max(sMax, Math.abs(sGot[r * sD + c] - ref));
+          }
+        }
+        raw.smallSizeMaxAbs = sMax;
+        // Probe E: read the 544MB eBuf directly — does it contain row 0?
+        const eHead = await backend.readBuffer(eBuf, 8);
+        raw.eBufFirst8 = Array.from(eHead).map(x => +x.toFixed(5));
+        raw.eBufRow0Expected = Array.from(coord.tokEmb.weight.data.slice(0, 8)).map(x => +x.toFixed(5));
+        // Probe F: size sweep — which buffer sizes survive createBufferFromData?
+        raw.sizes = [];
+        for (const n of [1000, 1000000, 16 * 1024 * 1024, 64 * 1024 * 1024, 128 * 1024 * 1024, 256 * 1024 * 1024]) {
+          try {
+            const slice = coord.tokEmb.weight.data.slice(0, n);
+            const b = backend.createBufferFromData(slice);
+            const rb = await backend.readBuffer(b, 8);
+            let ok = true;
+            for (let i = 0; i < 8; i++) if (Math.abs(rb[i] - slice[i]) > 1e-6) { ok = false; break; }
+            raw.sizes.push({ n, ok, first: +rb[0].toFixed(5) });
+            backend.releaseBuffer(b);
+          } catch (e) { raw.sizes.push({ n, error: String(e).slice(0, 80) }); }
+        }
+        backend.releaseBuffer(seBuf); backend.releaseBuffer(siBuf); backend.releaseBuffer(soBuf);
+      }
+      backend.releaseBuffer(eBuf); backend.releaseBuffer(iZero); backend.releaseBuffer(oZero);
+      backend.releaseBuffer(iSmall); backend.releaseBuffer(oSmall);
+      backend.releaseBuffer(iBuf); backend.releaseBuffer(oBuf);
+    }
+    out.embed = { maxAbsDiff: eMax, differing: eBad, rows, gpu0Match, cpuLen: embCPU.length, gpuLen: embGPU.length, raw };
+
+    // --- HEAD: CPU vs GPU on the same hidden vector ---
+    const h = new Float32Array(896);
+    for (let i = 0; i < 896; i++) h[i] = Math.sin(i * 0.13) * 0.5;
+    const hT = tg.Tensor.fromArray(h, [1, 1, coord.D], false);
+    const normed = coord.normF.forward(hT);
+    const headCPU = Float32Array.from((await normed.reshape([1, coord.D]).matmul(coord.tokEmb.weight.transpose2d()).toCPU()).data);
+    const headW = coord.tokEmb.weight.transpose2d(); // GPU buffer (weight onGPU)
+    const headGPU = Float32Array.from((await normed.reshape([1, coord.D]).matmul(headW).toCPU()).data);
+    let hMax = 0, hBad = 0;
+    for (let i = 0; i < headCPU.length; i++) {
+      const d = Math.abs(headCPU[i] - headGPU[i]);
+      if (d > hMax) hMax = d;
+      if (d > 1e-2) hBad++;
+    }
+    const top1 = (arr) => { let b = 0; for (let i = 1; i < arr.length; i++) if (arr[i] > arr[b]) b = i; return b; };
+    out.head = { maxAbsDiff: hMax, differing: hBad, cpuTop1: top1(headCPU), gpuTop1: top1(headGPU), cpuVal: headCPU[59604], gpuVal: headGPU[59604] };
+  } catch (e) {
+    out.error = String(e && e.stack || e);
+  }
+  $("out").textContent = JSON.stringify(out);
+  window.__testResult = out;
+}
+main();
+</script></body></html>

@@ -135,22 +135,21 @@ gabion pebble --id w-amd --job-id my-job-v1 --device webgpu --webgpu-backend WGP
 
 ## Qwen3.8-27B CUDA inference
 
-> **Perf warning (measured 2026-08-27):** the streaming layer-dequant path
-> below runs at **~14s/token (0.07 tok/s)** — ~35× slower than the proven
-> standalone runner (`D:/tmp/_q27_run.py`: fused IQ4_NL GEMV, persistent u8
-> weights, GPU scan → **0.40s/tok**). Read `docs/qwen35-inference-status.md`
-> before extending this path; porting the fused-kernel techniques in is the
-> intended next step.
+> **Perf warning:** the legacy streaming layer-dequant path below runs at
+> **~14s/token (0.07 tok/s)**. The current adapter contains the ported fast
+> design; the local dual-device path is exposed by
+> `Qwen35TextPipeline` and benchmarked with `tools/bench_qwen35_pipeline.py
+> --native`.
 >
 > **All speed/memory claims are measured with the protocol in
 > `docs/qwen35-benchmark.md` via `tools/bench_qwen35_pipeline.py --verify`
 > (single process, both shards, correctness gate + prefill/decode metrics).**
 > Multi-agent optimization work must follow that protocol.
 
-The Python pebble path supports the Qwen3.8 `qwen35` hybrid architecture and
-keeps the GGUF quantized on the host while streaming one active layer at a
-time to CUDA. Run two pebble processes, one per RTX 5060 Ti, with contiguous
-model shards:
+For the 27B model on this WDDM machine, use the single-process dual-device
+worker (`D:/tmp/_q35_dual_worker.py`). Two separate pebble processes hit the
+per-context memory wall during model load. The worker holds both shards on
+explicit `CUDA:0` / `CUDA:1` and can use the native direct-transfer pipeline.
 
 ```powershell
 $env:CUDA_PATH = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
@@ -158,17 +157,25 @@ $env:NVRTC_PATH = "$env:CUDA_PATH\bin\nvrtc64_120_0.dll"
 $env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
 $gguf = 'D:\aimodels\Qwen3.8-27B-IQ4_NL.gguf'
 $tok = 'D:\aimodels\hf\Qwen3.5-9B\tokenizer.json'
+$env:QWEN35_GGUF = $gguf
+$env:QWEN35_TOKENIZER = $tok
 
 gabion mesh --host 127.0.0.1 --port 8765
 
-gabion pebble --id qwen-gpu0 --mesh-ws-url ws://127.0.0.1:8765/ws `
-  --device cuda --visible-devices 0 --model qwen35 --gguf $gguf `
-  --tokenizer $tok --shard 0 --num-shards 2
-
-gabion pebble --id qwen-gpu1 --mesh-ws-url ws://127.0.0.1:8765/ws `
-  --device cuda --visible-devices 1 --model qwen35 --gguf $gguf `
-  --tokenizer $tok --shard 1 --num-shards 2
+python D:/tmp/_q35_dual_worker.py
 ```
+
+The dual-device worker reads the model/tokenizer paths shown above and keeps
+both shards in one process, enabling the native direct-transfer path.
+The large Q6_K output head uses the fused greedy GEMV by default; set
+`QWEN35_FUSE_Q6_HEAD=0` to select the slower chunked fallback for comparison.
+The 27B GDN `ssm_out` Q5_K matrices also use a fused GEMV by default; set
+`QWEN35_FUSE_Q5_PART=0` only to compare against the unfused path. Native
+prefill uses four-token chunks by default (`QWEN35_PREFILL_BATCH=4`); set it to
+`1` for the sequential diagnostic path. On the canonical IQ4_NL file this
+measures **3.64 tok/s decode** and **22.13/23.36 tok/s prefill** at 64/512
+tokens; see the benchmark document for the correctness gate and full report
+line.
 
 Then call the greedy pipeline endpoint:
 

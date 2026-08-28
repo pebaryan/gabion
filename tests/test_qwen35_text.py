@@ -68,7 +68,7 @@ def _fixture(tmp_path):
 
 
 def test_qwen35_layer_presence_and_pipeline_parity(tmp_path):
-    from gabion.user_models.qwen35_text import Qwen35TextAdapter
+    from gabion.user_models.qwen35_text import Qwen35TextAdapter, Qwen35TextPipeline
     from tools.export_model import export_gguf
 
     path, _ = _fixture(tmp_path)
@@ -101,6 +101,18 @@ def test_qwen35_layer_presence_and_pipeline_parity(tmp_path):
     # both pipelines must agree on the greedy argmax
     assert int(np.argmax(got)) == int(np.argmax(got2))
 
+    # The local dual-device fast path must preserve the mesh-facing split
+    # result while avoiding the hidden NumPy round-trip between shards.
+    native_left = Qwen35TextAdapter.from_gguf_shard(path, 0, 2)
+    native_right = Qwen35TextAdapter.from_gguf_shard(path, 1, 2)
+    native = Qwen35TextPipeline(native_left, native_right)
+    ns0, ns1 = native_left.new_state(32), native_right.new_state(32)
+    got_native = native.run(ids, ns0, ns1)
+    np.testing.assert_allclose(got, got_native, rtol=1e-3, atol=1e-3)
+    assert ns0["pos"] == ns1["pos"] == len(ids)
+    gs0, gs1 = native_left.new_state(32), native_right.new_state(32)
+    assert native.run_greedy(ids, gs0, gs1) == int(np.argmax(got))
+
 
 def test_qwen35_decode_keeps_state_between_tokens(tmp_path):
     from gabion.user_models.qwen35_text import Qwen35TextAdapter
@@ -116,6 +128,25 @@ def test_qwen35_decode_keeps_state_between_tokens(tmp_path):
     assert pos == 2 and state["pos"] == 3
     model.release_stream("s")
     assert "s" not in model._stream_states
+
+
+def test_qwen35_q5_gemv_matches_reference():
+    from tinygrad import Device, Tensor, dtypes
+
+    if str(Device.DEFAULT) != "CUDA":
+        pytest.skip("Q5_K GEMV check requires CUDA")
+    from gabion.user_models.qwen35_text import _QWeight
+
+    rng = np.random.default_rng(37)
+    out_dim, in_dim = 256, 512
+    blk = rng.integers(0, 256, size=(out_dim * (in_dim // 256), 176), dtype=np.uint8)
+    blk[:, 0:2] = np.frombuffer(np.float16(0.02).tobytes(), dtype=np.uint8)
+    blk[:, 2:4] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)
+    weight = _QWeight("CUDA", "Q5_K", blk, (out_dim, in_dim))
+    x = Tensor(rng.normal(0, 0.15, size=(1, in_dim)).astype(np.float32), device="CUDA", dtype=dtypes.float32).realize()
+    ref = (x @ weight.dequant().T).realize().numpy().reshape(-1)
+    got = weight.gemv(x).realize().numpy().reshape(-1)
+    np.testing.assert_allclose(got, ref, rtol=2e-4, atol=2e-3)
 
 
 def test_qwen35_iq4_xs_gpu_dequant_matches_reference():

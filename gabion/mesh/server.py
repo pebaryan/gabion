@@ -442,6 +442,64 @@ class MeshServer:
         # locate pipeline workers: need 2 with shard 0/1
         async with self._workers_lock:
             all_workers = dict(self._workers)
+
+        # A local dual-device Qwen worker can run the complete forward without
+        # a websocket/NumPy shard boundary.  Prefer it when
+        # advertised; otherwise retain the generic websocket shard pipeline.
+        native_workers = [
+            (wid, sess) for wid, sess in all_workers.items()
+            if str(sess.capabilities.get("model", "")).lower() == "qwen35"
+            and str(sess.capabilities.get("qwen35_native_pipeline", "0")) == "1"
+        ]
+        if model_kind == "qwen35" and native_workers:
+            native_wid, native_sess = native_workers[0]
+
+            async def _call_native(ids_list: List[int]):
+                rid = uuid.uuid4().hex[:8]
+                fut: asyncio.Future = asyncio.get_event_loop().create_future()
+                async with self._pipeline_lock:
+                    self._pipeline_pending[rid] = fut
+                try:
+                    await native_sess.ws.send_json(make_message(
+                        "infer_qwen35_native_request",
+                        {"request_id": rid, "ids": ids_list, "max_tokens": max_tokens},
+                    ))
+                except Exception:
+                    async with self._pipeline_lock:
+                        self._pipeline_pending.pop(rid, None)
+                    raise
+                try:
+                    return await asyncio.wait_for(fut, timeout=1800)
+                finally:
+                    async with self._pipeline_lock:
+                        self._pipeline_pending.pop(rid, None)
+
+            native_results: List[Dict[str, Any]] = []
+            for pidx, prompt in enumerate(prompts):
+                try:
+                    response = await _call_native(encoded[pidx])
+                    if response.get("error"):
+                        raise RuntimeError(str(response["error"]))
+                    generated = [int(x) for x in response.get("generated_ids", [])]
+                    try:
+                        text = _tok.decode(generated)  # type: ignore
+                    except Exception:
+                        text = ""
+                    native_results.append({
+                        "prompt_idx": pidx,
+                        "prompt": prompt,
+                        "generated_ids": generated,
+                        "text": text,
+                        "mode": "native",
+                        "workers": [native_wid],
+                    })
+                except Exception as exc:
+                    native_results.append({
+                        "prompt_idx": pidx, "prompt": prompt, "error": str(exc),
+                        "generated_ids": [], "mode": "native", "workers": [native_wid],
+                    })
+            return web.json_response({"results": native_results, "mode": "native", "workers": [native_wid]})
+
         # Pick workers advertising the requested model and a layer shard.
         shard_workers: Dict[int, tuple[str, any]] = {}
         for wid, sess in all_workers.items():

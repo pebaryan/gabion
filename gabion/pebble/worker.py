@@ -24,6 +24,9 @@ class PebbleWorker:
         self._gemma4_tok = None
         self._qwen35 = None
         self._qwen35_tok = None
+        # Optional single-process dual-device pipeline injected by the local
+        # Qwen35 deployment.  Normal one-shard workers leave this unset.
+        self._qwen35_pipeline = None
         import os
         self._model_kind = str(config.model_kind or os.environ.get("PEBBLE_MODEL", "gemma4")).lower()
         env_shard = os.environ.get("QWEN35_SHARD", os.environ.get("GEMMA4_SHARD", "0"))
@@ -187,6 +190,41 @@ class PebbleWorker:
             logger.warning("qwen35 pipeline shard %s failed %s: %s", shard, rid, exc)
             await ws.send_json(make_message("infer_pipeline_result", {"request_id": rid, "error": str(exc)}))
 
+    async def _handle_qwen35_native_request(self, ws, data):
+        """Run both local Qwen35 shards without the websocket shard boundary."""
+        rid = str(data.get("request_id", ""))
+        pipeline = self._qwen35_pipeline
+        if pipeline is None:
+            await ws.send_json(make_message("infer_pipeline_result", {
+                "request_id": rid, "error": "native_qwen35_pipeline_unavailable",
+            }))
+            return
+
+        def _sync():
+            import numpy as np
+
+            ids = np.asarray(list(data.get("ids", [])), dtype=np.int64).reshape(-1)
+            if ids.size == 0:
+                raise ValueError("native Qwen35 request has no input ids")
+            max_tokens = max(1, min(2048, int(data.get("max_tokens", 32))))
+            left, right = pipeline.first, pipeline.last
+            state0, state1 = left.new_state(), right.new_state()
+            nxt = pipeline.run_greedy(ids, state0, state1)
+            generated = []
+            for _ in range(max_tokens):
+                if nxt in (248044, 248045):
+                    break
+                generated.append(int(nxt))
+                nxt = pipeline.run_token(nxt, state0, state1)
+            return {"generated_ids": generated}
+
+        try:
+            res = await asyncio.to_thread(_sync)
+            await ws.send_json(make_message("infer_pipeline_result", {"request_id": rid, **res}))
+        except Exception as exc:
+            logger.warning("native qwen35 pipeline failed %s: %s", rid, exc)
+            await ws.send_json(make_message("infer_pipeline_result", {"request_id": rid, "error": str(exc)}))
+
     async def _handle_infer_pipeline_release(self, data):
         if self._model_kind != "qwen35" or self._qwen35 is None:
             return
@@ -251,6 +289,7 @@ class PebbleWorker:
                                         "gemma4_shard": f"{self._shard_idx}/{self._num_shards}" if self._num_shards > 1 else "full",
                                         "model_shard": f"{self._shard_idx}/{self._num_shards}" if self._num_shards > 1 else "full",
                                         "gemma4_pipeline": "1" if self._num_shards > 1 else "0",
+                                        "qwen35_native_pipeline": "1" if self._qwen35_pipeline is not None else "0",
                                     },
                                 },
                             )
@@ -293,6 +332,8 @@ class PebbleWorker:
                                     await self._handle_infer_request(ws, data)
                                 elif msg_type == "infer_pipeline_request":
                                     await self._handle_infer_pipeline_request(ws, data)
+                                elif msg_type == "infer_qwen35_native_request":
+                                    await self._handle_qwen35_native_request(ws, data)
                                 elif msg_type == "infer_pipeline_release":
                                     await self._handle_infer_pipeline_release(data)
                                 elif msg_type == "round_start":
