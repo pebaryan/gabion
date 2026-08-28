@@ -8,10 +8,14 @@ The previous per-layer-dequant + numpy-scan design measured ~35x slower
 - weights stay QUANTIZED as persistent VRAM u8 tensors (IQ4_NL / Q5_K);
   IQ4_NL single-row matmuls go through a fused dequant-GEMV custom kernel
   (``_QWeight.gemv``) so no f16 matrix is ever materialized for decode.
+  The 27B ``ssm_out`` Q5_K GEMV uses the same fused treatment by default.
 - the GatedDeltaNet recurrent scan runs IN-GRAPH on the GPU (T=1 scan step,
   state tensors updated via ``uop.store`` inside the TinyJit graph).
-- decode/prefill rows are processed one token at a time through one TinyJit
-  per entry point (ids/hidden/logits); no per-op Tensor<->numpy ping-pong.
+- the large Q6_K output head uses a fused dequant-GEMV for greedy argmax;
+  the chunked dequant path remains available for full-logit callers.
+- decode rows are processed one token at a time through one TinyJit per entry
+  point; native prefill uses a bounded batch of four tokens and returns only
+  the final row's argmax. There is no per-op Tensor<->numpy ping-pong.
 - token_embd / output weights use KQuant (u8 + on-device dequant) so the
   ~2.5GB f16 copies never live in VRAM.
 
@@ -37,13 +41,31 @@ from typing import Any
 
 import numpy as np
 
+# The raw batch-4 IQ4 kernel is compiled with NVRTC. tinygrad loads its CUDA
+# compiler support lazily, so point it at the standard Windows CUDA toolkit
+# before importing tinygrad. ``auto`` enables it when that runtime is present.
+_iq4_raw_mode = os.environ.get("QWEN35_IQ4_RAW_TILE4", "auto").lower()
+_IQ4_RAW_TILE4_ENABLED = _iq4_raw_mode != "0"
+if os.name == "nt" and _IQ4_RAW_TILE4_ENABLED:
+    _cuda_root = Path(os.environ.get("CUDA_PATH", ""))
+    if not _cuda_root.is_dir():
+        _cuda_root = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9")
+    _nvrtc = _cuda_root / "bin" / "nvrtc64_120_0.dll"
+    if _nvrtc.is_file():
+        os.environ["CUDA_PATH"] = str(_cuda_root)
+        os.environ.setdefault("NVRTC_PATH", str(_nvrtc))
+    elif _iq4_raw_mode == "auto":
+        _IQ4_RAW_TILE4_ENABLED = False
+elif os.name != "nt" and _iq4_raw_mode == "auto":
+    _IQ4_RAW_TILE4_ENABLED = False
+
 try:
     from tinygrad import Tensor, dtypes, TinyJit
-    from tinygrad.uop.ops import UOp, Ops, AxisType, KernelInfo
+    from tinygrad.uop.ops import UOp, Ops, AxisType, KernelInfo, ProgramInfo
     from tinygrad.llm.model import precompute_freqs_cis, apply_rope
 except ImportError:  # keep the module importable in pure-meta contexts
     Tensor = dtypes = TinyJit = UOp = None  # type: ignore
-    Ops = AxisType = KernelInfo = None  # type: ignore
+    Ops = AxisType = KernelInfo = ProgramInfo = None  # type: ignore
     precompute_freqs_cis = apply_rope = None  # type: ignore
 
 
@@ -70,6 +92,12 @@ _GPU_BLOCK_TYPES = {"Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ4_NL", "IQ4_XS"}
 #   end() (waitlist-deadlock lesson). num_axes=0 reduce (scalar loads).
 # ---------------------------------------------------------------------------
 _IQ4NL_FXN: dict = {}
+_IQ4NL_GEMM_FXN: dict = {}
+_IQ4NL_RAW_TILE4_PROGRAM: dict = {}
+_IQ4NL_RAW_GEMV_PROGRAM: dict = {}
+_Q5K_GEMV_FXN: dict = {}
+_Q5K_GEMM_FXN: dict = {}
+_Q6K_GEMV_FXN: dict = {}
 
 
 def build_iq4nl_gemv(out_dim: int, in_dim: int, name: str, local: int = 256) -> callable:
@@ -101,17 +129,480 @@ def build_iq4nl_gemv(out_dim: int, in_dim: int, name: str, local: int = 256) -> 
     return fxn
 
 
-def iq4nl_gemv(x: Tensor, u8: Tensor, sc: Tensor, ks: Tensor, out_dim: int, in_dim: int, dev: str) -> Tensor:
+def build_iq4nl_gemv_u32(out_dim: int, in_dim: int, name: str, local: int = 32) -> callable:
+    """u32-load variant of the fused IQ4_NL GEMV: quant bytes are loaded as
+    uint32 words (4 bytes per load) and unpacked with shifts in-kernel.
+    Bit-exact vs the byte-load kernel (f32 and f16 paths) and measured 2.65x
+    faster per replayed GEMV (87 vs 232 us at 5120x5120, 2026-08-28)."""
+    B = in_dim // 32
+    assert out_dim % local == 0 and in_dim % 32 == 0
+
+    def fxn(out: UOp, x: UOp, qs32: UOp, sc: UOp, ks: UOp) -> UOp:
+        g = UOp.range(out_dim // local, 0)
+        t = UOp.range(local, 1, AxisType.LOCAL)
+        oo = g * local + t
+        b = UOp.range(B, 2, AxisType.REDUCE)
+        jw = UOp.range(4, 3, AxisType.REDUCE)
+        s = sc.index(oo * B + b).load()
+        word = qs32.index(oo * B + b, jw).load()
+        terms = []
+        for bi in range(4):
+            byte = (word >> UOp.const(8 * bi, dtypes.uint32)) & UOp.const(0xFF, dtypes.uint32)
+            vlo = ks.index((byte & UOp.const(0xF, dtypes.uint32)).cast(dtypes.int32)).load()
+            vhi = ks.index((byte >> UOp.const(4, dtypes.uint32)).cast(dtypes.int32)).load()
+            j = jw * 4 + bi
+            xlo = x.index(b * 32 + j).load()
+            xhi = x.index(b * 32 + 16 + j).load()
+            if x.dtype == dtypes.float16:
+                wlo = (vlo * s).cast(dtypes.float16).float()
+                whi = (vhi * s).cast(dtypes.float16).float()
+                terms.append(wlo * xlo.float() + whi * xhi.float())
+            else:
+                terms.append((vlo * xlo + vhi * xhi) * s)
+        acc = terms[0]
+        for term in terms[1:]:
+            acc = acc + term
+        return out.index(oo).store(acc.reduce(b, jw, arg=(Ops.ADD, 0))).end(g, t).sink(
+            arg=KernelInfo(name=name, opts_to_apply=()))
+    return fxn
+
+
+def iq4nl_gemv(x: Tensor, u8: Tensor, sc: Tensor, ks: Tensor, out_dim: int, in_dim: int, dev: str,
+               u32t: Tensor | None = None) -> Tensor:
     """Fused dequant-GEMV for one row x (in_dim,) -> (1, 1, out_dim)."""
+    # Diagnostic only (QWEN35_IQ4_RAW_GEMV=1): the raw warp-per-row GEMV is
+    # faster standalone but raw PROGRAMs are not batched into the TinyJit CUDA
+    # graph, so at T=1 the per-launch WDDM overhead regresses decode (0.3316
+    # vs 0.2783 s/tok, measured 2026-08-28). The UOp kernel remains default.
+    raw_mode = os.environ.get("QWEN35_IQ4_RAW_GEMV", "0").lower()
+    if (raw_mode == "1"
+            and str(dev).startswith("CUDA") and out_dim % 4 == 0 and in_dim % 32 == 0):
+        return iq4nl_raw_gemv(x, u8, sc, ks, out_dim, in_dim, dev)
     was_f16 = x.dtype == dtypes.float16
-    key = (out_dim, in_dim, x.dtype)
+    # Uniform one-warp scheduling is the measured full-pipeline winner on the
+    # canonical 27B dual-5060-Ti setup.  ``auto`` remains available for shape
+    # diagnostics and other Qwen35 variants.
+    local_env = os.environ.get("QWEN35_IQ4_LOCAL", "32").lower()
+    if local_env != "auto":
+        local = int(local_env)
+    elif x.dtype == dtypes.float16:
+        # The 27B GDN projections have a different occupancy sweet spot from
+        # the full-attention/FFN f32 path.  Keep the old 256 fallback for
+        # shapes from other Qwen35 variants.
+        local = {
+            (5120, 17408): 32,  # ffn_down when a variant keeps the input f16
+            (6144, 5120): 32,   # GDN gate
+            (1024, 5120): 32,   # GDN alpha/beta
+            (12288, 5120): 64,  # full-attention q in an f16 caller
+            (5120, 6144): 32,
+        }.get((out_dim, in_dim), 256)
+    else:
+        local = {
+            (17408, 5120): 32,  # FFN gate/up
+            (5120, 17408): 64,  # FFN down
+            (6144, 5120): 64,   # full-attention gate
+            (12288, 5120): 128, # full-attention q
+            (1024, 5120): 32,   # full-attention k/v
+            (5120, 6144): 32,   # full-attention output
+        }.get((out_dim, in_dim), 256)
+    u32 = os.environ.get("QWEN35_IQ4_U32", "1") == "1"
+    key = (out_dim, in_dim, x.dtype, local, u32)
     fxn = _IQ4NL_FXN.get(key)
     if fxn is None:
-        fxn = build_iq4nl_gemv(out_dim, in_dim, f"iq4nl_{out_dim}_{in_dim}")
+        build = build_iq4nl_gemv_u32 if u32 else build_iq4nl_gemv
+        fxn = build(out_dim, in_dim, f"iq4nl_{'u32_' if u32 else ''}{out_dim}_{in_dim}_l{local}", local=local)
         _IQ4NL_FXN[key] = fxn
+    qarg = (u32t if u32t is not None else u8.bitcast(dtypes.uint32)) if u32 else u8
     out = Tensor.empty(out_dim, device=dev)
-    res = out.custom_kernel(x.reshape(in_dim), u8, sc, ks, fxn=fxn)[0].reshape(1, 1, out_dim)
+    res = out.custom_kernel(x.reshape(in_dim), qarg, sc, ks, fxn=fxn)[0].reshape(1, 1, out_dim)
     return res.cast(dtypes.float16) if was_f16 else res
+
+
+def build_iq4nl_gemm(out_dim: int, in_dim: int, tokens: int, name: str, local: int = 32) -> callable:
+    """Build a fused IQ4_NL matrix multiply for a small prefill batch."""
+    B = in_dim // 32
+    assert out_dim % local == 0 and in_dim % 32 == 0
+
+    def fxn(out: UOp, x: UOp, qs32: UOp, sc: UOp, ks: UOp) -> UOp:
+        g = UOp.range(tokens * out_dim // local, 0)
+        t = UOp.range(local, 1, AxisType.LOCAL)
+        flat = g * local + t
+        tok, oo = flat // out_dim, flat % out_dim
+        b = UOp.range(B, 2, AxisType.REDUCE)
+        jw = UOp.range(4, 3, AxisType.REDUCE)
+        s = sc.index(oo * B + b).load()
+        # u32 quant loads + shift unpack (bit-exact vs byte loads, ~2.6x faster)
+        word = qs32.index(oo * B + b, jw).load()
+        terms = []
+        for bi in range(4):
+            byte = (word >> UOp.const(8 * bi, dtypes.uint32)) & UOp.const(0xFF, dtypes.uint32)
+            vlo = ks.index((byte & UOp.const(0xF, dtypes.uint32)).cast(dtypes.int32)).load()
+            vhi = ks.index((byte >> UOp.const(4, dtypes.uint32)).cast(dtypes.int32)).load()
+            j = jw * 4 + bi
+            xlo = x.index(tok * in_dim + b * 32 + j).load()
+            xhi = x.index(tok * in_dim + b * 32 + 16 + j).load()
+            if x.dtype == dtypes.float16:
+                wlo = (vlo * s).cast(dtypes.float16)
+                whi = (vhi * s).cast(dtypes.float16)
+                terms.append((wlo * xlo).cast(dtypes.float32) + (whi * xhi).cast(dtypes.float32))
+            else:
+                terms.append((vlo * xlo + vhi * xhi) * s)
+        contrib = terms[0]
+        for term in terms[1:]:
+            contrib = contrib + term
+        return out.index(flat).store(contrib.reduce(b, jw, arg=(Ops.ADD, 0))).end(g, t).sink(
+            arg=KernelInfo(name=name, opts_to_apply=()))
+    return fxn
+
+
+def iq4nl_gemm(x: Tensor, w: "_QWeight", tokens: int) -> Tensor:
+    """Fused IQ4_NL GEMM for (1, tokens, in_dim) prefill input."""
+    out_dim, in_dim = w.shape
+    if (2 <= tokens <= 16 and x.dtype == dtypes.float32 and str(w.dev).startswith("CUDA")
+            and _IQ4_RAW_TILE4_ENABLED):
+        return iq4nl_raw_tile4(x, w, tokens)
+    local = int(os.environ.get("QWEN35_IQ4_LOCAL", "32"))
+    key = (out_dim, in_dim, tokens, x.dtype, local)
+    fxn = _IQ4NL_GEMM_FXN.get(key)
+    if fxn is None:
+        fxn = build_iq4nl_gemm(out_dim, in_dim, tokens,
+                               f"iq4nl_gemm_{out_dim}_{in_dim}_t{tokens}_l{local}", local=local)
+        _IQ4NL_GEMM_FXN[key] = fxn
+    out = Tensor.empty(tokens * out_dim, device=w.dev)
+    res = out.custom_kernel(x.reshape(tokens * in_dim), w.u832, w.sc, w.ks, fxn=fxn)[0]
+    res = res.reshape(1, tokens, out_dim)
+    return res.cast(dtypes.float16) if x.dtype == dtypes.float16 else res
+
+
+def _build_iq4nl_raw_tile_program(dev: str, out_dim: int, in_dim: int, tokens: int) -> UOp:
+    """Compile a replayable raw CUDA batch-T IQ4 projection program.
+
+    One 256-thread block computes one output row; each dequantized weight is
+    retained across all T token accumulators, so the u8 weight traffic is
+    amortized T-fold (the prefill win: prefill is weight-bandwidth-bound)."""
+    from tinygrad import Device
+    from tinygrad.helpers import Target
+    from tinygrad.renderer import Estimates
+    from tinygrad.renderer.cstyle import CUDARenderer
+
+    cuda = Device[dev]
+    compile_target = Target(device="CUDA", renderer="CLANG", arch=cuda.arch)
+    T = tokens
+    accs = "".join(f"  float a{t} = 0.0f;\n" for t in range(T))
+    fmas = "".join(f"    a{t} += wl * x[{t}*IN_DIM + k] + wh * x[{t}*IN_DIM + k + 16];\n"
+                   for t in range(T))
+    stores = "".join(f"    sm[{t}][tid] = a{t};\n" for t in range(T))
+    reduces = "".join(f"      sm[{t}][tid] += sm[{t}][tid+s];" + ("\n" if t % 2 == 1 else " ")
+                      for t in range(T))
+    outs = "".join(f"    out[{t}*OUT_DIM + o] = sm[{t}][0];\n" for t in range(T))
+    source = (r'''
+extern "C" __global__ void __launch_bounds__(256) iq4_raw_tile(
+    float *out, const float *x, const unsigned char *qs,
+    const float *sc, const float *ks) {
+  const int o = blockIdx.x, tid = threadIdx.x;
+  const int B = IN_DIM / 32;
+ACCS
+  for (int q = tid; q < IN_DIM / 2; q += 256) {
+    const int b = q >> 4, j = q & 15;
+    const unsigned char v = qs[(o * B + b) * 16 + j];
+    const float s = sc[o * B + b];
+    const float wl = ks[v & 15] * s, wh = ks[v >> 4] * s;
+    const int k = b * 32 + j;
+FMAS
+  }
+  __shared__ float sm[TOK][256];
+STORES
+  __syncthreads();
+  for (int s = 128; s; s >>= 1) {
+    if (tid < s) {
+REDUCES
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+OUTS
+  }
+}
+'''.replace("ACCS", accs).replace("FMAS", fmas).replace("STORES", stores)
+      .replace("REDUCES", reduces).replace("OUTS", outs)
+      .replace("TOK", str(T)).replace("IN_DIM", str(in_dim)).replace("OUT_DIM", str(out_dim)))
+    binary = CUDARenderer(compile_target).compiler.compile_cached(source)
+    params = (
+        UOp.param(0, dtypes.float32, (1, T, out_dim), device=dev),
+        UOp.param(1, dtypes.float32, (1, T, in_dim), device=dev),
+        UOp.param(2, dtypes.uint32, (out_dim * in_dim // 32, 4), device=dev),
+        UOp.param(3, dtypes.float32, (out_dim * in_dim // 32,), device=dev),
+        UOp.param(4, dtypes.float32, (16,), device=dev),
+    )
+    sink = UOp(Ops.SINK, arg=KernelInfo(name="iq4_raw_tile", estimates=Estimates()))
+    linear = UOp(Ops.LINEAR, src=params)
+    actual_target = Target(device="CUDA", arch=cuda.arch)
+    info = ProgramInfo("iq4_raw_tile", (out_dim, 1, 1), (256, 1, 1), (),
+                       (0, 1, 2, 3, 4), (0,), (1, 2, 3, 4), actual_target)
+    return UOp(Ops.PROGRAM, src=(sink, linear, UOp(Ops.SOURCE, arg=source),
+                                UOp(Ops.BINARY, dtypes.uchar, arg=binary)), arg=info)
+
+
+def iq4nl_raw_tile4(x: Tensor, w: "_QWeight", tokens: int = 4) -> Tensor:
+    """Raw CUDA tiled IQ4 projection for a small float32 prefill batch."""
+    out_dim, in_dim = w.shape
+    key = (w.dev, out_dim, in_dim, tokens)
+    program = _IQ4NL_RAW_TILE4_PROGRAM.get(key)
+    if program is None:
+        program = _build_iq4nl_raw_tile_program(w.dev, out_dim, in_dim, tokens)
+        _IQ4NL_RAW_TILE4_PROGRAM[key] = program
+    out = Tensor.empty(1, tokens, out_dim, device=w.dev)
+    call = program.call(out.uop, x.reshape(1, tokens, in_dim).uop, w.u832.uop, w.sc.uop, w.ks.uop)
+    return Tensor(out.uop.after(call))
+
+
+def _build_iq4nl_raw_gemv_program(dev: str, out_dim: int, in_dim: int, f16: bool) -> UOp:
+    """Compile a replayable raw CUDA warp-per-row IQ4 decode GEMV.
+
+    One warp reduces one output row with vectorized 16-byte block loads
+    (uint4 = one whole IQ4_NL block of quant bytes), the KVALUES table in
+    shared memory, and a warp-shuffle reduction.  The f16 variant replicates
+    the reference rounding exactly: weight = f16(KVAL*sc), product in f32.
+    """
+    from tinygrad import Device
+    from tinygrad.helpers import Target
+    from tinygrad.renderer import Estimates
+    from tinygrad.renderer.cstyle import CUDARenderer
+
+    cuda = Device[dev]
+    compile_target = Target(device="CUDA", renderer="CLANG", arch=cuda.arch)
+    if f16:
+        body = r'''
+      const float wl = h2f(f2h(ksm[v & 15] * s)), wh = h2f(f2h(ksm[v >> 4] * s));
+      acc += wl * h2f(x[k + j]) + wh * h2f(x[k + 16 + j]);
+'''
+    else:
+        body = r'''
+      acc += (ksm[v & 15] * x[k + j] + ksm[v >> 4] * x[k + 16 + j]) * s;
+'''
+    source = (r'''
+__device__ __forceinline__ float h2f(unsigned short h) {
+  float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f;
+}
+__device__ __forceinline__ unsigned short f2h(float f) {
+  unsigned short h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h;
+}
+extern "C" __global__ void __launch_bounds__(128) iq4_raw_gemv(
+    float *out, const XTYPE *x, const unsigned char *qs,
+    const float *sc, const float *ks) {
+  __shared__ float ksm[16];
+  if (threadIdx.x < 16) ksm[threadIdx.x] = ks[threadIdx.x];
+  __syncthreads();
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int o = blockIdx.x * 4 + warp;
+  const int B = IN_DIM / 32;
+  float acc = 0.0f;
+  for (int b = lane; b < B; b += 32) {
+    const uint4 q = ((const uint4 *)qs)[o * B + b];
+    const float s = sc[o * B + b];
+    const unsigned char *pb = (const unsigned char *)&q;
+    const int k = b * 32;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      const unsigned char v = pb[j];
+BODY
+    }
+  }
+#pragma unroll
+  for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0) out[o] = acc;
+}
+'''.replace("BODY", body)
+      .replace("XTYPE", "unsigned short" if f16 else "float")
+      .replace("IN_DIM", str(in_dim)))
+    binary = CUDARenderer(compile_target).compiler.compile_cached(source)
+    params = (
+        UOp.param(0, dtypes.float32, (out_dim,), device=dev),
+        UOp.param(1, dtypes.float16 if f16 else dtypes.float32, (in_dim,), device=dev),
+        UOp.param(2, dtypes.uint8, (out_dim * in_dim // 32, 16), device=dev),
+        UOp.param(3, dtypes.float32, (out_dim * in_dim // 32,), device=dev),
+        UOp.param(4, dtypes.float32, (16,), device=dev),
+    )
+    sink = UOp(Ops.SINK, arg=KernelInfo(name="iq4_raw_gemv", estimates=Estimates()))
+    linear = UOp(Ops.LINEAR, src=params)
+    actual_target = Target(device="CUDA", arch=cuda.arch)
+    info = ProgramInfo("iq4_raw_gemv", (out_dim // 4, 1, 1), (128, 1, 1), (),
+                       (0, 1, 2, 3, 4), (0,), (1, 2, 3, 4), actual_target)
+    return UOp(Ops.PROGRAM, src=(sink, linear, UOp(Ops.SOURCE, arg=source),
+                                UOp(Ops.BINARY, dtypes.uchar, arg=binary)), arg=info)
+
+
+def iq4nl_raw_gemv(x: Tensor, u8: Tensor, sc: Tensor, ks: Tensor,
+                   out_dim: int, in_dim: int, dev: str) -> Tensor:
+    """Raw CUDA warp-per-row IQ4 GEMV for one decode row (f32 or f16 input)."""
+    f16 = x.dtype == dtypes.float16
+    key = (dev, out_dim, in_dim, f16)
+    program = _IQ4NL_RAW_GEMV_PROGRAM.get(key)
+    if program is None:
+        program = _build_iq4nl_raw_gemv_program(dev, out_dim, in_dim, f16)
+        _IQ4NL_RAW_GEMV_PROGRAM[key] = program
+    out = Tensor.empty(out_dim, device=dev)
+    call = program.call(out.uop, x.reshape(in_dim).uop, u8.uop, sc.uop, ks.uop)
+    res = Tensor(out.uop.after(call)).reshape(1, 1, out_dim)
+    return res.cast(dtypes.float16) if f16 else res
+
+
+def build_q5k_gemv(out_dim: int, in_dim: int, name: str, local: int = 256) -> callable:
+    """Build a fused Q5_K dequant-GEMV for one decode row."""
+    B = in_dim // 256
+    assert out_dim % local == 0 and in_dim % 256 == 0
+
+    def fxn(out: UOp, x: UOp, qs32: UOp, qh32: UOp, sc: UOp, mn: UOp, d: UOp, dmin: UOp) -> UOp:
+        g = UOp.range(out_dim // local, 0)
+        t = UOp.range(local, 1, AxisType.LOCAL)
+        oo = g * local + t
+        b = UOp.range(B, 2, AxisType.REDUCE)
+        jw = UOp.range(8, 3, AxisType.REDUCE)
+        terms = []
+        for sub in range(8):
+            # u32 quant loads + shift unpack (bit-exact vs byte loads)
+            qsw = qs32.index(oo * B + b, (sub // 2) * 8 + jw).load()
+            qhw = qh32.index(oo * B + b, jw).load()
+            for bi in range(4):
+                byte = (qsw >> UOp.const(8 * bi, dtypes.uint32)) & UOp.const(0xFF, dtypes.uint32)
+                nib = (byte >> UOp.const((sub & 1) * 4, dtypes.uint32)) & UOp.const(0xF, dtypes.uint32)
+                hbyte = (qhw >> UOp.const(8 * bi, dtypes.uint32)) & UOp.const(0xFF, dtypes.uint32)
+                high = (hbyte >> UOp.const(sub, dtypes.uint32)) & UOp.const(1, dtypes.uint32)
+                qv = nib | (high << UOp.const(4, dtypes.uint32))
+                xv = x.index(b * 256 + sub * 32 + jw * 4 + bi).load()
+                wv = (d.index(oo * B + b).load() * sc.index(oo * B + b, sub).load() * qv.cast(dtypes.float32)
+                      - dmin.index(oo * B + b).load() * mn.index(oo * B + b, sub).load()).cast(dtypes.float16)
+                # The reference path is (f16 x f16) -> f16 product, then an f32
+                # reduction.  Keeping that order avoids unnecessary numerical
+                # drift in the recurrent stack.  For f32 callers retain the
+                # natural f32 product used by the standalone GEMV test.
+                terms.append((wv * xv).cast(dtypes.float32) if x.dtype == dtypes.float16
+                             else wv.float() * xv.cast(dtypes.float32))
+        acc = terms[0]
+        for term in terms[1:]:
+            acc = acc + term
+        return out.index(oo).store(acc.reduce(b, jw, arg=(Ops.ADD, 0))).end(g, t).sink(
+            arg=KernelInfo(name=name, opts_to_apply=()))
+    return fxn
+
+
+def q5k_gemv(x: Tensor, w: "_QWeight") -> Tensor:
+    was_f16 = x.dtype == dtypes.float16
+    out_dim, in_dim = w.shape
+    local = int(os.environ.get("QWEN35_Q5_LOCAL", "16"))
+    key = (out_dim, in_dim, x.dtype, local)
+    fxn = _Q5K_GEMV_FXN.get(key)
+    if fxn is None:
+        fxn = build_q5k_gemv(out_dim, in_dim, f"q5k_{out_dim}_{in_dim}_l{local}", local=local)
+        _Q5K_GEMV_FXN[key] = fxn
+    out = Tensor.empty(out_dim, device=w.dev)
+    res = out.custom_kernel(x.reshape(in_dim), w.qs32, w.qh32,
+                            w.sc, w.mn, w.d, w.dmin, fxn=fxn)[0]
+    res = res.reshape(1, 1, out_dim)
+    return res.cast(dtypes.float16) if was_f16 else res
+
+
+def build_q5k_gemm(out_dim: int, in_dim: int, tokens: int, name: str, local: int = 16) -> callable:
+    """Build a fused Q5_K matrix multiply for a small prefill batch."""
+    B = in_dim // 256
+    assert out_dim % local == 0 and in_dim % 256 == 0
+
+    def fxn(out: UOp, x: UOp, qs32: UOp, qh32: UOp, sc: UOp, mn: UOp, d: UOp, dmin: UOp) -> UOp:
+        g = UOp.range(tokens * out_dim // local, 0)
+        t = UOp.range(local, 1, AxisType.LOCAL)
+        flat = g * local + t
+        tok, oo = flat // out_dim, flat % out_dim
+        b = UOp.range(B, 2, AxisType.REDUCE)
+        jw = UOp.range(8, 3, AxisType.REDUCE)
+        terms = []
+        for sub in range(8):
+            qsw = qs32.index(oo * B + b, (sub // 2) * 8 + jw).load()
+            qhw = qh32.index(oo * B + b, jw).load()
+            for bi in range(4):
+                byte = (qsw >> UOp.const(8 * bi, dtypes.uint32)) & UOp.const(0xFF, dtypes.uint32)
+                nib = (byte >> UOp.const((sub & 1) * 4, dtypes.uint32)) & UOp.const(0xF, dtypes.uint32)
+                hbyte = (qhw >> UOp.const(8 * bi, dtypes.uint32)) & UOp.const(0xFF, dtypes.uint32)
+                high = (hbyte >> UOp.const(sub, dtypes.uint32)) & UOp.const(1, dtypes.uint32)
+                qv = nib | (high << UOp.const(4, dtypes.uint32))
+                xv = x.index(tok * in_dim + b * 256 + sub * 32 + jw * 4 + bi).load()
+                wv = (d.index(oo * B + b).load() * sc.index(oo * B + b, sub).load() * qv.cast(dtypes.float32)
+                      - dmin.index(oo * B + b).load() * mn.index(oo * B + b, sub).load()).cast(dtypes.float16)
+                terms.append((wv * xv).cast(dtypes.float32) if x.dtype == dtypes.float16
+                             else wv.float() * xv.cast(dtypes.float32))
+        acc = terms[0]
+        for term in terms[1:]:
+            acc = acc + term
+        return out.index(flat).store(acc.reduce(b, jw, arg=(Ops.ADD, 0))).end(g, t).sink(
+            arg=KernelInfo(name=name, opts_to_apply=()))
+    return fxn
+
+
+def q5k_gemm(x: Tensor, w: "_QWeight", tokens: int) -> Tensor:
+    """Fused Q5_K GEMM for (1, tokens, in_dim) prefill input."""
+    out_dim, in_dim = w.shape
+    local = int(os.environ.get("QWEN35_Q5_LOCAL", "16"))
+    key = (out_dim, in_dim, tokens, x.dtype, local)
+    fxn = _Q5K_GEMM_FXN.get(key)
+    if fxn is None:
+        fxn = build_q5k_gemm(out_dim, in_dim, tokens,
+                             f"q5k_gemm_{out_dim}_{in_dim}_t{tokens}_l{local}", local=local)
+        _Q5K_GEMM_FXN[key] = fxn
+    out = Tensor.empty(tokens * out_dim, device=w.dev)
+    res = out.custom_kernel(x.reshape(tokens * in_dim), w.qs32, w.qh32,
+                            w.sc, w.mn, w.d, w.dmin, fxn=fxn)[0]
+    res = res.reshape(1, tokens, out_dim)
+    return res.cast(dtypes.float16) if x.dtype == dtypes.float16 else res
+
+
+def build_q6k_gemv(out_dim: int, in_dim: int, name: str, local: int = 256) -> callable:
+    """Build the fused Q6_K output-head GEMV used by single-token greedy decode."""
+    B = in_dim // 256
+    assert out_dim % local == 0 and in_dim % 256 == 0
+
+    def fxn(out: UOp, x: UOp, ql32: UOp, qh32: UOp, sc: UOp, d: UOp) -> UOp:
+        g = UOp.range(out_dim // local, 0)
+        t = UOp.range(local, 1, AxisType.LOCAL)
+        oo = g * local + t
+        b = UOp.range(B, 2, AxisType.REDUCE)
+        row = oo * B + b
+        jw = UOp.range(4, 3, AxisType.REDUCE)
+        terms = []
+        # Unroll h/group/half-of-the-32-byte scale selection.  The first
+        # dynamic version passed Python parity but produced wrong CUDA values;
+        # fixed offsets also keep this kernel friendly to tinygrad's indexer.
+        # Quant bytes are loaded as u32 words and shift-unpacked (bit-exact).
+        for h in range(2):
+            for group in range(4):
+                for half in range(2):
+                    qlw = ql32.index(row, h * 16 + (group & 1) * 8 + half * 4 + jw).load()
+                    qhw = qh32.index(row, h * 8 + half * 4 + jw).load()
+                    for bi in range(4):
+                        qlb = (qlw >> UOp.const(8 * bi, dtypes.uint32)) & UOp.const(0xFF, dtypes.uint32)
+                        qhb = (qhw >> UOp.const(8 * bi, dtypes.uint32)) & UOp.const(0xFF, dtypes.uint32)
+                        qv = ((qlb >> UOp.const((group // 2) * 4, dtypes.uint32)) & UOp.const(0xF, dtypes.uint32)) \
+                            | (((qhb >> UOp.const(group * 2, dtypes.uint32)) & UOp.const(3, dtypes.uint32)) << UOp.const(4, dtypes.uint32))
+                        scale = sc.index(row, h * 8 + group * 2 + half).load()
+                        xv = x.index(b * 256 + h * 128 + group * 32 + half * 16 + jw * 4 + bi).load().cast(dtypes.float32)
+                        terms.append((qv.cast(dtypes.float32) - UOp.const(32.0, dtypes.float32)) * scale * d.index(row).load() * xv)
+        contrib = terms[0]
+        for term in terms[1:]:
+            contrib = contrib + term
+        acc = contrib.reduce(b, jw, arg=(Ops.ADD, 0))
+        return out.index(oo).store(acc).end(g, t).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+    return fxn
+
+
+def q6k_gemv(x: Tensor, ql: Tensor, qh: Tensor, sc: Tensor, d: Tensor,
+             out_dim: int, in_dim: int, dev: str) -> Tensor:
+    local = int(os.environ.get("QWEN35_Q6_LOCAL", "256"))
+    key = (out_dim, in_dim, x.dtype, local)
+    fxn = _Q6K_GEMV_FXN.get(key)
+    if fxn is None:
+        fxn = build_q6k_gemv(out_dim, in_dim, f"q6k_{out_dim}_{in_dim}_l{local}", local=local)
+        _Q6K_GEMV_FXN[key] = fxn
+    out = Tensor.empty(out_dim, device=dev)
+    return out.custom_kernel(x.reshape(in_dim), ql, qh,
+                             sc, d, fxn=fxn)[0].reshape(1, 1, out_dim)
 
 
 def _rms(x: Tensor, w: Tensor | None, eps: float) -> Tensor:
@@ -150,7 +641,10 @@ class _QWeight:
             nb = n // 32
             raw = np.ascontiguousarray(blk[:, 2:18])                       # (nb, 16) nibbles
             sc = blk[:, 0:2].copy().view("<f2")[:, 0].astype(np.float32)   # (nb,)
-            self.u8 = Tensor(raw, device=dev, dtype=dtypes.uint8).realize()
+            # uint32 primary (the u32-load kernels and the raw tile read the
+            # same buffer); u8 is a lazy bitcast view for the dequant fallbacks.
+            self.u832 = Tensor(raw.view("<u4"), device=dev).realize()
+            self.u8 = self.u832.bitcast(dtypes.uint8)
             self.sc = Tensor(sc, device=dev).realize()
             from tools.export_model import _IQ4_KVALUES
             self.ks = Tensor(np.array(_IQ4_KVALUES, dtype=np.float32).reshape(-1), device=dev).realize()
@@ -172,7 +666,24 @@ class _QWeight:
             mn[:, 6] = (scales[:, 10] >> 4) | ((scales[:, 6] >> 6) << 4)
             sc[:, 7] = (scales[:, 11] & 0xF) | ((scales[:, 3] >> 6) << 4)
             mn[:, 7] = (scales[:, 11] >> 4) | ((scales[:, 7] >> 6) << 4)
-            self.u8 = Tensor(blk, device=dev, dtype=dtypes.uint8).realize()
+            # qs/qh live once in VRAM.  For the fused-GEMV site the primary
+            # copy is uint32 (the u32-load kernels index words directly) with
+            # a lazy u8 bitcast view for the dequant fallbacks; other Q5
+            # instances (attn_qkv) keep u8 primary because their per-chunk
+            # dequant_f16 prefill path does byte-wise tensor ops.
+            qs_np = np.ascontiguousarray(blk[:, 48:176])
+            qh_np = np.ascontiguousarray(blk[:, 16:48])
+            q5_part = os.environ.get("QWEN35_FUSE_Q5_PART", "so").lower()
+            if q5_part in {"1", "so", "ssm_out"} and shape == (5120, 6144):
+                self.qs32 = Tensor(qs_np.view("<u4"), device=dev).realize()
+                self.qh32 = Tensor(qh_np.view("<u4"), device=dev).realize()
+                self.qs = self.qs32.bitcast(dtypes.uint8)
+                self.qh = self.qh32.bitcast(dtypes.uint8)
+            else:
+                self.qs = Tensor(qs_np, device=dev, dtype=dtypes.uint8).realize()
+                self.qh = Tensor(qh_np, device=dev, dtype=dtypes.uint8).realize()
+                self.qs32 = self.qs.bitcast(dtypes.uint32)
+                self.qh32 = self.qh.bitcast(dtypes.uint32)
             self.d = Tensor(d, device=dev).realize()
             self.dmin = Tensor(dmin, device=dev).realize()
             self.sc = Tensor(sc, device=dev).realize()
@@ -191,8 +702,7 @@ class _QWeight:
             return v.reshape(self.shape).cast(dtypes.float16)
         if self.gtype == "Q5_K":
             nb = n // 256
-            qs = self.u8[:, 48:176]
-            qh = self.u8[:, 16:48]
+            qs, qh = self.qs, self.qh
             qs_lo = qs & 0x0F
             qs_hi = (qs >> 4) & 0x0F
             nib = Tensor.stack(qs_lo.reshape(nb, 4, 32), qs_hi.reshape(nb, 4, 32), dim=2).reshape(nb, 8, 32)
@@ -203,11 +713,42 @@ class _QWeight:
             return (dl * val - dm).reshape(self.shape).cast(dtypes.float16)
         raise AssertionError
 
+    def dequant_f16(self) -> Tensor:
+        """Dequantize directly in f16 for memory-constrained batched prefill."""
+        n = int(np.prod(self.shape))
+        if self.gtype == "IQ4_NL":
+            nb = n // 32
+            lo = self.u8 & 0x0F
+            hi = (self.u8 >> 4) & 0x0F
+            # The table and per-block scale are cast before multiplication so
+            # the large intermediate never becomes an f32 full weight matrix.
+            ks16 = self.ks.cast(dtypes.float16)
+            vlo = ks16.gather(0, lo.reshape(-1).cast(dtypes.int32)).reshape(nb, 16)
+            vlo.realize()
+            vhi = ks16.gather(0, hi.reshape(-1).cast(dtypes.int32)).reshape(nb, 16)
+            vhi.realize()
+            v = Tensor.cat(vlo, vhi, dim=1)
+            return (v * self.sc.cast(dtypes.float16).reshape(nb, 1)).reshape(self.shape)
+        if self.gtype == "Q5_K":
+            nb = n // 256
+            qs, qh = self.qs, self.qh
+            qs_lo = qs & 0x0F
+            qs_hi = (qs >> 4) & 0x0F
+            nib = Tensor.stack(qs_lo.reshape(nb, 4, 32), qs_hi.reshape(nb, 4, 32), dim=2).reshape(nb, 8, 32)
+            hi_bits = ((qh.reshape(nb, 1, 32) >> Tensor.arange(8).to(self.dev).reshape(1, 8, 1)) & 1)
+            val = (nib | (hi_bits << 4)).cast(dtypes.float16)
+            dl = self.d.cast(dtypes.float16).reshape(nb, 1, 1) * self.sc.cast(dtypes.float16).reshape(nb, 8, 1)
+            dm = self.dmin.cast(dtypes.float16).reshape(nb, 1, 1) * self.mn.cast(dtypes.float16).reshape(nb, 8, 1)
+            return (dl * val - dm).reshape(self.shape)
+        raise AssertionError
+
     def gemv(self, x: Tensor) -> Tensor:
-        """Fused dequant-GEMV (M=1 only) — replaces dequant().T @ x for IQ4_NL."""
-        assert self.gtype == "IQ4_NL"
+        """Fused dequant-GEMV (M=1 only) for IQ4_NL and selected Q5_K."""
         out_dim, in_dim = self.shape
-        return iq4nl_gemv(x, self.u8, self.sc, self.ks, out_dim, in_dim, self.dev)
+        if self.gtype == "IQ4_NL":
+            return iq4nl_gemv(x, self.u8, self.sc, self.ks, out_dim, in_dim, self.dev, u32t=self.u832)
+        assert self.gtype == "Q5_K"
+        return q5k_gemv(x, self)
 
 
 class _KQuant:
@@ -231,8 +772,12 @@ class _KQuant:
             self.scales = Tensor(blk[:, 4:16], device=dev, dtype=dtypes.uint8).realize()  # (nb,12)
         elif gtype == "Q6_K":
             self.d = Tensor(blk[:, 208:210].copy().view("<f2")[:, 0].astype(np.float32), device=dev).realize()
-            self.ql = Tensor(blk[:, 0:128], device=dev, dtype=dtypes.uint8).realize()
-            self.qh = Tensor(blk[:, 128:192], device=dev, dtype=dtypes.uint8).realize()
+            # uint32 primary (the fused head GEMV loads words); u8 lazy views
+            # serve the gather/emb and chunked-dequant fallbacks.
+            self.ql32 = Tensor(np.ascontiguousarray(blk[:, 0:128]).view("<u4"), device=dev).realize()
+            self.qh32 = Tensor(np.ascontiguousarray(blk[:, 128:192]).view("<u4"), device=dev).realize()
+            self.ql = self.ql32.bitcast(dtypes.uint8)
+            self.qh = self.qh32.bitcast(dtypes.uint8)
             self.sc = Tensor(blk[:, 192:208].astype(np.int8).astype(np.float32), device=dev).realize()  # (nb,16)
         else:
             raise ValueError(f"_KQuant: unsupported type {gtype}")
@@ -369,6 +914,14 @@ class _FullAttnLayer:
     def _ffn(self, x: Tensor) -> Tensor:
         r = self.a
         w = self.w
+        if x.shape[1] > 1:
+            # Batched prefill otherwise keeps the two large gate/up dequant
+            # graphs live until the down projection is scheduled.  Realize
+            # each projection at the memory boundary; decode (T=1) keeps the
+            # fused graph path unchanged.
+            gate = r._mm(x, w["ffn_gate"]).realize()
+            up = r._mm(x, w["ffn_up"]).realize()
+            return r._mm(gate.silu() * up, w["ffn_down"]).realize()
         return r._mm(r._mm(x, w["ffn_gate"]).silu() * r._mm(x, w["ffn_up"]), w["ffn_down"])
 
     def __call__(self, x: Tensor, start_pos) -> Tensor:
@@ -424,27 +977,43 @@ class _GDNLayer:
         return r._mm(z.reshape(B, T, -1), self.w["so"])
 
     def _attn(self, x: Tensor, start_pos) -> Tensor:
-        """Single-step in-graph GDN scan (T=1; the adapter processes one row at a time)."""
+        """GDN recurrence for one decode row or a batched prefill chunk."""
         r = self.a
         q, k, v, alpha, beta, out_gate, state, _ = self._attn_pre(x, start_pos)
         V, Vd, K = r.num_v_heads, r.head_v_dim, r.head_k_dim
-        st = state.reshape(V, Vd, K).contiguous()
-        ah = alpha[:, :, 0].reshape(V, 1, 1).contiguous()
-        bh = beta[:, :, 0].reshape(V, 1).contiguous()
-        kh = k[:, :, 0].reshape(V, 1, K).contiguous()
-        qh = q[:, :, 0].reshape(V, 1, K).contiguous()
-        vh = v[:, :, 0].reshape(V, Vd).contiguous()
-        s1 = st * ah
-        delta = (vh - (s1 * kh).sum(-1)) * bh
-        st_new = s1 + delta.reshape(V, Vd, 1) * kh
-        core_t = (st_new * qh).sum(-1)  # (V, Vd)
-        store = self.rec_state.uop.store(st_new.cast(self.rec_state.dtype).reshape(1, V, Vd, K).contiguous().uop)
-        core = Tensor(core_t.reshape(1, 1, V, Vd).contiguous().uop.after(store))
+        if x.shape[1] == 1:
+            st = state.reshape(V, Vd, K).contiguous()
+            ah = alpha[:, :, 0].reshape(V, 1, 1).contiguous()
+            bh = beta[:, :, 0].reshape(V, 1).contiguous()
+            kh = k[:, :, 0].reshape(V, 1, K).contiguous()
+            qh = q[:, :, 0].reshape(V, 1, K).contiguous()
+            vh = v[:, :, 0].reshape(V, Vd).contiguous()
+            s1 = st * ah
+            delta = (vh - (s1 * kh).sum(-1)) * bh
+            st_new = s1 + delta.reshape(V, Vd, 1) * kh
+            core_t = (st_new * qh).sum(-1)  # (V, Vd)
+            store = self.rec_state.uop.store(st_new.cast(self.rec_state.dtype).reshape(1, V, Vd, K).contiguous().uop)
+            core = Tensor(core_t.reshape(1, 1, V, Vd).contiguous().uop.after(store))
+        else:
+            # The recurrence remains sequential in token order, while its
+            # projections and surrounding FFN are evaluated as a batch.
+            outs = []
+            for t in range(x.shape[1]):
+                s1 = state * alpha[:, :, t]
+                delta = (v[:, :, t] - (s1 * k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]
+                state = s1 + delta * k[:, :, t]
+                outs.append((state * q[:, :, t]).sum(-1))
+            store = self.rec_state.uop.store(state.cast(self.rec_state.dtype).uop)
+            core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(store))
         return self._attn_post(core, out_gate, start_pos)
 
     def _ffn(self, x: Tensor) -> Tensor:
         r = self.a
         w = self.w
+        if x.shape[1] > 1:
+            gate = r._mm(x, w["ffn_gate"]).realize()
+            up = r._mm(x, w["ffn_up"]).realize()
+            return r._mm(gate.silu() * up, w["ffn_down"]).realize()
         return r._mm(r._mm(x, w["ffn_gate"]).silu() * r._mm(x, w["ffn_up"]), w["ffn_down"])
 
     def __call__(self, x: Tensor, start_pos) -> Tensor:
@@ -458,9 +1027,10 @@ class Qwen35TextAdapter:
 
     Weights are loaded once into persistent VRAM (quantized types stay u8 and
     dequant on-device per matmul; IQ4_NL single-row matmuls use the fused
-    GEMV custom kernel).  Rows are processed one token at a time through one
-    TinyJit per entry point, so decode is kernel-graph-replay, not per-op
-    numpy ping-pong.
+    GEMV custom kernel; the large Q6_K greedy head uses a fused GEMV too).
+    Decode rows are processed one token at a time through one TinyJit, while
+    native prefill uses bounded four-token chunks; both paths stay on-device
+    and avoid per-op numpy ping-pong.
     """
 
     def __init__(
@@ -534,7 +1104,7 @@ class Qwen35TextAdapter:
         self._jits: dict[str, Any] = {}
         self._v_sp = None
         self._fuse_f16 = False
-        self._rstride = 4
+        self._rstride = 2
 
     @staticmethod
     def _layer_is_full(names: set[str], i: int) -> bool:
@@ -638,21 +1208,28 @@ class Qwen35TextAdapter:
 
         weights = [tensor_bytes(i) for i in range(L)]
         total = sum(weights)
-        boundaries = [0]
-        for s in range(1, num_shards):
-            target = total * s / num_shards
-            acc = 0
-            cut = boundaries[-1]
-            while cut < L and acc + weights[cut] <= target:
-                acc += weights[cut]
-                cut += 1
-            prev = max(boundaries[-1] + 1, min(L - (num_shards - s), cut))
-            nxt = min(L - (num_shards - s), cut + 1)
-            prev_bytes = sum(weights[boundaries[-1]:prev])
-            next_bytes = sum(weights[boundaries[-1]:nxt])
-            chosen = prev if abs(prev_bytes - target) <= abs(next_bytes - target) else nxt
-            boundaries.append(max(boundaries[-1] + 1, min(L - (num_shards - s), chosen)))
-        boundaries.append(L)
+        forced_split = os.environ.get("QWEN35_SPLIT")
+        if forced_split is not None and num_shards == 2:
+            split = int(forced_split)
+            if not 1 <= split < L:
+                raise ValueError(f"QWEN35_SPLIT must be in [1, {L - 1}], got {split}")
+            boundaries = [0, split, L]
+        else:
+            boundaries = [0]
+            for s in range(1, num_shards):
+                target = total * s / num_shards
+                acc = 0
+                cut = boundaries[-1]
+                while cut < L and acc + weights[cut] <= target:
+                    acc += weights[cut]
+                    cut += 1
+                prev = max(boundaries[-1] + 1, min(L - (num_shards - s), cut))
+                nxt = min(L - (num_shards - s), cut + 1)
+                prev_bytes = sum(weights[boundaries[-1]:prev])
+                next_bytes = sum(weights[boundaries[-1]:nxt])
+                chosen = prev if abs(prev_bytes - target) <= abs(next_bytes - target) else nxt
+                boundaries.append(max(boundaries[-1] + 1, min(L - (num_shards - s), chosen)))
+            boundaries.append(L)
         for j in range(1, len(boundaries)):
             boundaries[j] = max(boundaries[j], boundaries[j - 1] + 1)
         boundaries[-1] = L
@@ -694,7 +1271,7 @@ class Qwen35TextAdapter:
         # indexed device string (device= arg or QWEN35_DEVICE=CUDA:1), which
         # is the mechanism the standalone runner uses for its second card.
         self.dev = device or os.environ.get("QWEN35_DEVICE") or str(Device.DEFAULT)
-        self._rstride = int(os.environ.get("QWEN35_RSTRIDE", "4"))
+        self._rstride = int(os.environ.get("QWEN35_RSTRIDE", "2"))
         fuse = os.environ.get("QWEN35_FUSE_F16", "auto")
         self._fuse_f16 = {"1": True, "0": False}.get(fuse, self._gguf_size >= 8 * 2**30)
         self._v_sp = UOp.variable("start_pos", 0, self.seq_len - 1)
@@ -812,15 +1389,35 @@ class Qwen35TextAdapter:
     # ------------------------------------------------------------------
 
     def _mm(self, x: Tensor, w) -> Tensor:
-        """Matmul x @ w.T — fused IQ4_NL GEMV for single-row decode when enabled.
+        """Matmul x @ w.T — fused IQ4_NL/Q5_K GEMV for single-row decode.
 
         f32 path (FullAttn projections + FFNs): parity 5e-7, oracle-safe.
-        f16 path (GDN attn projections): fused only for big models (QWEN35_FUSE_F16=auto
+        f16 path (GDN projections): fused only for big models (QWEN35_FUSE_F16=auto
         -> GGUF >= 8GiB); the f16 matmul differs by 1 f16 ULP on ~0.1% of outputs
         (accumulation order) — 20x smaller than the IQ4_NL quantization error."""
-        if (isinstance(w, _QWeight) and w.gtype == "IQ4_NL" and str(self.dev).startswith("CUDA")
-                and x.numel() == w.shape[1] and (x.dtype == dtypes.float32 or (x.dtype == dtypes.float16 and self._fuse_f16))):
+        # The 27B ssm_out shape is gate-verified and materially faster.  Q5
+        # attn_qkv remains on the reference path because fusing it fails the
+        # model gate and does not improve throughput.
+        q5_part = os.environ.get("QWEN35_FUSE_Q5_PART", "so").lower()
+        q5_fused = (isinstance(w, _QWeight) and w.gtype == "Q5_K"
+                    and q5_part in {"1", "so", "ssm_out"}
+                    and w.shape == (5120, 6144))
+        if (isinstance(w, _QWeight) and str(self.dev).startswith("CUDA")
+                and x.numel() == w.shape[1]
+                and (w.gtype == "IQ4_NL" or (w.gtype == "Q5_K" and q5_fused))
+                and (x.dtype == dtypes.float32 or (x.dtype == dtypes.float16 and self._fuse_f16))):
             return w.gemv(x)
+        if isinstance(w, _QWeight) and x.ndim == 3 and x.shape[1] > 1:
+            # T>1 prefill cannot use the single-row fused GEMV; use the
+            # memory-bounded f16 dequant form instead of an f32 full matrix.
+            if w.gtype == "IQ4_NL":
+                return iq4nl_gemm(x, w, x.shape[1])
+            # The shape-specific ssm_out kernel is gate-verified.  QKV's
+            # recurrent accumulation is more sensitive to fused dequant
+            # rounding, so retain the reference batched matmul there.
+            if w.shape == (5120, 6144):
+                return q5k_gemm(x, w, x.shape[1])
+            return x @ w.dequant_f16().T
         return x @ w.dequant().T
 
     def _forward_ids(self, ids_t: Tensor, start_pos) -> Tensor:
@@ -849,10 +1446,51 @@ class Qwen35TextAdapter:
             logits = z @ self._out_w.dequant().T
         return logits.reshape(1, -1)
 
+    def _forward_argmax_last(self, x: Tensor, start_pos) -> Tensor:
+        """Batched-prefill graph returning only the final row's argmax."""
+        x = self._forward_hid(x, start_pos)[:, -1:]
+        z = _rms(x, self._out_norm, self.norm_eps)
+        if (os.environ.get("QWEN35_FUSE_Q6_HEAD", "1") == "1"
+                and isinstance(self._out_w, _KQuant) and self._out_w.gtype == "Q6_K"
+                and self._out_w.vocab * self._out_w.D > 500_000_000
+                and self._out_w.vocab % 256 == 0):
+            logits = q6k_gemv(z, self._out_w.ql32, self._out_w.qh32, self._out_w.sc,
+                               self._out_w.d, self._out_w.vocab, self._out_w.D, self.dev)
+        elif isinstance(self._out_w, _KQuant):
+            logits = (self._out_w.fused_out_chunked(z) if self._out_w.vocab * self._out_w.D > 500_000_000
+                      else self._out_w.fused_out(z))
+        else:
+            logits = z @ self._out_w.dequant().T
+        return logits.reshape(1, -1).argmax(-1)
+
+    def _forward_argmax(self, x: Tensor, start_pos) -> Tensor:
+        """Final greedy token with the vocabulary reduction inside the JIT graph."""
+        if (os.environ.get("QWEN35_FUSE_Q6_HEAD", "1") == "1"
+                and isinstance(self._out_w, _KQuant) and self._out_w.gtype == "Q6_K"
+                and self._out_w.vocab * self._out_w.D > 500_000_000
+                and self._out_w.vocab % 256 == 0):
+            x = self._forward_hid(x, start_pos)
+            z = _rms(x, self._out_norm, self.norm_eps)
+            logits = q6k_gemv(z, self._out_w.ql32, self._out_w.qh32, self._out_w.sc,
+                               self._out_w.d, self._out_w.vocab, self._out_w.D, self.dev)
+            return logits.argmax(-1)
+        return self._forward_logits(x, start_pos).argmax(-1)
+
     def _step(self, key: str, inp: Tensor, pos: int) -> Tensor:
         jit = self._jits.get(key)
         if jit is None:
-            fn = {"ids": self._forward_ids, "hid": self._forward_hid, "log": self._forward_logits}[key]
+            if key.startswith("ids"):
+                fn = self._forward_ids
+            elif key.startswith("hid"):
+                fn = self._forward_hid
+            elif key == "log":
+                fn = self._forward_logits
+            elif key == "argmax":
+                fn = self._forward_argmax
+            elif key.startswith("argmax_last"):
+                fn = self._forward_argmax_last
+            else:
+                raise KeyError(key)
             jit = TinyJit(fn)
             self._jits[key] = jit
         return jit(inp, self._v_sp.bind(pos))
@@ -1040,3 +1678,155 @@ class Qwen35TextAdapter:
             return out[0].cat(*out[1:], dim=-1).reshape(n_out, n_in).cast(dtypes.float16)
 
         raise NotImplementedError(typ)
+
+
+class Qwen35TextPipeline:
+    """Run two layer-sharded adapters with a direct device-to-device boundary.
+
+    The mesh-facing adapter API intentionally returns NumPy arrays because the
+    hidden state may cross a websocket.  That boundary is expensive when both
+    shards live in the same process, though: it forces every token through
+    device -> host -> device.  This helper keeps the hidden state as a
+    tinygrad tensor, transfers it directly to the second GPU, and synchronizes
+    the two WDDM CUDA queues before the next shard consumes it.
+
+    tinygrad 0.14's combined multi-device TinyJit did not establish a reliable
+    cross-device dependency on this WDDM driver (the correctness gate failed
+    after recurrent state advanced), so the safe version intentionally uses the
+    existing per-shard TinyJits plus the direct tensor boundary.
+
+    The adapters remain independently usable; this is an additive fast path for
+    local dual-device deployments and benchmarks.
+    """
+
+    def __init__(self, first: Qwen35TextAdapter, last: Qwen35TextAdapter) -> None:
+        if first.layer_end != last.layer_start:
+            raise ValueError(
+                f"non-contiguous Qwen35 shards: {first.layer_start}:{first.layer_end} "
+                f"then {last.layer_start}:{last.layer_end}"
+            )
+        if first.layer_start != 0 or not last.owns_output_norm:
+            raise ValueError("Qwen35TextPipeline requires the first and final model shards")
+        if first.d_model != last.d_model or first.seq_len != last.seq_len:
+            raise ValueError("Qwen35 pipeline shards disagree on model dimensions")
+        if Tensor is None or UOp is None:
+            raise RuntimeError("tinygrad is not importable")
+        from tinygrad import Device
+
+        self.first = first
+        self.last = last
+        self._Device = Device
+        # The destination queue sync is the validated fast default.  `both`
+        # remains available as a conservative diagnostic fallback.
+        self._sync_mode = os.environ.get("QWEN35_PIPELINE_SYNC", "dst").lower()
+        if self._sync_mode not in {"src", "dst", "both"}:
+            raise ValueError("QWEN35_PIPELINE_SYNC must be src, dst, or both")
+
+    def _step(self, token_id: int, pos: int, output_key: str = "argmax") -> Tensor:
+        token = Tensor([[int(token_id)]], dtype=dtypes.int32, device=self.first.dev)
+        hidden = self.first._step("ids", token, int(pos))
+        # On WDDM, the source and destination CUDA queues are independent.
+        # Synchronize before and after the cross-device copy so the next
+        # shard never consumes a stale hidden state.  This remains a device
+        # transfer; it does not serialize through NumPy or base64.
+        if self._sync_mode in ("src", "both"):
+            self._Device[self.first.dev].synchronize()
+        hidden = hidden.to(self.last.dev).realize()
+        if self._sync_mode in ("dst", "both"):
+            self._Device[self.last.dev].synchronize()
+        return self.last._step(output_key, hidden, int(pos))
+
+    def _step_batch(self, token_ids: Any, pos: int, output_key: str) -> Tensor:
+        """Run a fixed-size prefill chunk through both shards on-device."""
+        ids = np.asarray(token_ids, dtype=np.int32).reshape(1, -1)
+        T = ids.shape[1]
+        token = Tensor(ids, dtype=dtypes.int32, device=self.first.dev)
+        hidden = self.first._step(f"ids{T}", token, int(pos))
+        if self._sync_mode in ("src", "both"):
+            self._Device[self.first.dev].synchronize()
+        hidden = hidden.to(self.last.dev).realize()
+        if self._sync_mode in ("dst", "both"):
+            self._Device[self.last.dev].synchronize()
+        if output_key == "hid":
+            key = f"hid{T}"
+        elif output_key == "argmax_last":
+            key = f"argmax_last{T}"
+        else:
+            raise ValueError(f"unsupported batched pipeline output: {output_key}")
+        return self.last._step(key, hidden, int(pos))
+
+    def _step_hidden(self, token_id: int, pos: int) -> Tensor:
+        """Run one token through both layer stacks without the output head."""
+        token = Tensor([[int(token_id)]], dtype=dtypes.int32, device=self.first.dev)
+        hidden = self.first._step("ids", token, int(pos))
+        if self._sync_mode in ("src", "both"):
+            self._Device[self.first.dev].synchronize()
+        hidden = hidden.to(self.last.dev).realize()
+        if self._sync_mode in ("dst", "both"):
+            self._Device[self.last.dev].synchronize()
+        return self.last._step("hid", hidden, int(pos))
+
+    @staticmethod
+    def _check_states(state0: dict[str, Any], state1: dict[str, Any]) -> int:
+        pos0, pos1 = int(state0["pos"]), int(state1["pos"])
+        if pos0 != pos1:
+            raise ValueError(f"Qwen35 pipeline state positions differ: {pos0} != {pos1}")
+        return pos0
+
+    def run_token(self, token_id: int, state0: dict[str, Any], state1: dict[str, Any]) -> int:
+        """Consume one token and return its greedy next-token id."""
+        pos = self._check_states(state0, state1)
+        logits = self._step(token_id, pos)
+        state0["pos"] = pos + 1
+        state1["pos"] = pos + 1
+        return int(logits.item())
+
+    def run(self, ids: Any, state0: dict[str, Any], state1: dict[str, Any]) -> np.ndarray:
+        """Consume ids one at a time and return the final logits as NumPy."""
+        ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+        if ids.size == 0:
+            raise ValueError("Qwen35TextPipeline.run requires at least one token")
+        for token_id in ids[:-1]:
+            pos = self._check_states(state0, state1)
+            self._step_hidden(int(token_id), pos)
+            state0["pos"] = pos + 1
+            state1["pos"] = pos + 1
+        pos = self._check_states(state0, state1)
+        last = self._step(int(ids[-1]), pos, output_key="log")
+        state0["pos"] = pos + 1
+        state1["pos"] = pos + 1
+        return np.asarray(last.numpy(), dtype=np.float32)
+
+    def run_prefill(self, ids: Any, state0: dict[str, Any], state1: dict[str, Any]) -> int:
+        """Consume a prompt while computing output logits only for its last row."""
+        ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+        if ids.size == 0:
+            raise ValueError("Qwen35TextPipeline.run_prefill requires at least one token")
+        # Four-token chunks are the measured sweet spot on the canonical dual-
+        # 5060 Ti 27B setup. Keep the override for smaller cards/variants and
+        # for apples-to-apples diagnostics against the sequential path.
+        batch = max(1, int(os.environ.get("QWEN35_PREFILL_BATCH", "4")))
+        # Keep one-token generation on the lean decode graph.  Batched mode is
+        # only for actual prompt chunks; routing T=1 through the prefill
+        # wrapper would add a separate JIT and a redundant last-row slice.
+        if batch > 1 and ids.size > 1:
+            pos = self._check_states(state0, state1)
+            for start in range(0, ids.size, batch):
+                chunk = ids[start:start + batch]
+                last = start + chunk.size == ids.size
+                out = self._step_batch(chunk, pos, "argmax_last" if last else "hid")
+                pos += int(chunk.size)
+                state0["pos"], state1["pos"] = pos, pos
+                if last:
+                    return int(out.item())
+            raise AssertionError("prefill chunk loop produced no final output")
+        for token_id in ids[:-1]:
+            pos = self._check_states(state0, state1)
+            self._step_hidden(int(token_id), pos)
+            state0["pos"] = pos + 1
+            state1["pos"] = pos + 1
+        return self.run_token(int(ids[-1]), state0, state1)
+
+    def run_greedy(self, ids: Any, state0: dict[str, Any], state1: dict[str, Any]) -> int:
+        """Consume ids and return only the final greedy token on-device."""
+        return self.run_prefill(ids, state0, state1)
